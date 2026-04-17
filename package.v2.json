@@ -7,7 +7,6 @@
         "icon": "clean_a.png",
         "author": "Agonie",
         "level": 1,
-        "history": {
-            "v1.0": "Emby入库之后自动删种"
+        "v2": true
         }
 }
