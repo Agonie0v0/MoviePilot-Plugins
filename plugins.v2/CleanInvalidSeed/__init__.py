@@ -15,7 +15,7 @@ from app.core.event import eventmanager, Event
 from app.helper.downloader import DownloaderHelper
 from app.utils.string import StringUtils
 
-class CleanUnlinkedSeed(_PluginBase):
+class CleanInvalidSeed(_PluginBase):
     # 插件名称
     plugin_name = "Emby入库删种"
     # 插件描述
@@ -29,14 +29,14 @@ class CleanUnlinkedSeed(_PluginBase):
     # 作者主页
     author_url = "https://github.com/Agonie0v0"
     # 插件配置项ID前缀
-    plugin_config_prefix = "cleanunlinkedseed"
+    plugin_config_prefix = "cleaninvalidseed"
     # 加载顺序
     plugin_order = 1
     # 可使用的用户级别
     auth_level = 1
 
     # 日志标签
-    LOG_TAG = "[CleanUnlinkedSeed]"
+    LOG_TAG = "[CleanInvalidSeed]"
 
     # 状态变量
     _enabled = False
@@ -169,7 +169,7 @@ class CleanUnlinkedSeed(_PluginBase):
         if self._enabled and self._cron:
             return [
                 {
-                    "id": "CleanUnlinkedSeed",
+                    "id": "CleanInvalidSeed",
                     "name": "Emby入库删种",
                     "trigger": CronTrigger.from_crontab(self._cron),
                     "func": self.clean_unlinked_seeds,
