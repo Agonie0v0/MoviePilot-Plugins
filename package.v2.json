@@ -1,0 +1,13 @@
+{
+    "CleanInvalidSeed": {
+        "name": "Emby入库删种",
+        "description": "Emby入库之后自动删种",
+        "labels": "Qbittorrent",
+        "version": "1.0",
+        "icon": "clean_a.png",
+        "author": "Agonie",
+        "level": 1,
+        "history": {
+            "v1.0": "Emby入库之后自动删种"
+        }
+}
