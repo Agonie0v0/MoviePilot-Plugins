@@ -6,6 +6,8 @@
         "version": "1.0",
         "icon": "clean_a.png",
         "author": "Agonie",
+        "github": "Agonie0v0/MoviePilot-Plugins",
+        "repo": "Agonie0v0/MoviePilot-Plugins",
         "level": 1,
         "v2": true,
         "history": {
