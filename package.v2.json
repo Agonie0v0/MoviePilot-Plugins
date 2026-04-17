@@ -1,15 +1,15 @@
 {
-    "CleanInvalidSeed": {
-        "name": "Emby入库删种",
-        "description": "Emby入库之后自动删种",
+    "AutoCleanUnlinkedSeed": {
+        "name": "Emby智能入库删种",
+        "description": "Emby入库之后自动清理断链做种，支持精准过滤",
         "labels": "Qbittorrent",
-        "version": "1.0",
+        "version": "1.2",
         "icon": "clean_a.png",
         "author": "Agonie",
         "level": 1,
         "v2": true,
         "history": {
-            "v1.0": "Emby入库之后自动删种"
+            "v1.0": "Emby入库之后自动删种",
         }
     }
 }
