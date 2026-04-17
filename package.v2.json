@@ -1,5 +1,5 @@
 {
-    "AutoCleanUnlinkedSeed": {
+    "autocleanunlinkedseed": {
         "name": "Emby智能入库删种",
         "description": "Emby入库之后自动清理断链做种，支持精准过滤",
         "labels": "Qbittorrent",
