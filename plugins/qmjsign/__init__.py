@@ -15,6 +15,7 @@ import time
 import random
 import requests
 import re
+import json
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -313,6 +314,7 @@ class qmjsign(_PluginBase):
             post_url = "https://www.1000qm.vip/api/mobile/index.php?version=4&module=login&loginsubmit=yes"
             post_data = {
                 "formhash": formhash,
+                "fastloginfield": "username",
                 "username": self._username,
                 "password": self._password,
                 "questionid": self._questionid if self._questionid else "0",
@@ -320,15 +322,69 @@ class qmjsign(_PluginBase):
                 "cookietime": "2592000"  # 30天记住登录
             }
 
-            resp_login = session.post(post_url, data=post_data, timeout=self._timeout)
-            if resp_login.status_code != 200:
-                return False, f"登录接口返回 HTTP {resp_login.status_code}"
+            headers = {
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.1000qm.vip/"
+            }
 
+            resp_login = session.post(post_url, data=post_data, headers=headers, timeout=self._timeout)
+
+            # 容错策略 1：检查 Session Cookies 中是否已获得 auth 认证凭据
+            # （Discuz! 登录成功时无论是否重定向或输出格式如何，均会下发 *_auth Cookie）
+            cookie_dict = requests.utils.dict_from_cookiejar(session.cookies)
+            has_auth = any(k.endswith('_auth') and len(v) > 10 for k, v in cookie_dict.items())
+            if has_auth:
+                logger.info("检测到登录凭据 Cookie (auth) 已下发，正在验证会话有效性...")
+                valid, check_msg = self._check_cookie_valid(session)
+                if valid:
+                    logger.info(f"账号 [{self._username}] 登录验证成功！({check_msg})")
+                    self._save_session_cookie(session)
+                    return True, f"登录成功 ({check_msg})"
+
+            # 容错策略 2：多重解析 JSON（剥离 UTF-8 BOM，或从文本中提取 JSON 块）
+            res_json = None
+            raw_bytes = resp_login.content or b""
+            raw_text = ""
             try:
-                res_json = resp_login.json()
+                raw_text = raw_bytes.decode("utf-8-sig", errors="replace").strip()
             except Exception:
-                return False, f"登录响应非 JSON 格式: {resp_login.text[:200]}"
+                raw_text = (resp_login.text or "").strip()
 
+            if raw_text:
+                try:
+                    res_json = json.loads(raw_text)
+                except Exception:
+                    # 尝试用正则提取 JSON 结构
+                    json_match = re.search(r'\{[\s\S]*\}', raw_text)
+                    if json_match:
+                        try:
+                            res_json = json.loads(json_match.group(0))
+                        except Exception:
+                            pass
+
+            # 容错策略 3：未解析出 JSON 时进行会话有效性兜底测试
+            if not res_json:
+                valid, check_msg = self._check_cookie_valid(session)
+                if valid:
+                    logger.info(f"响应非标准 JSON，但会话有效性校验通过！({check_msg})")
+                    self._save_session_cookie(session)
+                    return True, f"登录成功 ({check_msg})"
+
+                # 清洗 HTML 标签，避免日志中出现空白或裸标签导致无法查看原因
+                clean_text = re.sub(r'<script.*?</script>', '', raw_text, flags=re.S)
+                clean_text = re.sub(r'<style.*?</style>', '', clean_text, flags=re.S)
+                clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
+                clean_text = ' '.join(clean_text.split())
+
+                diag_info = (
+                    f"HTTP {resp_login.status_code}, 重定向: {len(resp_login.history)}次, "
+                    f"字节数: {len(raw_bytes)}"
+                )
+                logger.error(f"阡陌居自动登录响应异常 ({diag_info}): {repr(clean_text[:120]) if clean_text else '（内容为空）'}")
+                return False, f"登录响应异常: {clean_text[:50] if clean_text else '空响应/网络阻断'}"
+
+            # 步骤 3：解析标准 JSON 响应
             res_vars = res_json.get("Variables", {}) or {}
             res_msg = res_json.get("Message", {}) or {}
             msg_val = res_msg.get("messageval", "")
@@ -338,10 +394,9 @@ class qmjsign(_PluginBase):
             auth = res_vars.get("auth")
             uname = res_vars.get("member_username", "")
 
-            # 成功判定：Variables 下发了 auth 或 member_uid 大于 0
+            # 成功判定：Variables 下发了 auth 或 member_uid 大于 0，或 messageval 为 login_succeed
             if (auth and uid != "0") or (uid not in ["0", "", None] and uname) or ("login_succeed" in msg_val):
                 logger.info(f"账号 [{uname or self._username}] (UID: {uid}) 自动登录成功！")
-                # 保存并更新 Cookie
                 self._save_session_cookie(session)
                 return True, f"登录成功 (UID: {uid})"
 
