@@ -1,8 +1,9 @@
 """
 阡陌居签到插件 (QmjSign)
-版本: 1.2.3
+版本: 1.2.4
 原作者: madrays
 增强修改:
+- v1.2.4: 深度重构 UI 排版与交互细节（Emil Kowalski 设计工程）：精简常驻开关为3等宽列、4列紧凑对齐数字参数框（彻底解决历史天数过宽问题）、独立单次动作组、全新仪表盘级账户财富指标卡（大字号指标+彩色微调卡片）与现代扁平化签到历史记录表格。
 - v1.2.3: 优化插件配置表单布局与色彩层级，4列均分开关色彩区分，长Cookie整行呼吸空间，4+4+4网络参数网格，警示色历史清理与结构化配置指南。
 - v1.2.2: 增加清空历史记录功能（支持设置表单开关、远程命令/qmjsign_clear与API三种方式）；配置高清插件图标（PNG格式及全URL引用）；优化账号登录参数与密码空格处理，增加账号被锁定(login_strike)防重试保护与精准引导提示。
 - v1.2.1: 增强自动登录容错机制：支持UTF-8 BOM自动清洗；优先识别auth Cookie；增加会话有效性兜底探测与错误文本清洗。
@@ -62,19 +63,31 @@ def _extract_sign_message(html_content: str) -> Optional[str]:
         segment = re.sub(r'<[^>]+>', '', segment)
         return segment.strip()
 
-    # 1) 优先提取 alert_xxx 中的消息
-    alert_match = re.search(r'<div class="alert_(?:error|right|info)">(.*?)</div>', html_content, re.S)
-    if alert_match:
-        msg = _clean(alert_match.group(1))
-        if msg:
-            return msg
+    if not html_content:
+        return None
 
-    # 2) 回退：提取 <div class="c"> 或 <div class="c altw"> 内容
-    div_match = re.search(r'<div class="c(?: altw)?">(.*?)</div>', html_content, re.S)
-    if div_match:
-        msg = _clean(div_match.group(1))
-        if msg:
-            return msg
+    # Discuz AJAX 响应通常包裹在 CDATA 中
+    cdata_match = re.search(r'<!\[CDATA\[(.*?)\]\]>', html_content, flags=re.S)
+    body = cdata_match.group(1) if cdata_match else html_content
+
+    patterns = [
+        r'<div[^>]*class=["\'][^"\']*\balert_error\b[^"\']*["\'][^>]*>(.*?)</div>',
+        r'<div[^>]*class=["\'][^"\']*\balert_right\b[^"\']*["\'][^>]*>(.*?)</div>',
+        r'<div[^>]*class=["\'][^"\']*\balert_info\b[^"\']*["\'][^>]*>(.*?)</div>',
+        r'<div[^>]*class=["\']c(?:\s+altw)?["\'][^>]*>(.*?)</div>',
+        r'<p[^>]*class=["\'][^"\']*\balert\b[^"\']*["\'][^>]*>(.*?)</p>',
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, body, flags=re.S | re.I)
+        if m:
+            cleaned = _clean(m.group(1))
+            if cleaned:
+                return cleaned
+
+    cleaned_body = _clean(body)
+    if cleaned_body and len(cleaned_body) <= 120:
+        return cleaned_body
 
     return None
 
@@ -107,15 +120,15 @@ _SIGN_TEXTS = {
 
 _SIGN_TEXTS_FALLBACK = ["今日签到", "每日签到", "打卡签到", "签到成功，新的一天"]
 
-# Discuz 安全提问选项定义
+# 论坛安全提问列表 (Discuz! 经典安全提问)
 _SECURITY_QUESTIONS = [
     {"title": "无安全提问", "value": "0"},
     {"title": "母亲的名字", "value": "1"},
     {"title": "爷爷的名字", "value": "2"},
     {"title": "父亲出生的城市", "value": "3"},
-    {"title": "你其中一位老师的名字", "value": "4"},
-    {"title": "你个人计算机的型号", "value": "5"},
-    {"title": "你最喜欢的餐馆名称", "value": "6"},
+    {"title": "您其中一位老师的名字", "value": "4"},
+    {"title": "您个人计算机的型号", "value": "5"},
+    {"title": "您最喜欢的餐馆名称", "value": "6"},
     {"title": "驾驶执照最后四位数字", "value": "7"},
 ]
 
@@ -126,9 +139,9 @@ class qmjsign(_PluginBase):
     # 插件描述
     plugin_desc = "自动完成阡陌居每日签到与威望红包，支持账号密码自动登录更新Cookie、失败重试与历史记录"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/qmj.png"
+    plugin_icon = "qmj.png"
     # 插件版本
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.4"
     # 插件作者
     plugin_author = "Agonie"
     # 作者主页
@@ -1125,37 +1138,37 @@ class qmjsign(_PluginBase):
             {
                 'component': 'VForm',
                 'content': [
-                    # 1. 顶部核心功能开关（4列均分，色彩分明，文案对称）
+                    # 1. 核心常驻功能开关（3等宽列均分，4+4+4=12，语义色彩明快）
                     {
                         'component': 'VRow',
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'sm': 6, 'md': 3},
+                                'props': {'cols': 12, 'sm': 4, 'md': 4},
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'enabled',
-                                        'label': '启用插件',
+                                        'label': '启用自动签到',
                                         'color': 'primary'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'sm': 6, 'md': 3},
+                                'props': {'cols': 12, 'sm': 4, 'md': 4},
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'notify',
-                                        'label': '开启签到通知',
+                                        'label': '发送签到通知',
                                         'color': 'info'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'sm': 6, 'md': 3},
+                                'props': {'cols': 12, 'sm': 4, 'md': 4},
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {
@@ -1164,22 +1177,10 @@ class qmjsign(_PluginBase):
                                         'color': 'success'
                                     }
                                 }]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'sm': 6, 'md': 3},
-                                'content': [{
-                                    'component': 'VSwitch',
-                                    'props': {
-                                        'model': 'onlyonce',
-                                        'label': '立即运行一次',
-                                        'color': 'warning'
-                                    }
-                                }]
                             }
                         ]
                     },
-                    # 2. 账号与密码认证（6 + 6 对称网格）
+                    # 2. 论坛账号与密码（6 + 6 对称网格）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1191,7 +1192,8 @@ class qmjsign(_PluginBase):
                                     'props': {
                                         'model': 'username',
                                         'label': '论坛用户名 / 账号',
-                                        'placeholder': '配置后Cookie过期可全自动重新登录续期'
+                                        'placeholder': '配置后Cookie失效将自动重新登录续期',
+                                        'prepend-inner-icon': 'mdi-account-outline'
                                     }
                                 }]
                             },
@@ -1202,15 +1204,16 @@ class qmjsign(_PluginBase):
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'password',
-                                        'label': '论坛密码',
+                                        'label': '论坛登录密码',
                                         'type': 'password',
-                                        'placeholder': '请输入阡陌居登录密码'
+                                        'placeholder': '请输入阡陌居登录密码',
+                                        'prepend-inner-icon': 'mdi-lock-outline'
                                     }
                                 }]
                             }
                         ]
                     },
-                    # 3. 安全提问（6 + 6 对称网格）
+                    # 3. Discuz! 安全提问（6 + 6 对称网格）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1221,8 +1224,9 @@ class qmjsign(_PluginBase):
                                     'component': 'VSelect',
                                     'props': {
                                         'model': 'questionid',
-                                        'label': '安全提问（若未设置请选无）',
-                                        'items': _SECURITY_QUESTIONS
+                                        'label': '安全提问（未设置请保持“无”）',
+                                        'items': _SECURITY_QUESTIONS,
+                                        'prepend-inner-icon': 'mdi-shield-account-outline'
                                     }
                                 }]
                             },
@@ -1234,7 +1238,8 @@ class qmjsign(_PluginBase):
                                     'props': {
                                         'model': 'answer',
                                         'label': '安全提问答案',
-                                        'placeholder': '若账号设置了安全提问请在此填写'
+                                        'placeholder': '若账号设置了安全提问请在此填写',
+                                        'prepend-inner-icon': 'mdi-key-variant'
                                     }
                                 }]
                             }
@@ -1251,14 +1256,15 @@ class qmjsign(_PluginBase):
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'cookie',
-                                        'label': '站点 Cookie（可选，填入账号密码将自动登录生成并持久化保存）',
-                                        'placeholder': '如已配置账号密码可完全留空，系统自动登录并回填保存'
+                                        'label': '站点 Cookie (可选，填入账号密码将自动登录生成并持久化保存)',
+                                        'placeholder': '如已配置账号密码可完全留空，系统自动登录并回填保存',
+                                        'prepend-inner-icon': 'mdi-cookie-outline'
                                     }
                                 }]
                             }
                         ]
                     },
-                    # 5. 定时周期与网络代理（6 + 6，两者均为外部环境配置）
+                    # 5. 定时周期与网络代理（6 + 6 对称网格）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1281,58 +1287,76 @@ class qmjsign(_PluginBase):
                                     'props': {
                                         'model': 'proxy',
                                         'label': '网络代理（可选）',
-                                        'placeholder': '例如 http://127.0.0.1:7890，无代理请留空'
+                                        'placeholder': '例如 http://127.0.0.1:7890，无代理请留空',
+                                        'prepend-inner-icon': 'mdi-web'
                                     }
                                 }]
                             }
                         ]
                     },
-                    # 6. 请求参数三列等宽（4 + 4 + 4 = 12，告别原先4个小框挤压变形）
+                    # 6. 数值调节参数（4列紧凑等宽：3 + 3 + 3 + 3 = 12，解决历史天数文本框过宽问题）
                     {
                         'component': 'VRow',
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
+                                'props': {'cols': 6, 'sm': 3, 'md': 3},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'timeout',
-                                        'label': '网络超时时间(秒)',
+                                        'label': '网络超时(秒)',
                                         'type': 'number',
-                                        'placeholder': '20'
+                                        'placeholder': '20',
+                                        'prepend-inner-icon': 'mdi-timer-outline'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
+                                'props': {'cols': 6, 'sm': 3, 'md': 3},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'max_retries',
-                                        'label': '最大重试次数',
+                                        'label': '最大重试(次)',
                                         'type': 'number',
-                                        'placeholder': '3'
+                                        'placeholder': '3',
+                                        'prepend-inner-icon': 'mdi-reload'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
+                                'props': {'cols': 6, 'sm': 3, 'md': 3},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'retry_interval',
                                         'label': '重试间隔(秒)',
                                         'type': 'number',
-                                        'placeholder': '30'
+                                        'placeholder': '30',
+                                        'prepend-inner-icon': 'mdi-timer-sand'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 6, 'sm': 3, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'history_days',
+                                        'label': '历史保留(天)',
+                                        'type': 'number',
+                                        'placeholder': '30',
+                                        'prepend-inner-icon': 'mdi-calendar-clock'
                                     }
                                 }]
                             }
                         ]
                     },
-                    # 7. 数据维护设置（6 + 6，左右基线对齐，警示色开关）
+                    # 7. 即时触发与维护操作（双列 6 + 6，保存时触发并自动复位）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1340,12 +1364,11 @@ class qmjsign(_PluginBase):
                                 'component': 'VCol',
                                 'props': {'cols': 12, 'md': 6},
                                 'content': [{
-                                    'component': 'VTextField',
+                                    'component': 'VSwitch',
                                     'props': {
-                                        'model': 'history_days',
-                                        'label': '历史保留天数',
-                                        'type': 'number',
-                                        'placeholder': '30'
+                                        'model': 'onlyonce',
+                                        'label': '立即运行一次 (保存后后台立即执行并复位)',
+                                        'color': 'warning'
                                     }
                                 }]
                             },
@@ -1356,7 +1379,7 @@ class qmjsign(_PluginBase):
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'clear_history',
-                                        'label': '清空历史记录 (保存时立即执行)',
+                                        'label': '清空历史记录 (保存时立即清除并复位)',
                                         'color': 'error'
                                     }
                                 }]
@@ -1375,13 +1398,13 @@ class qmjsign(_PluginBase):
                                     'props': {
                                         'type': 'info',
                                         'variant': 'tonal',
+                                        'title': '💡 阡陌居自动签到配置与运行指南',
+                                        'style': 'white-space: pre-line;',
                                         'text': (
-                                            '💡【配置指南与说明】\n'
-                                            '• 🔑 自动更新Cookie：配置用户名和密码后，Cookie 失效将自动登录并持久化保存，彻底告别频繁手动抓包。\n'
-                                            '• 🛡️ 安全提问：若论坛账号启用了安全提问，请选择相应问题并填写答案；否则保持“无安全提问”。\n'
-                                            '• 🌐 代理与超时：网络直连 1000qm.vip 若经常波动或超时，可在网络代理填入本地代理，并适当调大超时时间。\n'
-                                            '• 🚀 签到测试：保存配置后可勾选顶部的“立即运行一次”，系统将在后台立刻执行签到与威望红包任务。\n'
-                                            '• 🧹 历史清理：如需清空历史记录，勾选“清空历史记录”后点击保存即可，执行完毕后开关会自动复位。'
+                                            '• 🔑 自动更新Cookie：配置用户名和密码后，Cookie 失效将自动登录续期并持久化回写，无需频繁手动抓包。\n'
+                                            '• 🛡️ Discuz安全提问：若论坛账号启用了安全提问，请选择相应问题并填写答案；否则请保持“无安全提问”。\n'
+                                            '• 🌐 代理与超时：网络直连 1000qm.vip 若经常波动，可在代理项填入本地代理地址并适当调大超时时间。\n'
+                                            '• ⚡ 动作开关说明：底部的“立即运行一次”与“清空历史记录”保存后将立即执行并在完成后自动复位关闭。'
                                         )
                                     }
                                 }]
@@ -1410,105 +1433,212 @@ class qmjsign(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """构建详情页面展示签到历史与财富概览"""
+        """构建详情页面展示签到历史与财富概览（现代数据仪表盘风格）"""
         historys = self.get_data('sign_history') or []
         credits_overview = self.get_data('last_credits_overview') or {}
 
+        # 1. 账户财富汇总卡片（响应式微件网格）
+        overview_card = []
+        if credits_overview:
+            def stat_tile(label: str, key: str, color_class: str, icon: str):
+                val = credits_overview.get(key)
+                val_str = str(val) if val not in [None, 'None', ''] else '—'
+                return {
+                    'component': 'VCol',
+                    'props': {'cols': 6, 'sm': 4, 'md': 2},
+                    'content': [{
+                        'component': 'VCard',
+                        'props': {
+                            'variant': 'tonal',
+                            'class': 'text-center py-3 px-2 rounded-lg elevation-0',
+                        },
+                        'content': [
+                            {
+                                'component': 'div',
+                                'props': {'class': f'text-h5 font-weight-bold {color_class} mb-1'},
+                                'text': val_str
+                            },
+                            {
+                                'component': 'div',
+                                'props': {'class': 'text-caption text-medium-emphasis font-weight-medium'},
+                                'text': f"{icon} {label}"
+                            }
+                        ]
+                    }]
+                }
+
+            overview_card = [{
+                'component': 'VCard',
+                'props': {'variant': 'outlined', 'class': 'mb-4 rounded-lg'},
+                'content': [
+                    {
+                        'component': 'VCardItem',
+                        'props': {'class': 'pb-2'},
+                        'content': [
+                            {
+                                'component': 'VCardTitle',
+                                'props': {'class': 'text-subtitle-1 font-weight-bold d-flex align-center'},
+                                'text': '💰 账户财富总览'
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {'class': 'pt-0'},
+                        'content': [
+                            {
+                                'component': 'VRow',
+                                'props': {'dense': True},
+                                'content': [
+                                    stat_tile('铜币', 'coins_total', 'text-amber-darken-3', '🪙'),
+                                    stat_tile('威望', 'prestige_total', 'text-success', '🌟'),
+                                    stat_tile('贡献', 'contribution_total', 'text-cyan-darken-1', '🤝'),
+                                    stat_tile('发书数', 'books_total', 'text-blue-darken-1', '📚'),
+                                    stat_tile('积分', 'credits_total', 'text-indigo-darken-1', '💎'),
+                                    stat_tile('总积分', 'credits_sum', 'text-deep-purple-darken-1', '👑'),
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }]
+
+        # 2. 签到历史表格数据构造
         history_rows = []
         if historys:
             sorted_history = sorted(historys, key=lambda x: x.get("date", ""), reverse=True)
             for history in sorted_history:
                 status_text = history.get("status", "未知")
-                status_color = "success" if any(k in status_text for k in ["签到成功", "已签到"]) else "error"
+                is_success = any(k in status_text for k in ["签到成功", "已签到"])
+                status_color = "success" if is_success else "error"
+                status_icon = "mdi-check-circle-outline" if is_success else "mdi-alert-circle-outline"
+
+                # 智能格式化奖励微标
+                reward_elements = []
+                cg = history.get("coins_gain")
+                if cg and str(cg) not in ["—", "None", "", "0"]:
+                    reward_elements.append({
+                        'component': 'VChip',
+                        'props': {'size': 'x-small', 'color': 'amber-darken-2', 'variant': 'tonal', 'class': 'mr-1'},
+                        'text': f"🪙 铜币 +{cg}"
+                    })
+                pg = history.get("prestige_gain")
+                if pg and str(pg) not in ["—", "None", "", "0"]:
+                    reward_elements.append({
+                        'component': 'VChip',
+                        'props': {'size': 'x-small', 'color': 'success', 'variant': 'tonal', 'class': 'mr-1'},
+                        'text': f"🌟 威望 +{pg}"
+                    })
+                if not reward_elements:
+                    reward_elements = [{
+                        'component': 'span',
+                        'props': {'class': 'text-caption text-medium-emphasis'},
+                        'text': '日常打卡' if is_success else '—'
+                    }]
+
                 history_rows.append({
                     'component': 'tr',
                     'content': [
-                        {'component': 'td', 'props': {'class': 'text-caption'}, 'text': history.get("date", "")},
+                        {
+                            'component': 'td',
+                            'props': {'class': 'text-caption font-weight-medium text-medium-emphasis'},
+                            'text': history.get("date", "")
+                        },
                         {
                             'component': 'td',
                             'content': [{
                                 'component': 'VChip',
-                                'props': {'color': status_color, 'size': 'small', 'variant': 'outlined'},
+                                'props': {
+                                    'color': status_color,
+                                    'size': 'small',
+                                    'variant': 'tonal',
+                                    'prepend-icon': status_icon,
+                                    'class': 'font-weight-medium'
+                                },
                                 'text': status_text
                             }]
                         },
-                        {'component': 'td', 'text': history.get('message', '—')},
-                        {'component': 'td', 'text': f"铜币 +{history.get('coins_gain', '—')} | 威望 +{history.get('prestige_gain', '—')}"}
+                        {
+                            'component': 'td',
+                            'content': reward_elements
+                        },
+                        {
+                            'component': 'td',
+                            'props': {'class': 'text-body-2'},
+                            'text': history.get('message', '—')
+                        }
                     ]
                 })
 
-        overview_card = []
-        if credits_overview:
-            def chip(label, key, color='primary'):
-                return {
-                    'component': 'VChip',
-                    'props': {'size': 'small', 'variant': 'outlined', 'color': color, 'class': 'mr-2 mb-2'},
-                    'text': f"{label} {credits_overview.get(key, '—')}"
-                }
-
-            overview_card = [{
-                'component': 'VCard',
-                'props': {'variant': 'outlined', 'class': 'mb-4'},
+        empty_state = [{
+            'component': 'tr',
+            'content': [{
+                'component': 'td',
+                'props': {'colspan': 4, 'class': 'text-center py-6'},
                 'content': [
-                    {'component': 'VCardTitle', 'props': {'class': 'text-h6'}, 'text': '💰 账户财富汇总'},
-                    {'component': 'VCardText', 'content': [{'component': 'div', 'content': [
-                        chip('铜币', 'coins_total', 'amber-darken-2'),
-                        chip('威望', 'prestige_total', 'success'),
-                        chip('贡献', 'contribution_total'),
-                        chip('发书数', 'books_total'),
-                        chip('积分', 'credits_total', 'info'),
-                        chip('总积分', 'credits_sum', 'deep-purple')
-                    ]}]}
+                    {'component': 'div', 'props': {'class': 'text-subtitle-1 text-medium-emphasis mb-1'}, 'text': '📅 暂无历史记录'},
+                    {'component': 'div', 'props': {'class': 'text-caption text-disabled'}, 'text': '系统执行自动签到或手动测试后将在此展示状态与收益'}
                 ]
             }]
+        }]
 
         table_card = [
             {
                 'component': 'VCard',
-                'props': {'variant': 'outlined', 'class': 'mb-4'},
+                'props': {'variant': 'outlined', 'class': 'rounded-lg'},
                 'content': [
-                    {'component': 'VCardTitle', 'props': {'class': 'text-h6'}, 'text': '📊 阡陌居签到历史'},
                     {
-                        'component': 'VCardText',
+                        'component': 'VCardItem',
+                        'props': {'class': 'pb-2'},
                         'content': [
                             {
-                                'component': 'VAlert',
-                                'props': {
-                                    'type': 'info',
-                                    'variant': 'tonal',
-                                    'density': 'compact',
-                                    'class': 'mb-3',
-                                    'text': '提示：如需清理或重置签到历史，可在插件设置中开启【清空历史记录】并点击保存，或发送命令 /qmjsign_clear。'
-                                }
-                            },
+                                'component': 'div',
+                                'props': {'class': 'd-flex justify-space-between align-center w-100'},
+                                'content': [
+                                    {
+                                        'component': 'VCardTitle',
+                                        'props': {'class': 'text-subtitle-1 font-weight-bold pa-0'},
+                                        'text': '📊 签到历史记录'
+                                    },
+                                    {
+                                        'component': 'VChip',
+                                        'props': {'size': 'x-small', 'variant': 'tonal', 'color': 'primary'},
+                                        'text': f"共 {len(historys)} 条记录"
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {'class': 'pt-0'},
+                        'content': [
                             {
                                 'component': 'VTable',
-                                'props': {'hover': True, 'density': 'compact'},
+                                'props': {'hover': True, 'density': 'comfortable', 'class': 'rounded-lg'},
                                 'content': [
                                     {
                                         'component': 'thead',
                                         'content': [{
                                             'component': 'tr',
                                             'content': [
-                                                {'component': 'th', 'text': '时间'},
-                                                {'component': 'th', 'text': '状态'},
-                                                {'component': 'th', 'text': '消息'},
-                                                {'component': 'th', 'text': '奖励'}
+                                                {'component': 'th', 'props': {'class': 'text-caption font-weight-bold text-medium-emphasis', 'style': 'width: 170px;'}, 'text': '执行时间'},
+                                                {'component': 'th', 'props': {'class': 'text-caption font-weight-bold text-medium-emphasis', 'style': 'width: 110px;'}, 'text': '状态'},
+                                                {'component': 'th', 'props': {'class': 'text-caption font-weight-bold text-medium-emphasis', 'style': 'width: 180px;'}, 'text': '获取奖励'},
+                                                {'component': 'th', 'props': {'class': 'text-caption font-weight-bold text-medium-emphasis'}, 'text': '状态描述与反馈'}
                                             ]
                                         }]
                                     },
                                     {
                                         'component': 'tbody',
-                                        'content': history_rows if history_rows else [{
-                                            'component': 'tr',
-                                            'content': [{
-                                                'component': 'td',
-                                                'props': {'colspan': 4, 'class': 'text-center text-muted py-4'},
-                                                'text': '暂无历史记录'
-                                            }]
-                                        }]
+                                        'content': history_rows if history_rows else empty_state
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'div',
+                                'props': {'class': 'text-caption text-disabled text-right mt-2'},
+                                'text': '💡 提示：如需清空历史记录，可在插件设置中勾选【清空历史记录】并点击保存，或发送命令 /qmjsign_clear'
                             }
                         ]
                     }
