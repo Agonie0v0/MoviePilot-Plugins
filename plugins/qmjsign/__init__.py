@@ -29,6 +29,25 @@ from app.plugins import _PluginBase
 from app.log import logger
 from app.schemas import NotificationType
 
+try:
+    from app.schemas.types import EventType
+    from app.core.event import eventmanager, Event
+except ImportError:
+    try:
+        from app.sdk.events import eventmanager, Event
+        from app.schemas.types import EventType
+    except ImportError:
+        EventType = None
+        eventmanager = None
+        Event = None
+
+if eventmanager is not None and EventType is not None:
+    _register_action = eventmanager.register(EventType.PluginAction)
+else:
+    def _register_action(f):
+        return f
+
+
 
 def _extract_sign_message(html_content: str) -> Optional[str]:
     """
@@ -104,9 +123,9 @@ class qmjsign(_PluginBase):
     # 插件描述
     plugin_desc = "自动完成阡陌居每日签到与威望红包，支持账号密码自动登录更新Cookie、失败重试与历史记录"
     # 插件图标
-    plugin_icon = "qmj.ico"
+    plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/qmj.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     # 插件作者
     plugin_author = "Agonie"
     # 作者主页
@@ -147,6 +166,12 @@ class qmjsign(_PluginBase):
         logger.info("============= qmjsign 初始化 =============")
         try:
             if config:
+                # 清空历史记录指令检查
+                if config.get("clear_history"):
+                    self.save_data('sign_history', [])
+                    self.save_data('last_credits_overview', {})
+                    logger.info("已清空阡陌居签到历史记录与统计缓存")
+
                 self._enabled = bool(config.get("enabled", False))
                 self._cookie = (config.get("cookie") or "").strip()
                 self._notify = bool(config.get("notify", True))
@@ -157,7 +182,7 @@ class qmjsign(_PluginBase):
                 self._history_days = int(config.get("history_days", 30))
                 self._draw_prestige_enabled = bool(config.get("draw_prestige", False))
                 self._username = (config.get("username") or "").strip()
-                self._password = (config.get("password") or "").strip()
+                self._password = str(config.get("password") or "")
                 self._questionid = str(config.get("questionid", "0"))
                 self._answer = (config.get("answer") or "").strip()
                 self._proxy = (config.get("proxy") or "").strip()
@@ -213,7 +238,8 @@ class qmjsign(_PluginBase):
                 "questionid": self._questionid or "0",
                 "answer": self._answer or "",
                 "proxy": self._proxy or "",
-                "timeout": self._timeout
+                "timeout": self._timeout,
+                "clear_history": False
             })
         except Exception as e:
             logger.warning(f"qmjsign 更新配置失败: {str(e)}")
@@ -314,12 +340,14 @@ class qmjsign(_PluginBase):
             post_url = "https://www.1000qm.vip/api/mobile/index.php?version=4&module=login&loginsubmit=yes"
             post_data = {
                 "formhash": formhash,
+                "loginfield": "username",
                 "fastloginfield": "username",
                 "username": self._username,
                 "password": self._password,
                 "questionid": self._questionid if self._questionid else "0",
                 "answer": self._answer or "",
-                "cookietime": "2592000"  # 30天记住登录
+                "cookietime": "2592000",  # 30天记住登录
+                "loginsubmit": "yes"
             }
 
             headers = {
@@ -400,17 +428,24 @@ class qmjsign(_PluginBase):
                 self._save_session_cookie(session)
                 return True, f"登录成功 (UID: {uid})"
 
-            # 失败信息解析
+            # 失败信息解析与友好映射
             error_map = {
-                "login_invalid": "用户名或密码错误，请检查配置",
-                "login_question_empty": "论坛账号设置了安全提问，请在插件配置中选择安全提问并填写答案",
-                "login_question_invalid": "安全提问答案错误，请检查配置",
-                "login_strike": "登录失败次数过多，账号被临时锁定，请稍后再试",
+                "login_invalid": "用户名或密码错误，请核对论坛账号与密码（注意区分大小写）",
+                "login_question_empty": "论坛账号已设置安全提问，请在插件配置中选择提问并填写答案",
+                "login_question_invalid": "安全提问答案错误，请核对插件配置中的提问与答案",
+                "login_strike": "登录失败次数过多，账号被论坛临时锁定15分钟（请等待15分钟解锁，切勿频繁重试）",
                 "login_clearcookies": "登录状态异常，已清理Cookie",
             }
             error_desc = error_map.get(msg_val)
             if not error_desc:
                 error_desc = msg_str if (msg_str and not msg_str.startswith("mobile:")) else f"登录失败: {msg_val or '未知错误'}"
+
+            if msg_val == "login_strike":
+                logger.warning(
+                    "⚠️ 提示：论坛密码或安全提问错误次数已达上限，账号已被论坛安全策略临时锁定 15 分钟。"
+                    "请暂停测试并等待至少 15 分钟解锁；切勿频繁点击运行，否则每次尝试都会重置 15 分钟锁定计时！"
+                    "解锁后建议先在浏览器隐身窗口登录一次，确认账号、密码和安全提问无误后再在插件中保存配置。"
+                )
 
             logger.error(f"阡陌居自动登录失败: {error_desc}")
             return False, error_desc
@@ -605,6 +640,26 @@ class qmjsign(_PluginBase):
                     login_ok, login_msg = self._auto_login(session)
                     if not login_ok:
                         logger.error(f"自动登录失败: {login_msg}")
+                        # 账号被论坛临时锁定时，立即中止，严禁重试避免重置锁定时间
+                        if "锁定" in login_msg:
+                            sign_dict = {
+                                "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+                                "status": "签到失败: 账号被锁定 (需等待15分钟)",
+                                "message": login_msg
+                            }
+                            self._save_sign_history(sign_dict)
+                            if self._notify:
+                                self.post_message(
+                                    mtype=NotificationType.SiteMessage,
+                                    title="【⚠️ 阡陌居账号被临时锁定】",
+                                    text=(
+                                        "⚠️ 论坛提示密码或提问错误次数过多，账号被临时锁定15分钟。\n"
+                                        "请暂停测试，等待至少15分钟后再试；切勿频繁运行以免延长锁定！\n"
+                                        "建议待解锁后在浏览器中验证登录，核对账号密码及是否开启了安全提问。"
+                                    )
+                                )
+                            return sign_dict
+
                         # 登录失败，若是网络原因可以重试
                         if ("超时" in login_msg or "HTTP" in login_msg) and retry_count < self._max_retries:
                             logger.info(f"登录遇到网络波动，{self._retry_interval} 秒后重试...")
@@ -614,6 +669,7 @@ class qmjsign(_PluginBase):
                         sign_dict = {
                             "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
                             "status": f"签到失败: 自动登录失败 - {login_msg}",
+                            "message": login_msg
                         }
                         self._save_sign_history(sign_dict)
                         if self._notify:
@@ -1263,7 +1319,7 @@ class qmjsign(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 6},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
@@ -1271,6 +1327,17 @@ class qmjsign(_PluginBase):
                                         'label': '历史保留天数',
                                         'type': 'number',
                                         'placeholder': '30'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {
+                                        'model': 'clear_history',
+                                        'label': '清空历史记录 (保存时立即执行)',
                                     }
                                 }]
                             }
@@ -1292,7 +1359,8 @@ class qmjsign(_PluginBase):
                                             '1. 自动更新Cookie：建议配置论坛用户名与密码。当Cookie过期或未填写时，插件会自动通过移动端安全通道重新登录并自动回写持久化Cookie，无需反复手动抓包。\n'
                                             '2. 安全提问：若您的论坛账号启用了安全提问，请务必选择对应的问题并填写答案；否则保持“无安全提问”即可。\n'
                                             '3. 连接超时与代理：若服务器访问 1000qm.vip 较慢或经常超时，可在“网络代理”填入本地代理（如 http://127.0.0.1:7890）或增大“网络超时时间”。\n'
-                                            '4. 签到测试：保存配置后可勾选“立即运行一次”测试签到与红包领取流程。'
+                                            '4. 签到测试：保存配置后可勾选“立即运行一次”测试签到与红包领取流程。\n'
+                                            '5. 清空历史记录：开启【清空历史记录】后点击保存，将立即重置并清空签到历史记录与财富缓存（保存后开关自动复位为关闭）。'
                                         )
                                     }
                                 }]
@@ -1316,7 +1384,8 @@ class qmjsign(_PluginBase):
             "cron": "0 8 * * *",
             "max_retries": 3,
             "retry_interval": 30,
-            "history_days": 30
+            "history_days": 30,
+            "clear_history": False
         }
 
     def get_page(self) -> List[dict]:
@@ -1382,6 +1451,16 @@ class qmjsign(_PluginBase):
                         'component': 'VCardText',
                         'content': [
                             {
+                                'component': 'VAlert',
+                                'props': {
+                                    'type': 'info',
+                                    'variant': 'tonal',
+                                    'density': 'compact',
+                                    'class': 'mb-3',
+                                    'text': '提示：如需清理或重置签到历史，可在插件设置中开启【清空历史记录】并点击保存，或发送命令 /qmjsign_clear。'
+                                }
+                            },
+                            {
                                 'component': 'VTable',
                                 'props': {'hover': True, 'density': 'compact'},
                                 'content': [
@@ -1438,11 +1517,71 @@ class qmjsign(_PluginBase):
     def _has_running_extended_retry(self) -> bool:
         return False
 
-    def get_command(self) -> List[Dict[str, Any]]:
-        return []
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        """注册远程控制命令"""
+        if not EventType:
+            return []
+        return [
+            {
+                "cmd": "/qmjsign_clear",
+                "event": EventType.PluginAction,
+                "desc": "清空阡陌居签到历史记录",
+                "category": "签到",
+                "data": {"action": "qmjsign_clear_history"},
+            },
+            {
+                "cmd": "/qmjsign_sign",
+                "event": EventType.PluginAction,
+                "desc": "立即执行一次阡陌居签到",
+                "category": "签到",
+                "data": {"action": "qmjsign_sign_now"},
+            }
+        ]
+
+    @_register_action
+    def handle_plugin_commands(self, event: Event):
+        """处理插件远程命令事件"""
+        if not event or not event.event_data:
+            return
+        action = event.event_data.get("action")
+        if action == "qmjsign_clear_history":
+            self.save_data('sign_history', [])
+            self.save_data('last_credits_overview', {})
+            logger.info("已通过远程命令清空阡陌居签到历史记录")
+            self.post_message(
+                channel=event.event_data.get("channel"),
+                title="【🧹 阡陌居签到】",
+                text="已成功清空所有历史签到记录与财富统计缓存！",
+                userid=event.event_data.get("user")
+            )
+        elif action == "qmjsign_sign_now":
+            self.post_message(
+                channel=event.event_data.get("channel"),
+                title="【🚀 阡陌居签到】",
+                text="收到立即签到指令，开始执行签到任务...",
+                userid=event.event_data.get("user")
+            )
+            self.sign()
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        """注册插件对外 API 接口"""
+        return [
+            {
+                "path": "/clear_history",
+                "endpoint": self.clear_history_api,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "清空阡陌居签到历史记录",
+            }
+        ]
+
+    def clear_history_api(self):
+        """清空历史记录 API 端点"""
+        self.save_data('sign_history', [])
+        self.save_data('last_credits_overview', {})
+        logger.info("已通过 API 清空阡陌居签到历史记录")
+        return {"code": 0, "message": "历史记录已成功清空"}
 
     def _is_manual_trigger(self) -> bool:
         """检查是否手动触发"""
