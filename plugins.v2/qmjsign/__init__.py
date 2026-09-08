@@ -1,8 +1,9 @@
 """
 阡陌居签到插件 (QmjSign)
-版本: 1.2.5
+版本: 1.2.6
 原作者: madrays
 增强修改:
+- v1.2.6: 修正 Discuz! 积分体系认知偏差，移除虚构且恒为空的“总积分”卡片，统一为真实的五项财产指标（铜币、威望、贡献、发书数、综合积分），优化五列自适应均分排版与通知模板。
 - v1.2.5: 恢复并规范插件图标为完整的 HTTPS 原始链接，修复因相对文件名导致 MoviePilot 回退显示默认拼图占位符的问题。
 - v1.2.4: 深度重构 UI 排版与交互细节（Emil Kowalski 设计工程）：精简常驻开关为3等宽列、4列紧凑对齐数字参数框（彻底解决历史天数过宽问题）、独立单次动作组、全新仪表盘级账户财富指标卡（大字号指标+彩色微调卡片）与现代扁平化签到历史记录表格。
 - v1.2.3: 优化插件配置表单布局与色彩层级，4列均分开关色彩区分，长Cookie整行呼吸空间，4+4+4网络参数网格，警示色历史清理与结构化配置指南。
@@ -142,7 +143,7 @@ class qmjsign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/qmj.png"
     # 插件版本
-    plugin_version = "1.2.5"
+    plugin_version = "1.2.6"
     # 插件作者
     plugin_author = "Agonie"
     # 作者主页
@@ -1033,24 +1034,17 @@ class qmjsign(_PluginBase):
                 books_total = _search_num("发书数")
                 credits_user = _search_num("积分")
 
-                # 总积分
-                credits_sum = None
-                m_sum = re.search(r"总积分\s*:\s*(\d+)", text_credit)
-                if m_sum:
-                    credits_sum = m_sum.group(1)
-
                 overview = {}
                 if coins_total: overview["coins_total"] = coins_total
                 if prestige_total: overview["prestige_total"] = prestige_total
                 if contrib_total: overview["contribution_total"] = contrib_total
                 if books_total: overview["books_total"] = books_total
                 if credits_user: overview["credits_total"] = credits_user
-                if credits_sum: overview["credits_sum"] = credits_sum
 
                 if overview:
                     self.save_data('last_credits_overview', overview)
                     info.update(overview)
-                    logger.info(f"成功获取财富总览: 铜币={coins_total}, 威望={prestige_total}, 总积分={credits_sum}")
+                    logger.info(f"成功获取财富总览: 铜币={coins_total}, 威望={prestige_total}, 贡献={contrib_total}, 发书数={books_total}, 综合积分={credits_user}")
             except Exception as e:
                 logger.warning(f"获取财富总览失败: {str(e)}")
 
@@ -1103,13 +1097,12 @@ class qmjsign(_PluginBase):
             f"💬 消息：{sign_dict.get('message', '—')}\n"
             f"🪙 当日奖励：铜币 +{sign_dict.get('coins_gain', '—')} | 威望 +{sign_dict.get('prestige_gain', '—')}\n"
             f"━━━━━━━━━━\n"
-            f"🧧 财富汇总\n"
+            f"🧧 财富总览\n"
             f"🪙 铜币：{sign_dict.get('coins_total', '—')}\n"
-            f"🥇 威望：{sign_dict.get('prestige_total', '—')}\n"
+            f"🌟 威望：{sign_dict.get('prestige_total', '—')}\n"
             f"🤝 贡献：{sign_dict.get('contribution_total', '—')}\n"
             f"📚 发书数：{sign_dict.get('books_total', '—')}\n"
-            f"📈 积分：{sign_dict.get('credits_total', '—')}\n"
-            f"🏆 总积分：{sign_dict.get('credits_sum', '—')}\n"
+            f"👑 综合积分：{sign_dict.get('credits_total', '—')}\n"
             f"━━━━━━━━━━"
         )
         self.post_message(
@@ -1446,7 +1439,11 @@ class qmjsign(_PluginBase):
                 val_str = str(val) if val not in [None, 'None', ''] else '—'
                 return {
                     'component': 'VCol',
-                    'props': {'cols': 6, 'sm': 4, 'md': 2},
+                    'props': {
+                        'cols': 6,
+                        'sm': 4,
+                        'style': 'flex: 1 0 0%; min-width: 140px;',
+                    },
                     'content': [{
                         'component': 'VCard',
                         'props': {
@@ -1495,8 +1492,7 @@ class qmjsign(_PluginBase):
                                     stat_tile('威望', 'prestige_total', 'text-success', '🌟'),
                                     stat_tile('贡献', 'contribution_total', 'text-cyan-darken-1', '🤝'),
                                     stat_tile('发书数', 'books_total', 'text-blue-darken-1', '📚'),
-                                    stat_tile('积分', 'credits_total', 'text-indigo-darken-1', '💎'),
-                                    stat_tile('总积分', 'credits_sum', 'text-deep-purple-darken-1', '👑'),
+                                    stat_tile('综合积分', 'credits_total', 'text-deep-purple-darken-1', '👑'),
                                 ]
                             }
                         ]
