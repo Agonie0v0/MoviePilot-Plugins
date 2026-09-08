@@ -1,8 +1,9 @@
 """
 阡陌居签到插件 (QmjSign)
-版本: 1.2.6
-原作者: madrays
-增强修改:
+版本: 1.2.7
+源自: 基于 QD 签到模板实现
+更新历史:
+- v1.2.7: 规范插件源自于 QD 签到模板，移除历史无关依赖与表述；优化五大核心财产指标与自适应排版。
 - v1.2.6: 修正 Discuz! 积分体系认知偏差，移除虚构且恒为空的“总积分”卡片，统一为真实的五项财产指标（铜币、威望、贡献、发书数、综合积分），优化五列自适应均分排版与通知模板。
 - v1.2.5: 恢复并规范插件图标为完整的 HTTPS 原始链接，修复因相对文件名导致 MoviePilot 回退显示默认拼图占位符的问题。
 - v1.2.4: 深度重构 UI 排版与交互细节（Emil Kowalski 设计工程）：精简常驻开关为3等宽列、4列紧凑对齐数字参数框（彻底解决历史天数过宽问题）、独立单次动作组、全新仪表盘级账户财富指标卡（大字号指标+彩色微调卡片）与现代扁平化签到历史记录表格。
@@ -15,7 +16,7 @@
           优化重试与异常容错能力。
 - v1.1.3: 签到心情与签到文字改为随机选择（DSU 心情库 + 对应文案）
 - v1.1.2: 修复签到失败（“未定义操作”）：改用 https、补齐 qdmode/todaysay/fastreply 参数
-- v1.0.0: 初始版本，基于QD签到模板实现
+- v1.0.0: 初始版本，基于 QD 签到模板实现
 """
 import time
 import random
@@ -143,7 +144,7 @@ class qmjsign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/qmj.png"
     # 插件版本
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     # 插件作者
     plugin_author = "Agonie"
     # 作者主页
