@@ -1,0 +1,32 @@
+{
+    "autocleanunlinkedseed": {
+        "name": "Emby智能入库删种",
+        "description": "Emby入库之后自动清理断链做种，支持精准过滤",
+        "labels": "Qbittorrent",
+        "version": "1.0",
+        "icon": "clean_a.png",
+        "author": "Agonie",
+        "github": "Agonie0v0/MoviePilot-Plugins",
+        "repo": "Agonie0v0/MoviePilot-Plugins",
+        "level": 1,
+        "v2": true,
+        "history": {
+            "v1.0": "Emby入库之后自动删种"
+        }
+    },
+    "qmjsign": {
+        "name": "阡陌居签到",
+        "description": "自动完成阡陌居每日签到与威望红包，支持账号密码自动登录更新Cookie、失败重试与历史记录",
+        "labels": "签到,阡陌居,论坛,PT",
+        "version": "1.2.0",
+        "icon": "qmj.ico",
+        "author": "Agonie",
+        "github": "Agonie0v0/MoviePilot-Plugins",
+        "repo": "Agonie0v0/MoviePilot-Plugins",
+        "level": 1,
+        "v2": true,
+        "history": {
+            "v1.2.0": "新增账号密码自动登录更新Cookie功能，避免频繁手动抓取；支持Discuz安全提问；支持网络代理与自定义超时设置；优化Cookie校验逻辑，区分网络异常与会话失效，修复超时导致误判Cookie过期的Bug。"
+        }
+    }
+}
