@@ -1,8 +1,11 @@
 """
 阡陌居签到插件 (QmjSign)
-版本: 1.2.0
+版本: 1.2.3
 原作者: madrays
 增强修改:
+- v1.2.3: 优化插件配置表单布局与色彩层级，4列均分开关色彩区分，长Cookie整行呼吸空间，4+4+4网络参数网格，警示色历史清理与结构化配置指南。
+- v1.2.2: 增加清空历史记录功能（支持设置表单开关、远程命令/qmjsign_clear与API三种方式）；配置高清插件图标（PNG格式及全URL引用）；优化账号登录参数与密码空格处理，增加账号被锁定(login_strike)防重试保护与精准引导提示。
+- v1.2.1: 增强自动登录容错机制：支持UTF-8 BOM自动清洗；优先识别auth Cookie；增加会话有效性兜底探测与错误文本清洗。
 - v1.2.0: 增加账号密码自动登录与Cookie自动更新持久化；支持Discuz安全提问；
           增加网络代理(Proxy)与自定义超时时间配置；
           优化Cookie有效性校验机制（区分网络超时与会话失效，彻底解决误报Cookie过期与ReadTimeout问题）；
@@ -1122,55 +1125,61 @@ class qmjsign(_PluginBase):
             {
                 'component': 'VForm',
                 'content': [
+                    # 1. 顶部核心功能开关（4列均分，色彩分明，文案对称）
                     {
                         'component': 'VRow',
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'sm': 6, 'md': 3},
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'enabled',
                                         'label': '启用插件',
+                                        'color': 'primary'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'sm': 6, 'md': 3},
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'notify',
-                                        'label': '开启通知',
+                                        'label': '开启签到通知',
+                                        'color': 'info'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'sm': 6, 'md': 3},
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'draw_prestige',
-                                        'label': '领取每日威望红包',
+                                        'label': '领取威望红包',
+                                        'color': 'success'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'sm': 6, 'md': 3},
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'onlyonce',
                                         'label': '立即运行一次',
+                                        'color': 'warning'
                                     }
                                 }]
                             }
                         ]
                     },
+                    # 2. 账号与密码认证（6 + 6 对称网格）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1201,6 +1210,7 @@ class qmjsign(_PluginBase):
                             }
                         ]
                     },
+                    # 3. 安全提问（6 + 6 对称网格）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1230,52 +1240,73 @@ class qmjsign(_PluginBase):
                             }
                         ]
                     },
+                    # 4. 站点 Cookie 独立整行（cols: 12，给长串Cookie充分呼吸空间）
                     {
                         'component': 'VRow',
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 8},
+                                'props': {'cols': 12},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'cookie',
-                                        'label': '站点Cookie（可选，登录后自动保存）',
-                                        'placeholder': '如已配置账号密码可留空，系统自动登录并回写'
+                                        'label': '站点 Cookie（可选，填入账号密码将自动登录生成并持久化保存）',
+                                        'placeholder': '如已配置账号密码可完全留空，系统自动登录并回填保存'
+                                    }
+                                }]
+                            }
+                        ]
+                    },
+                    # 5. 定时周期与网络代理（6 + 6，两者均为外部环境配置）
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VCronField',
+                                    'props': {
+                                        'model': 'cron',
+                                        'label': '签到周期 (Cron 表达式)'
                                     }
                                 }]
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'proxy',
+                                        'label': '网络代理（可选）',
+                                        'placeholder': '例如 http://127.0.0.1:7890，无代理请留空'
+                                    }
+                                }]
+                            }
+                        ]
+                    },
+                    # 6. 请求参数三列等宽（4 + 4 + 4 = 12，告别原先4个小框挤压变形）
+                    {
+                        'component': 'VRow',
+                        'content': [
                             {
                                 'component': 'VCol',
                                 'props': {'cols': 12, 'md': 4},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
-                                        'model': 'proxy',
-                                        'label': '网络代理（可选）',
-                                        'placeholder': '例如 http://127.0.0.1:7890'
-                                    }
-                                }]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
-                                'content': [{
-                                    'component': 'VCronField',
-                                    'props': {
-                                        'model': 'cron',
-                                        'label': '签到周期'
+                                        'model': 'timeout',
+                                        'label': '网络超时时间(秒)',
+                                        'type': 'number',
+                                        'placeholder': '20'
                                     }
                                 }]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
@@ -1288,7 +1319,7 @@ class qmjsign(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {
@@ -1298,22 +1329,10 @@ class qmjsign(_PluginBase):
                                         'placeholder': '30'
                                     }
                                 }]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
-                                'content': [{
-                                    'component': 'VTextField',
-                                    'props': {
-                                        'model': 'timeout',
-                                        'label': '网络超时时间(秒)',
-                                        'type': 'number',
-                                        'placeholder': '20'
-                                    }
-                                }]
                             }
                         ]
                     },
+                    # 7. 数据维护设置（6 + 6，左右基线对齐，警示色开关）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1338,11 +1357,13 @@ class qmjsign(_PluginBase):
                                     'props': {
                                         'model': 'clear_history',
                                         'label': '清空历史记录 (保存时立即执行)',
+                                        'color': 'error'
                                     }
                                 }]
                             }
                         ]
                     },
+                    # 8. 结构化说明卡片（图文层次清晰，呼吸均匀）
                     {
                         'component': 'VRow',
                         'content': [
@@ -1355,12 +1376,12 @@ class qmjsign(_PluginBase):
                                         'type': 'info',
                                         'variant': 'tonal',
                                         'text': (
-                                            '💡【功能与配置说明】\n'
-                                            '1. 自动更新Cookie：建议配置论坛用户名与密码。当Cookie过期或未填写时，插件会自动通过移动端安全通道重新登录并自动回写持久化Cookie，无需反复手动抓包。\n'
-                                            '2. 安全提问：若您的论坛账号启用了安全提问，请务必选择对应的问题并填写答案；否则保持“无安全提问”即可。\n'
-                                            '3. 连接超时与代理：若服务器访问 1000qm.vip 较慢或经常超时，可在“网络代理”填入本地代理（如 http://127.0.0.1:7890）或增大“网络超时时间”。\n'
-                                            '4. 签到测试：保存配置后可勾选“立即运行一次”测试签到与红包领取流程。\n'
-                                            '5. 清空历史记录：开启【清空历史记录】后点击保存，将立即重置并清空签到历史记录与财富缓存（保存后开关自动复位为关闭）。'
+                                            '💡【配置指南与说明】\n'
+                                            '• 🔑 自动更新Cookie：配置用户名和密码后，Cookie 失效将自动登录并持久化保存，彻底告别频繁手动抓包。\n'
+                                            '• 🛡️ 安全提问：若论坛账号启用了安全提问，请选择相应问题并填写答案；否则保持“无安全提问”。\n'
+                                            '• 🌐 代理与超时：网络直连 1000qm.vip 若经常波动或超时，可在网络代理填入本地代理，并适当调大超时时间。\n'
+                                            '• 🚀 签到测试：保存配置后可勾选顶部的“立即运行一次”，系统将在后台立刻执行签到与威望红包任务。\n'
+                                            '• 🧹 历史清理：如需清空历史记录，勾选“清空历史记录”后点击保存即可，执行完毕后开关会自动复位。'
                                         )
                                     }
                                 }]
