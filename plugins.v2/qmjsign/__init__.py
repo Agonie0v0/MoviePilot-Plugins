@@ -1,8 +1,9 @@
 """
 阡陌居签到插件 (QmjSign)
-版本: 1.2.4
+版本: 1.2.5
 原作者: madrays
 增强修改:
+- v1.2.5: 恢复并规范插件图标为完整的 HTTPS 原始链接，修复因相对文件名导致 MoviePilot 回退显示默认拼图占位符的问题。
 - v1.2.4: 深度重构 UI 排版与交互细节（Emil Kowalski 设计工程）：精简常驻开关为3等宽列、4列紧凑对齐数字参数框（彻底解决历史天数过宽问题）、独立单次动作组、全新仪表盘级账户财富指标卡（大字号指标+彩色微调卡片）与现代扁平化签到历史记录表格。
 - v1.2.3: 优化插件配置表单布局与色彩层级，4列均分开关色彩区分，长Cookie整行呼吸空间，4+4+4网络参数网格，警示色历史清理与结构化配置指南。
 - v1.2.2: 增加清空历史记录功能（支持设置表单开关、远程命令/qmjsign_clear与API三种方式）；配置高清插件图标（PNG格式及全URL引用）；优化账号登录参数与密码空格处理，增加账号被锁定(login_strike)防重试保护与精准引导提示。
@@ -139,9 +140,9 @@ class qmjsign(_PluginBase):
     # 插件描述
     plugin_desc = "自动完成阡陌居每日签到与威望红包，支持账号密码自动登录更新Cookie、失败重试与历史记录"
     # 插件图标
-    plugin_icon = "qmj.png"
+    plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/qmj.png"
     # 插件版本
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     # 插件作者
     plugin_author = "Agonie"
     # 作者主页
