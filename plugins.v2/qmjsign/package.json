@@ -1,0 +1,20 @@
+{
+  "QmjSign": {
+    "name": "阡陌居签到",
+    "description": "自动完成阡陌居每日签到与威望红包，支持账号密码自动登录更新Cookie、失败重试与历史记录",
+    "labels": "签到,阡陌居,论坛,PT",
+    "version": "1.2.0",
+    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/qmj.ico",
+    "author": "madrays & antigravity",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "v1.2.0": "新增账号密码自动登录更新Cookie功能，避免手动频繁抓取；支持Discuz安全提问；支持网络代理与自定义超时设置；优化Cookie校验逻辑，区分网络异常与会话失效，修复超时导致误判Cookie过期的Bug。",
+      "v1.1.3": "签到心情与签到文字改为随机选择（DSU 心情库 + 对应文案）",
+      "v1.1.2": "修复签到失败（“未定义操作”）：改用 https、补齐 qdmode/todaysay/fastreply 参数",
+      "v1.1.1": "威望红包流程补充先申请再领取；重复签到通知回填铜币；修正文案",
+      "v1.1.0": "新增每日威望红包领取开关；解析并汇总财富六项；通知与详情页展示优化；精简日志",
+      "v1.0.0": "首次发布，支持每日定时自动签到、失败重试、历史记录和通知"
+    }
+  }
+}
