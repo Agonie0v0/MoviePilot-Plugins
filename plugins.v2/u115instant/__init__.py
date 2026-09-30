@@ -41,7 +41,7 @@ class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.5.0"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -49,6 +49,7 @@ class u115instant(_PluginBase):
     auth_level = 1
 
     _MARKER = "115秒传整理：未命中秒传，已取消普通上传"
+    _DEFAULT_RISK_COOLDOWN_SECONDS = 3600
     _VIDEO_EXTENSIONS = {
         ".264",
         ".265",
@@ -78,6 +79,10 @@ class u115instant(_PluginBase):
         self._max_wait_hours = 72
         self._tasks: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
+        # ponytail: 一个账号一个锁即可，插件只允许一个 115 整理链路在途。
+        self._u115_lock = threading.RLock()
+        self._cooldown_until = 0.0
+        self._u115_target: Optional[U115Pan] = None
         self._context = threading.local()
 
     def init_plugin(self, config: dict = None):
@@ -112,6 +117,159 @@ class u115instant(_PluginBase):
         except (TypeError, ValueError):
             return default
         return max(minimum, min(value, maximum))
+
+    @staticmethod
+    def _host_cooldown_until(original: Optional[U115Pan]) -> float:
+        """读取 MP 内置 115 对象的共享风控截止时间。"""
+        if original is None:
+            return 0.0
+        try:
+            limit_lock = getattr(original, "_limit_lock", None)
+            if limit_lock is not None:
+                with limit_lock:
+                    return float(getattr(original, "_limit_until", 0.0) or 0.0)
+            return float(getattr(original, "_limit_until", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    def _get_u115_target(self) -> Optional[U115Pan]:
+        """获取当前进程共享的 115 存储对象。"""
+        if self._u115_target is not None:
+            return self._u115_target
+        try:
+            self._u115_target = U115Pan()
+        except Exception as exc:
+            logger.debug(f"[115Instant] 获取 115 对象失败：{exc}")
+        return self._u115_target
+
+    def _install_request_guard(self, original: U115Pan):
+        """将宿主请求方法接到插件冷却和并发锁。"""
+        guard = getattr(original, "_u115instant_request_guard", None)
+        if guard:
+            guard["plugin"] = self
+            self._u115_target = original
+            return
+
+        raw_request = original._request_api
+        guard = {"plugin": self, "original": raw_request}
+
+        def guarded_request(method, endpoint, result_key=None, *args, **kwargs):
+            plugin = guard.get("plugin")
+            if plugin is None or not plugin.get_state():
+                return guard["original"](method, endpoint, result_key, *args, **kwargs)
+            return plugin._request_115(
+                original,
+                method,
+                endpoint,
+                result_key,
+                *args,
+                **kwargs,
+            )
+
+        original._u115instant_request_guard = guard
+        original._request_api = guarded_request
+        self._u115_target = original
+
+    def _restore_request_guard(self):
+        """插件停用时恢复宿主原始请求方法。"""
+        original = self._u115_target
+        guard = getattr(original, "_u115instant_request_guard", None)
+        if not original or not guard or guard.get("plugin") is not self:
+            return
+        original._request_api = guard["original"]
+        delattr(original, "_u115instant_request_guard")
+        self._u115_target = None
+
+    @staticmethod
+    def _raw_request_api(original: U115Pan):
+        guard = getattr(original, "_u115instant_request_guard", None)
+        if guard:
+            return guard["original"]
+        return original._request_api
+
+    def _cooldown_until_for(self, original: Optional[U115Pan] = None) -> float:
+        """合并插件冷却与宿主冷却，避免调用方绕过任一层保护。"""
+        host_until = self._host_cooldown_until(original)
+        with self._lock:
+            self._cooldown_until = max(self._cooldown_until, host_until)
+            return self._cooldown_until
+
+    def _cooldown_remaining(self, original: Optional[U115Pan] = None) -> float:
+        return max(0.0, self._cooldown_until_for(original) - time.time())
+
+    @staticmethod
+    def _cooldown_minutes(seconds: float) -> int:
+        return max(1, int((max(0.0, seconds) + 59) // 60))
+
+    def _activate_cooldown(self, original: Optional[U115Pan], reason: str) -> float:
+        """记录一次插件侧冷却；宿主冷却更长时沿用宿主截止时间。"""
+        now = time.time()
+        try:
+            duration = float(
+                getattr(original, "limit_sleep_seconds", self._DEFAULT_RISK_COOLDOWN_SECONDS)
+            )
+        except (TypeError, ValueError):
+            duration = self._DEFAULT_RISK_COOLDOWN_SECONDS
+        until = max(now + max(60.0, duration), self._host_cooldown_until(original))
+        with self._lock:
+            previous = self._cooldown_until
+            self._cooldown_until = max(previous, until)
+            active_until = self._cooldown_until
+        if active_until > previous + 1:
+            logger.warning(
+                f"[115Instant] {reason}，插件暂停 115 请求 {self._cooldown_minutes(active_until - now)} 分钟"
+            )
+        return active_until
+
+    def _request_115(
+        self,
+        original: U115Pan,
+        method: str,
+        endpoint: str,
+        result_key: Optional[str] = None,
+        *args,
+        **kwargs,
+    ):
+        """插件请求入口：串行调用并在失败后进入插件侧冷却。"""
+        with self._u115_lock:
+            remaining = self._cooldown_remaining(original)
+            if remaining > 0:
+                logger.debug(
+                    f"[115Instant] {method} {endpoint} 被插件冷却拦截，"
+                    f"剩余 {remaining:.0f} 秒"
+                )
+                return None
+            # 宿主的重试会在风控响应上同步等待；重试调度交给插件队列。
+            kwargs["retry_limit"] = 0
+            response = self._raw_request_api(original)(
+                method,
+                endpoint,
+                result_key,
+                *args,
+                **kwargs,
+            )
+            if response is None:
+                self._activate_cooldown(
+                    original,
+                    f"{method} {endpoint} 请求失败或触发访问限制",
+                )
+            return response
+
+    def _defer_task(self, key: str, next_at: float, reason: str):
+        """不增加重试次数地顺延任务，供锁竞争和风控冷却使用。"""
+        with self._lock:
+            task = self._tasks.get(key)
+            if not task:
+                return
+            task.update(
+                {
+                    "status": "waiting",
+                    "next_at": next_at,
+                    "last_error": reason,
+                    "updated_at": time.time(),
+                }
+            )
+            self._save_tasks()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -155,6 +313,7 @@ class u115instant(_PluginBase):
         if storage == "u115":
             try:
                 original = U115Pan()
+                self._install_request_guard(original)
                 proxy = _U115InstantProxy(self, original)
                 if isinstance(data, dict):
                     data["storage_oper"] = proxy
@@ -180,7 +339,28 @@ class u115instant(_PluginBase):
             "force_upload": bool(previous.get("force_upload"))
             if isinstance(previous, dict)
             else False,
+            "retrying": bool(previous.get("retrying"))
+            if isinstance(previous, dict)
+            else False,
         }
+        path_obj = Path(str(path or ""))
+        if (
+            self._protected(path_obj)
+            and self._cooldown_remaining(self._get_u115_target()) > 0
+        ):
+            remaining = self._cooldown_remaining(self._get_u115_target())
+            self._record_wait(
+                path_obj,
+                Path(str(self._field(data, "target_path") or "")),
+                f"115 风控冷却中，已顺延 {self._cooldown_minutes(remaining)} 分钟",
+            )
+            self._set_field(data, "cancel", True)
+            self._set_field(data, "source", "u115instant")
+            self._set_field(
+                data,
+                "reason",
+                f"115 风控冷却中，剩余 {self._cooldown_minutes(remaining)} 分钟，本次整理已顺延",
+            )
 
     @eventmanager.register(ChainEventType.TransferOverwriteCheck, priority=5)
     def deny_overwrite(self, event: Event):
@@ -235,6 +415,7 @@ class u115instant(_PluginBase):
         ]
 
     def stop_service(self):
+        self._restore_request_guard()
         self._context.value = None
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -404,6 +585,7 @@ class u115instant(_PluginBase):
         waiting = sum(task.get("status") == "waiting" for task in tasks)
         retrying = sum(task.get("status") in {"retrying", "forcing"} for task in tasks)
         needs_action = sum(task.get("status") in {"manual", "stale", "error", "verify"} for task in tasks)
+        cooldown_remaining = self._cooldown_remaining(self._get_u115_target())
 
         def format_time(value: Any) -> str:
             try:
@@ -452,6 +634,12 @@ class u115instant(_PluginBase):
         if not self._enabled:
             alert_type, alert_icon, alert_title = "warning", "mdi-power-off", "插件当前未启用"
             alert_text = "启用插件并保存配置后，MP 才会拦截本地到 115 的视频移动整理。"
+        elif cooldown_remaining > 0:
+            alert_type, alert_icon, alert_title = "warning", "mdi-shield-alert-outline", "115 风控冷却中"
+            alert_text = (
+                f"插件已暂停新的 115 请求，预计还需等待 "
+                f"{self._cooldown_minutes(cooldown_remaining)} 分钟；队列任务会自动顺延。"
+            )
         elif needs_action:
             alert_type, alert_icon, alert_title = "warning", "mdi-alert-outline", "有任务需要人工处理"
             alert_text = f"当前有 {needs_action} 个任务需要人工处理；执行 /115instant_force 后会忽略秒传检查并强制上传。"
@@ -743,79 +931,124 @@ class u115instant(_PluginBase):
     def _instant_upload(self, original: U115Pan, target_dir, local_path: Path, new_name: Optional[str]):
         local_path = Path(local_path)
         context = getattr(self._context, "value", None)
-        if isinstance(context, dict) and context.get("force_upload"):
-            # 人工处理明确要求放弃秒传拦截，交回 MP 原生上传流程。
-            return original.upload(target_dir, local_path, new_name)
-        if not self._enabled or not self._protected(local_path):
-            try:
-                return original.upload(target_dir, local_path, new_name)
-            finally:
-                self._context.value = None
-
-        target_name = new_name or local_path.name
-        target_path = Path(target_dir.path) / target_name
+        force_upload = isinstance(context, dict) and context.get("force_upload")
         try:
-            file_size = local_path.stat().st_size
-            file_sha1 = original._calc_sha1(local_path)
-            file_preid = original._calc_sha1(local_path, 128 * 1024 * 1024)
-            target_cid = target_dir.fileid
-            if not target_cid:
-                self._record_state(local_path, "error", "115 目标目录缺少 fileid")
-                return None
+            with self._u115_lock:
+                if force_upload:
+                    # 人工处理明确要求放弃秒传拦截，交回 MP 原生上传流程。
+                    if self._cooldown_remaining(original) > 0:
+                        logger.warning(
+                            f"[115Instant] {local_path.name} 暂停强制上传，等待风控冷却结束"
+                        )
+                        return None
+                    return original.upload(target_dir, local_path, new_name)
+                if not self._enabled or not self._protected(local_path):
+                    return original.upload(target_dir, local_path, new_name)
 
-            init_data = {
-                "file_name": target_name,
-                "file_size": file_size,
-                "target": f"U_1_{target_cid}",
-                "fileid": file_sha1,
-                "preid": file_preid,
-            }
-            init_resp = original._request_api("POST", "/open/upload/init", data=init_data)
-            if not init_resp or not init_resp.get("state"):
-                self._record_state(local_path, "error", "115 秒传预检接口失败，请检查登录或网络")
-                return None
-
-            init_result = init_resp.get("data") or {}
-            if init_result.get("code") in (700, 701) and init_result.get("sign_check"):
-                sign_check = str(init_result["sign_check"]).split("-")
-                if len(sign_check) != 2:
-                    self._record_state(local_path, "error", "115 二次认证范围无效")
+                if self._cooldown_remaining(original) > 0:
+                    remaining = self._cooldown_remaining(original)
+                    self._record_wait(
+                        local_path,
+                        Path(target_dir.path) / (new_name or local_path.name),
+                        f"115 风控冷却中，已顺延 {self._cooldown_minutes(remaining)} 分钟",
+                    )
                     return None
-                start, end = int(sign_check[0]), int(sign_check[1])
-                with local_path.open("rb") as handle:
-                    handle.seek(start)
-                    sign_value = hashlib.sha1(handle.read(end - start + 1)).hexdigest().upper()
-                init_data.update(
-                    {
-                        "pick_code": init_result.get("pick_code"),
-                        "sign_key": init_result.get("sign_key"),
-                        "sign_val": sign_value,
-                    }
+
+                target_name = new_name or local_path.name
+                target_path = Path(target_dir.path) / target_name
+                file_size = local_path.stat().st_size
+                file_sha1 = original._calc_sha1(local_path)
+                file_preid = original._calc_sha1(local_path, 128 * 1024 * 1024)
+                target_cid = target_dir.fileid
+                if not target_cid:
+                    self._record_state(local_path, "error", "115 目标目录缺少 fileid")
+                    return None
+
+                init_data = {
+                    "file_name": target_name,
+                    "file_size": file_size,
+                    "target": f"U_1_{target_cid}",
+                    "fileid": file_sha1,
+                    "preid": file_preid,
+                }
+                init_resp = self._request_115(
+                    original,
+                    "POST",
+                    "/open/upload/init",
+                    data=init_data,
                 )
-                init_resp = original._request_api("POST", "/open/upload/init", data=init_data)
                 if not init_resp or not init_resp.get("state"):
-                    self._record_state(local_path, "error", "115 二次认证失败")
+                    if self._cooldown_remaining(original) > 0:
+                        self._record_wait(
+                            local_path,
+                            target_path,
+                            f"115 请求失败，已进入风控冷却，稍后重试",
+                        )
+                    else:
+                        self._record_state(
+                            local_path,
+                            "error",
+                            "115 秒传预检接口失败，请检查登录或网络",
+                        )
                     return None
+
                 init_result = init_resp.get("data") or {}
+                if init_result.get("code") in (700, 701) and init_result.get("sign_check"):
+                    sign_check = str(init_result["sign_check"]).split("-")
+                    if len(sign_check) != 2:
+                        self._record_state(local_path, "error", "115 二次认证范围无效")
+                        return None
+                    start, end = int(sign_check[0]), int(sign_check[1])
+                    with local_path.open("rb") as handle:
+                        handle.seek(start)
+                        sign_value = hashlib.sha1(handle.read(end - start + 1)).hexdigest().upper()
+                    init_data.update(
+                        {
+                            "pick_code": init_result.get("pick_code"),
+                            "sign_key": init_result.get("sign_key"),
+                            "sign_val": sign_value,
+                        }
+                    )
+                    init_resp = self._request_115(
+                        original,
+                        "POST",
+                        "/open/upload/init",
+                        data=init_data,
+                    )
+                    if not init_resp or not init_resp.get("state"):
+                        if self._cooldown_remaining(original) > 0:
+                            self._record_wait(
+                                local_path,
+                                target_path,
+                                "115 二次认证请求进入风控冷却，稍后重试",
+                            )
+                        else:
+                            self._record_state(local_path, "error", "115 二次认证失败")
+                        return None
+                    init_result = init_resp.get("data") or {}
 
-            if init_result.get("status") != 2:
-                self._record_wait(local_path, target_path, self._MARKER)
-                return None
+                if init_result.get("status") != 2:
+                    self._record_wait(local_path, target_path, self._MARKER)
+                    return None
 
-            file_id = init_result.get("file_id")
-            if file_id:
-                info = original._request_api(
-                    "GET", "/open/folder/get_info", "data", params={"file_id": int(file_id)}
-                )
-                if info:
+                file_id = init_result.get("file_id")
+                if file_id:
+                    info = self._request_115(
+                        original,
+                        "GET",
+                        "/open/folder/get_info",
+                        "data",
+                        params={"file_id": int(file_id)},
+                    )
+                    if info:
+                        logger.info(f"[115Instant] {target_name} 秒传成功")
+                        return self._build_file_item(target_path, info)
+                remote_item = original.get_item(target_path)
+                if remote_item:
                     logger.info(f"[115Instant] {target_name} 秒传成功")
-                    return self._build_file_item(target_path, info)
-            remote_item = original.get_item(target_path)
-            if remote_item:
-                logger.info(f"[115Instant] {target_name} 秒传成功")
-                return remote_item
-            self._record_state(local_path, "verify", "115 已返回秒传成功，但目标文件暂不可核验")
-            return None
+                    return remote_item
+                self._record_state(local_path, "verify", "115 已返回秒传成功，但目标文件暂不可核验")
+                return None
         except (OSError, ValueError, TypeError) as exc:
             self._record_state(local_path, "error", f"115 秒传预检异常：{exc}")
             return None
@@ -837,125 +1070,182 @@ class u115instant(_PluginBase):
         """强制上传一条人工任务，跳过插件的秒传预检。"""
         if not self._enabled:
             return
-        pending_statuses = {"manual", "stale", "error", "verify"}
-        selected = None
-        with self._lock:
-            for key, task in self._tasks.items():
-                if task.get("status") in pending_statuses:
-                    selected = (key, dict(task))
-                    break
-        if not selected:
-            self._notify_user("115 秒传暂无人工任务", "当前没有可强制上传的等待任务")
-            return
-
-        key, task = selected
-        source = Path(task["path"])
-        if not self._signature(source):
-            self._record_state(source, "stale", "源文件已不存在，无法强制上传")
-            return
-        history_id = self._resolve_history_id(task)
-        if not history_id:
-            self._record_state(source, "error", "找不到整理历史记录，无法强制上传")
-            return
-
-        with self._lock:
-            current = self._tasks.get(key)
-            if not current or current.get("status") not in pending_statuses:
-                return
-            current.update({
-                "status": "forcing",
-                "history_id": history_id,
-                "updated_at": time.time(),
-                "last_error": "人工确认强制上传，已跳过秒传预检",
-            })
-            self._save_tasks()
-
-        self._context.value = {"force_upload": True, "path": str(source)}
         try:
+            if not self._u115_lock.acquire(blocking=False):
+                logger.info("[115Instant] 已有 115 整理正在执行，人工强制上传顺延")
+                return
             try:
-                state, message = TransferChain().redo_transfer_history(history_id)
-            except Exception as exc:
-                state, message = False, f"强制上传异常：{exc}"
-        finally:
-            self._context.value = None
+                pending_statuses = {"manual", "stale", "error", "verify"}
+                selected = None
+                with self._lock:
+                    for key, task in self._tasks.items():
+                        if task.get("status") in pending_statuses:
+                            selected = (key, dict(task))
+                            break
+                if not selected:
+                    self._notify_user("115 秒传暂无人工任务", "当前没有可强制上传的等待任务")
+                    return
 
-        if state:
-            with self._lock:
-                self._tasks.pop(key, None)
-                self._save_tasks()
-            self._notify_user("115 强制上传完成", source.name)
-            return
+                key, task = selected
+                source = Path(task["path"])
+                if not self._signature(source):
+                    self._record_state(source, "stale", "源文件已不存在，无法强制上传")
+                    return
+                history_id = self._resolve_history_id(task)
+                if not history_id:
+                    self._record_state(source, "error", "找不到整理历史记录，无法强制上传")
+                    return
 
-        with self._lock:
-            current = self._tasks.get(key)
-            if current and current.get("status") == "forcing":
-                current.update({
-                    "status": "manual",
-                    "next_at": None,
-                    "last_error": f"强制上传失败：{message or '未知错误'}",
-                    "updated_at": time.time(),
-                })
-                self._save_tasks()
-        self._notify_user("115 强制上传失败", f"{source.name}\n{message or '未知错误'}")
+                original = self._get_u115_target()
+                remaining = self._cooldown_remaining(original)
+                if remaining > 0:
+                    reason = (
+                        f"115 风控冷却中，剩余 {self._cooldown_minutes(remaining)} 分钟；"
+                        "人工强制上传已保留"
+                    )
+                    with self._lock:
+                        current = self._tasks.get(key)
+                        if current:
+                            current.update({"last_error": reason, "updated_at": time.time()})
+                            self._save_tasks()
+                    self._notify_user("115 仍在风控冷却", f"{source.name}\n{reason}")
+                    return
+
+                with self._lock:
+                    current = self._tasks.get(key)
+                    if not current or current.get("status") not in pending_statuses:
+                        return
+                    current.update({
+                        "status": "forcing",
+                        "history_id": history_id,
+                        "updated_at": time.time(),
+                        "last_error": "人工确认强制上传，已跳过秒传预检",
+                    })
+                    self._save_tasks()
+
+                self._context.value = {"force_upload": True, "path": str(source)}
+                try:
+                    try:
+                        state, message = TransferChain().redo_transfer_history(history_id)
+                    except Exception as exc:
+                        state, message = False, f"强制上传异常：{exc}"
+                finally:
+                    self._context.value = None
+
+                if state:
+                    with self._lock:
+                        self._tasks.pop(key, None)
+                        self._save_tasks()
+                    self._notify_user("115 强制上传完成", source.name)
+                    return
+
+                with self._lock:
+                    current = self._tasks.get(key)
+                    if current and current.get("status") == "forcing":
+                        current.update({
+                            "status": "manual",
+                            "next_at": None,
+                            "last_error": f"强制上传失败：{message or '未知错误'}",
+                            "updated_at": time.time(),
+                        })
+                        self._save_tasks()
+                self._notify_user("115 强制上传失败", f"{source.name}\n{message or '未知错误'}")
+            finally:
+                self._u115_lock.release()
+        except Exception as exc:
+            logger.error(f"[115Instant] 人工强制上传处理异常：{exc}")
 
     def retry_pending(self, force: bool = False):
         if not self._enabled:
             return
-        now = time.time()
-        due: List[Tuple[str, Dict[str, Any]]] = []
-        with self._lock:
-            for key, task in self._tasks.items():
-                if task.get("status") != "waiting":
-                    continue
-                if not force and float(task.get("next_at", 0)) > now:
-                    continue
-                due.append((key, dict(task)))
+        if not self._u115_lock.acquire(blocking=False):
+            logger.debug("[115Instant] 已有 115 整理正在执行，跳过本轮自动重试")
+            return
+        try:
+            now = time.time()
+            due: List[Tuple[str, Dict[str, Any]]] = []
+            with self._lock:
+                for key, task in self._tasks.items():
+                    if task.get("status") != "waiting":
+                        continue
+                    if not force and float(task.get("next_at", 0)) > now:
+                        continue
+                    due.append((key, dict(task)))
 
-        for key, task in due[:1]:
+            if not due:
+                return
+
+            key, task = due[0]
+            original = self._get_u115_target()
+            remaining = self._cooldown_remaining(original)
+            if remaining > 0:
+                self._defer_task(
+                    key,
+                    now + remaining,
+                    f"115 风控冷却中，已顺延 {self._cooldown_minutes(remaining)} 分钟",
+                )
+                return
+
             source = Path(task["path"])
             signature = self._signature(source)
             if not signature:
                 self._record_state(source, "stale", "源文件已不存在")
-                continue
+                return
             if signature != task.get("signature"):
                 self._record_state(source, "stale", "源文件大小或修改时间已变化")
-                continue
+                return
             first_at = float(task.get("first_at", now))
             if now - first_at > self._max_wait_hours * 3600:
                 self._record_state(source, "stale", "已超过最大等待时间，请人工执行强制上传")
-                continue
+                return
             history_id = self._resolve_history_id(task)
             if not history_id:
-                with self._lock:
-                    current = self._tasks.get(key)
-                    if current:
-                        current["next_at"] = now + 60
-                        self._save_tasks()
-                continue
+                self._defer_task(key, now + 60, "等待 MP 生成整理历史记录")
+                return
+            manual = False
             with self._lock:
                 current = self._tasks.get(key)
                 if not current or current.get("status") != "waiting":
-                    continue
+                    return
                 current["status"] = "retrying"
                 current["history_id"] = history_id
                 current["updated_at"] = now
                 self._save_tasks()
+
+            self._context.value = {"retrying": True, "path": str(source)}
             try:
-                state, message = TransferChain().redo_transfer_history(history_id)
-            except Exception as exc:
-                state, message = False, f"重试异常：{exc}"
+                try:
+                    state, message = TransferChain().redo_transfer_history(history_id)
+                except Exception as exc:
+                    state, message = False, f"重试异常：{exc}"
+            finally:
+                self._context.value = None
+
             if state:
                 with self._lock:
                     self._tasks.pop(key, None)
                     self._save_tasks()
                 self._notify_user("115 秒传整理完成", source.name)
-            else:
-                with self._lock:
-                    current = self._tasks.get(key)
-                    if current and current.get("status") == "retrying":
-                        current["status"] = "waiting"
-                        current["next_at"] = time.time() + self._later_retry_minutes * 60
-                        current["last_error"] = str(message or "再次未命中秒传")
-                        current["updated_at"] = time.time()
-                        self._save_tasks()
+                return
+
+            with self._lock:
+                current = self._tasks.get(key)
+                if current and current.get("status") == "retrying":
+                    attempts = int(current.get("attempts", 0)) + 1
+                    manual = attempts > self._max_retry_attempts
+                    current.update({
+                        "status": "manual" if manual else "waiting",
+                        "attempts": attempts,
+                        "next_at": None if manual else time.time() + self._later_retry_minutes * 60,
+                        "last_error": str(message or "再次未命中秒传"),
+                        "updated_at": time.time(),
+                    })
+                    self._save_tasks()
+            if manual:
+                self._notify_user(
+                    "115 秒传转人工处理",
+                    f"{source.name}\n已达到最大重试次数，可执行 /115instant_force 强制上传",
+                )
+        finally:
+            self._u115_lock.release()
 
