@@ -3,7 +3,7 @@
     "name": "115秒传整理",
     "description": "115未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传",
     "labels": "115,秒传,整理",
-    "version": "1.5.1",
+    "version": "1.5.2",
     "icon": "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png",
     "author": "Agonie",
     "github": "Agonie0v0/MoviePilot-Plugins",
@@ -11,6 +11,7 @@
     "level": 1,
     "v2": true,
     "history": {
+      "v1.5.2": "增加等待任务逐行手动整理、勾选批量整理和防止页面操作重叠的响应式队列表格",
       "v1.5.1": "兼容存储枚举值，增加整理接管日志，并在风控请求失败时登记等待任务",
       "v1.5.0": "增加 115 风控冷却、请求并发锁，并统一保护目录查询、秒传预检、自动重试和人工强制上传",
       "v1.3.0": "增加最大重试次数，超限后转人工处理，并支持人工强制上传跳过秒传预检",
