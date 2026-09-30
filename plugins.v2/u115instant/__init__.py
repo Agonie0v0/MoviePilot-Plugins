@@ -41,7 +41,7 @@ class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -234,6 +234,9 @@ class u115instant(_PluginBase):
         with self._u115_lock:
             remaining = self._cooldown_remaining(original)
             if remaining > 0:
+                self._queue_current_context(
+                    f"115 风控冷却中，已阻止 {method} {endpoint} 请求"
+                )
                 logger.debug(
                     f"[115Instant] {method} {endpoint} 被插件冷却拦截，"
                     f"剩余 {remaining:.0f} 秒"
@@ -249,9 +252,13 @@ class u115instant(_PluginBase):
                 **kwargs,
             )
             if response is None:
-                self._activate_cooldown(
+                cooldown_until = self._activate_cooldown(
                     original,
                     f"{method} {endpoint} 请求失败或触发访问限制",
+                )
+                self._queue_current_context(
+                    f"115 请求失败或触发访问限制，已进入冷却至 "
+                    f"{time.strftime('%H:%M:%S', time.localtime(cooldown_until))}"
                 )
             return response
 
@@ -310,7 +317,7 @@ class u115instant(_PluginBase):
             return
         data = event.event_data
         storage = self._field(data, "storage")
-        if storage == "u115":
+        if self._is_u115(storage):
             try:
                 original = U115Pan()
                 self._install_request_guard(original)
@@ -319,6 +326,9 @@ class u115instant(_PluginBase):
                     data["storage_oper"] = proxy
                 else:
                     setattr(data, "storage_oper", proxy)
+                logger.info(
+                    f"[115Instant] 已接管 115 存储操作对象（storage={storage!r}）"
+                )
             except Exception as exc:
                 logger.error(f"[115Instant] 获取 115 操作对象失败：{exc}")
 
@@ -336,6 +346,8 @@ class u115instant(_PluginBase):
             "target_storage": self._field(data, "target_storage"),
             "transfer_type": self._field(data, "transfer_type"),
             "path": str(path) if path else "",
+            "target_path": str(self._field(data, "target_path") or ""),
+            "queued": False,
             "force_upload": bool(previous.get("force_upload"))
             if isinstance(previous, dict)
             else False,
@@ -344,14 +356,22 @@ class u115instant(_PluginBase):
             else False,
         }
         path_obj = Path(str(path or ""))
-        if (
-            self._protected(path_obj)
-            and self._cooldown_remaining(self._get_u115_target()) > 0
-        ):
+        protected = self._protected(path_obj)
+        if protected:
+            logger.info(
+                f"[115Instant] 已接管本地视频整理：{path_obj} -> "
+                f"{self._field(data, 'target_path')}"
+            )
+        elif self._is_video(path_obj):
+            logger.info(
+                "[115Instant] 跳过本次整理："
+                f"source={self._field(fileitem, 'storage')!r}, "
+                f"target={self._field(data, 'target_storage')!r}, "
+                f"type={self._field(data, 'transfer_type')!r}"
+            )
+        if protected and self._cooldown_remaining(self._get_u115_target()) > 0:
             remaining = self._cooldown_remaining(self._get_u115_target())
-            self._record_wait(
-                path_obj,
-                Path(str(self._field(data, "target_path") or "")),
+            self._queue_current_context(
                 f"115 风控冷却中，已顺延 {self._cooldown_minutes(remaining)} 分钟",
             )
             self._set_field(data, "cancel", True)
@@ -371,9 +391,9 @@ class u115instant(_PluginBase):
         fileitem = self._field(data, "fileitem")
         path = Path(str(self._field(fileitem, "path") or ""))
         if (
-            self._field(fileitem, "storage") == "local"
-            and self._field(data, "target_storage") == "u115"
-            and self._field(data, "transfer_type") == "move"
+            self._is_local(self._field(fileitem, "storage"))
+            and self._is_u115(self._field(data, "target_storage"))
+            and self._is_move(self._field(data, "transfer_type"))
             and self._is_video(path)
         ):
             self._set_field(data, "overwrite", False)
@@ -813,6 +833,23 @@ class u115instant(_PluginBase):
         return getattr(value, name, default)
 
     @staticmethod
+    def _value_name(value: Any) -> str:
+        """将 MoviePilot 的字符串/枚举字段统一为可比较的名称。"""
+        return str(getattr(value, "value", value) or "").strip().lower()
+
+    @classmethod
+    def _is_local(cls, value: Any) -> bool:
+        return cls._value_name(value) == "local"
+
+    @classmethod
+    def _is_u115(cls, value: Any) -> bool:
+        return cls._value_name(value) == "u115"
+
+    @classmethod
+    def _is_move(cls, value: Any) -> bool:
+        return cls._value_name(value) == "move"
+
+    @staticmethod
     def _set_field(value: Any, name: str, item: Any):
         if isinstance(value, dict):
             value[name] = item
@@ -844,6 +881,22 @@ class u115instant(_PluginBase):
     def _notify_user(self, title: str, text: str):
         if self._notify:
             self.post_message(mtype=NotificationType.Manual, title=title, text=text)
+
+    def _queue_current_context(self, reason: str) -> bool:
+        """把当前整理登记到等待队列，同一整理上下文只登记一次。"""
+        context = getattr(self._context, "value", None)
+        if not isinstance(context, dict) or context.get("queued"):
+            return False
+        local_path = Path(str(context.get("path") or ""))
+        if not self._protected(local_path) or not self._signature(local_path):
+            return False
+        target_path = Path(str(context.get("target_path") or ""))
+        self._record_wait(local_path, target_path, reason)
+        context["queued"] = True
+        logger.warning(f"[115Instant] 已取消当前整理并登记等待任务：{local_path.name}")
+        # 当前 MP 整理随后会失败返回，清掉线程上下文，避免污染下一次整理。
+        self._context.value = None
+        return True
 
     def _record_wait(self, local_path: Path, target_path: Path, reason: str):
         signature = self._signature(local_path)
@@ -904,9 +957,9 @@ class u115instant(_PluginBase):
         context = getattr(self._context, "value", None)
         if context:
             return (
-                context.get("source_storage") == "local"
-                and context.get("target_storage") == "u115"
-                and context.get("transfer_type") == "move"
+                self._is_local(context.get("source_storage"))
+                and self._is_u115(context.get("target_storage"))
+                and self._is_move(context.get("transfer_type"))
                 and self._is_video(local_path)
             )
         # 没有拦截上下文时对视频文件保持保护，避免插件失效时意外普通上传。
@@ -947,11 +1000,14 @@ class u115instant(_PluginBase):
 
                 if self._cooldown_remaining(original) > 0:
                     remaining = self._cooldown_remaining(original)
-                    self._record_wait(
-                        local_path,
-                        Path(target_dir.path) / (new_name or local_path.name),
+                    if not self._queue_current_context(
                         f"115 风控冷却中，已顺延 {self._cooldown_minutes(remaining)} 分钟",
-                    )
+                    ):
+                        self._record_wait(
+                            local_path,
+                            Path(target_dir.path) / (new_name or local_path.name),
+                            f"115 风控冷却中，已顺延 {self._cooldown_minutes(remaining)} 分钟",
+                        )
                     return None
 
                 target_name = new_name or local_path.name
@@ -979,11 +1035,14 @@ class u115instant(_PluginBase):
                 )
                 if not init_resp or not init_resp.get("state"):
                     if self._cooldown_remaining(original) > 0:
-                        self._record_wait(
-                            local_path,
-                            target_path,
+                        if not self._queue_current_context(
                             f"115 请求失败，已进入风控冷却，稍后重试",
-                        )
+                        ):
+                            self._record_wait(
+                                local_path,
+                                target_path,
+                                "115 请求失败，已进入风控冷却，稍后重试",
+                            )
                     else:
                         self._record_state(
                             local_path,
@@ -1017,11 +1076,14 @@ class u115instant(_PluginBase):
                     )
                     if not init_resp or not init_resp.get("state"):
                         if self._cooldown_remaining(original) > 0:
-                            self._record_wait(
-                                local_path,
-                                target_path,
+                            if not self._queue_current_context(
                                 "115 二次认证请求进入风控冷却，稍后重试",
-                            )
+                            ):
+                                self._record_wait(
+                                    local_path,
+                                    target_path,
+                                    "115 二次认证请求进入风控冷却，稍后重试",
+                                )
                         else:
                             self._record_state(local_path, "error", "115 二次认证失败")
                         return None
