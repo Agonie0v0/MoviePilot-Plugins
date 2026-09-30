@@ -42,7 +42,7 @@ class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -109,6 +109,15 @@ class u115instant(_PluginBase):
         saved = self.get_data("tasks") or {}
         self._tasks = saved if isinstance(saved, dict) else {}
         if self._enabled:
+            # 提前保护共享的 U115Pan 实例，覆盖仪表盘、存储用量和目录查询等
+            # 不经过 StorageOperSelection 的后台调用。
+            try:
+                original = self._get_u115_target()
+                if original is not None:
+                    self._install_request_guard(original)
+                    logger.info("[115Instant] 已安装全局 115 请求保护")
+            except Exception as exc:
+                logger.warning(f"[115Instant] 安装全局 115 请求保护失败：{exc}")
             logger.info("[115Instant] 已启用，仅拦截本地到 115 的视频移动整理")
 
     @staticmethod
