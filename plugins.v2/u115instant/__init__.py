@@ -41,7 +41,7 @@ class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -439,7 +439,53 @@ class u115instant(_PluginBase):
         self._context.value = None
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "path": "/toggle_selection",
+                "endpoint": self.toggle_selection_api,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "切换 115 秒传任务选择状态",
+            },
+            {
+                "path": "/force_upload",
+                "endpoint": self.force_upload_api,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "手动整理指定或已选 115 秒传任务",
+            },
+        ]
+
+    def toggle_selection_api(self, payload: Optional[Dict[str, Any]] = None):
+        """切换页面队列中一条任务的选中状态。"""
+        raw_key = str((payload or {}).get("key") or "")
+        key = self._resolve_task_key(raw_key)
+        if not key:
+            return {"code": 1, "message": "任务不存在或已完成"}
+
+        pending_statuses = {"waiting", "manual", "stale", "error", "verify"}
+        with self._lock:
+            task = self._tasks.get(key)
+            if not task or task.get("status") not in pending_statuses:
+                return {"code": 1, "message": "任务当前不可选择"}
+            selected = not bool(task.get("selected", False))
+            task.update({"selected": selected, "updated_at": time.time()})
+            self._save_tasks()
+        return {"code": 0, "selected": selected}
+
+    def force_upload_api(self, payload: Optional[Dict[str, Any]] = None):
+        """从详情页手动整理一条或多条任务，跳过秒传预检。"""
+        data = payload or {}
+        raw_keys = data.get("keys")
+        task_keys = raw_keys if isinstance(raw_keys, list) else None
+        task_key = data.get("key")
+        selected = bool(data.get("selected"))
+        self.force_upload_pending(
+            task_key=str(task_key) if task_key else None,
+            task_keys=[str(key) for key in task_keys] if task_keys else None,
+            selected=selected,
+        )
+        return {"code": 0, "message": "已提交手动整理"}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         def field_col(model: str, label: str, icon: str, minimum: int, maximum: int, md: int = 6) -> dict:
@@ -601,10 +647,16 @@ class u115instant(_PluginBase):
 
     def get_page(self) -> List[dict]:
         with self._lock:
-            tasks = [dict(task) for task in self._tasks.values()]
+            task_items = [(str(key), dict(task)) for key, task in self._tasks.items()]
+        tasks = [task for _, task in task_items]
         waiting = sum(task.get("status") == "waiting" for task in tasks)
         retrying = sum(task.get("status") in {"retrying", "forcing"} for task in tasks)
         needs_action = sum(task.get("status") in {"manual", "stale", "error", "verify"} for task in tasks)
+        actionable_statuses = {"waiting", "manual", "stale", "error", "verify"}
+        selected_count = sum(
+            bool(task.get("selected")) and task.get("status") in actionable_statuses
+            for task in tasks
+        )
         cooldown_remaining = self._cooldown_remaining(self._get_u115_target())
 
         def format_time(value: Any) -> str:
@@ -660,9 +712,12 @@ class u115instant(_PluginBase):
                 f"插件已暂停新的 115 请求，预计还需等待 "
                 f"{self._cooldown_minutes(cooldown_remaining)} 分钟；队列任务会自动顺延。"
             )
+        elif selected_count:
+            alert_type, alert_icon, alert_title = "info", "mdi-checkbox-multiple-marked-outline", "已选择任务"
+            alert_text = f"已选择 {selected_count} 个任务，可立即批量手动整理并跳过秒传预检。"
         elif needs_action:
             alert_type, alert_icon, alert_title = "warning", "mdi-alert-outline", "有任务需要人工处理"
-            alert_text = f"当前有 {needs_action} 个任务需要人工处理；执行 /115instant_force 后会忽略秒传检查并强制上传。"
+            alert_text = f"当前有 {needs_action} 个任务需要人工处理；可在对应行直接手动整理。"
         elif waiting or retrying:
             alert_type, alert_icon, alert_title = "info", "mdi-sync", "115 秒传保护正在工作"
             alert_text = f"当前有 {waiting} 个文件等待重试，{retrying} 个文件正在执行。普通上传已被阻止。"
@@ -671,9 +726,10 @@ class u115instant(_PluginBase):
             alert_text = "暂无等待任务。新的未命中秒传文件会自动出现在这里。"
 
         rows = []
-        for task in tasks[-30:]:
+        for task_key, task in task_items[-30:]:
             status, color, icon = status_meta(str(task.get("status", "")))
             path = str(task.get("path", ""))
+            task_key = task_key or self._task_key(path)
             reason = str(task.get("last_error", "") or "—")
             if task.get("status") == "forcing":
                 next_at = "强制上传中"
@@ -683,10 +739,70 @@ class u115instant(_PluginBase):
                 next_at = "执行中"
             else:
                 next_at = format_time(task.get("next_at"))
+
+            if status in {"等待重试", "人工处理", "待核验", "需处理", "源文件变化"}:
+                action_content = [
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "size": "small",
+                            "variant": "tonal",
+                            "color": "primary",
+                            "prepend-icon": "mdi-cloud-upload-outline",
+                            "aria-label": f"手动整理 {Path(path).name or path}",
+                            "title": "跳过秒传预检并立即整理",
+                            "class": "text-no-wrap",
+                        },
+                        "events": {
+                            "click": {
+                                "api": "/plugin/u115instant/force_upload",
+                                "method": "POST",
+                                "params": {"key": task_key},
+                            }
+                        },
+                        "text": "手动整理",
+                    }
+                ]
+            elif status in {"正在重试", "强制上传中"}:
+                action_content = [
+                    {
+                        "component": "VChip",
+                        "props": {"size": "small", "variant": "tonal", "color": "primary", "prepend-icon": "mdi-sync"},
+                        "text": "执行中",
+                    }
+                ]
+            else:
+                action_content = [{"component": "span", "props": {"class": "text-disabled"}, "text": "—"}]
+
             rows.append(
                 {
                     "component": "tr",
                     "content": [
+                        {
+                            "component": "td",
+                            "props": {"class": "text-center", "style": "width: 52px;"},
+                            "content": [
+                                {
+                                    "component": "VCheckbox",
+                                    "props": {
+                                        "model-value": bool(task.get("selected", False)),
+                                        "disabled": task.get("status") not in actionable_statuses,
+                                        "density": "compact",
+                                        "hide-details": True,
+                                        "color": "primary",
+                                        "aria-label": f"选择 {Path(path).name or path}",
+                                        "title": "选择后可批量手动整理",
+                                    },
+                                    "events": {
+                                        "click": {
+                                            "api": "/plugin/u115instant/toggle_selection",
+                                            "method": "POST",
+                                            "params": {"key": task_key},
+                                        }
+                                    },
+                                }
+                            ],
+                        },
                         {
                             "component": "td",
                             "props": {"style": "max-width: 330px;"},
@@ -710,6 +826,7 @@ class u115instant(_PluginBase):
                         {"component": "td", "props": {"class": "text-body-2 text-no-wrap"}, "text": next_at},
                         {"component": "td", "props": {"class": "text-body-2 text-center"}, "text": str(task.get("attempts", 0))},
                         {"component": "td", "props": {"class": "text-caption text-medium-emphasis", "style": "max-width: 300px;"}, "text": reason},
+                        {"component": "td", "props": {"class": "text-right", "style": "min-width: 112px;"}, "content": action_content},
                     ],
                 }
             )
@@ -721,7 +838,7 @@ class u115instant(_PluginBase):
                     "content": [
                         {
                             "component": "td",
-                            "props": {"colspan": 5, "class": "text-center py-8"},
+                            "props": {"colspan": 7, "class": "text-center py-8"},
                             "content": [
                                 {"component": "VIcon", "props": {"icon": "mdi-inbox-outline", "size": "34", "color": "disabled"}},
                                 {"component": "div", "props": {"class": "text-subtitle-2 text-medium-emphasis mt-2"}, "text": "暂无等待或人工任务"},
@@ -786,9 +903,30 @@ class u115instant(_PluginBase):
                         "content": [
                             {
                                 "component": "div",
-                                "props": {"class": "d-flex align-center justify-space-between w-100"},
+                                "props": {"class": "d-flex align-center justify-space-between flex-wrap ga-2 w-100"},
                                 "content": [
                                     {"component": "VCardTitle", "props": {"class": "text-subtitle-1 font-weight-bold pa-0"}, "text": "等待与人工队列"},
+                                    {
+                                        "component": "VBtn",
+                                        "props": {
+                                            "size": "small",
+                                            "variant": "tonal",
+                                            "color": "primary",
+                                            "prepend-icon": "mdi-cloud-upload-outline",
+                                            "disabled": selected_count == 0,
+                                            "class": "text-no-wrap",
+                                            "aria-label": "批量手动整理已选择任务",
+                                            "title": "跳过秒传预检并整理已选择任务",
+                                        },
+                                        "events": {
+                                            "click": {
+                                                "api": "/plugin/u115instant/force_upload",
+                                                "method": "POST",
+                                                "params": {"selected": True},
+                                            }
+                                        },
+                                        "text": f"批量手动整理 ({selected_count})",
+                                    },
                                     {"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": "primary"}, "text": f"最近 {min(len(tasks), 30)} 条"},
                                 ],
                             }
@@ -799,25 +937,33 @@ class u115instant(_PluginBase):
                         "props": {"class": "pt-0 px-0"},
                         "content": [
                             {
-                                "component": "VTable",
-                                "props": {"density": "comfortable", "hover": True, "class": "w-100"},
+                                "component": "div",
+                                "props": {"class": "overflow-x-auto"},
                                 "content": [
                                     {
-                                        "component": "thead",
+                                        "component": "VTable",
+                                        "props": {"density": "comfortable", "hover": True, "class": "w-100 text-no-wrap", "style": "min-width: 900px;"},
                                         "content": [
                                             {
-                                                "component": "tr",
+                                                "component": "thead",
                                                 "content": [
-                                                    {"component": "th", "props": {"style": "min-width: 250px;"}, "text": "文件"},
-                                                    {"component": "th", "props": {"style": "width: 120px;"}, "text": "状态"},
-                                                    {"component": "th", "props": {"style": "width: 120px;"}, "text": "下次执行"},
-                                                    {"component": "th", "props": {"style": "width: 70px;"}, "text": "次数"},
-                                                    {"component": "th", "text": "最近原因"},
+                                                    {
+                                                        "component": "tr",
+                                                        "content": [
+                                                            {"component": "th", "props": {"style": "width: 52px;"}, "text": "选择"},
+                                                            {"component": "th", "props": {"style": "min-width: 250px;"}, "text": "文件"},
+                                                            {"component": "th", "props": {"style": "width: 120px;"}, "text": "状态"},
+                                                            {"component": "th", "props": {"style": "width: 120px;"}, "text": "下次执行"},
+                                                            {"component": "th", "props": {"style": "width: 70px;"}, "text": "次数"},
+                                                            {"component": "th", "props": {"style": "min-width: 260px;"}, "text": "最近原因"},
+                                                            {"component": "th", "props": {"style": "width: 112px;"}, "text": "操作"},
+                                                        ],
+                                                    }
                                                 ],
-                                            }
+                                            },
+                                            {"component": "tbody", "content": rows},
                                         ],
-                                    },
-                                    {"component": "tbody", "content": rows},
+                                    }
                                 ],
                             }
                         ],
@@ -862,6 +1008,16 @@ class u115instant(_PluginBase):
             return str(Path(path).absolute())
         except (OSError, ValueError):
             return path
+
+    def _resolve_task_key(self, raw_key: str) -> Optional[str]:
+        """兼容页面传回的原始 key 和规范化后的绝对路径。"""
+        if not raw_key:
+            return None
+        with self._lock:
+            if raw_key in self._tasks:
+                return raw_key
+            normalized = self._task_key(raw_key)
+            return normalized if normalized in self._tasks else None
 
     @classmethod
     def _is_video(cls, path: Path) -> bool:
@@ -925,6 +1081,7 @@ class u115instant(_PluginBase):
                 "target_path": str(target_path),
                 "signature": signature,
                 "status": "manual" if manual else "waiting",
+                "selected": bool(old.get("selected", False)),
                 "attempts": attempts,
                 "first_at": first_at,
                 "next_at": None if manual else next_at,
@@ -1128,34 +1285,56 @@ class u115instant(_PluginBase):
             logger.debug(f"[115Instant] 查询失败历史记录失败：{exc}")
         return None
 
-    def force_upload_pending(self):
-        """强制上传一条人工任务，跳过插件的秒传预检。"""
+    def force_upload_pending(
+        self,
+        task_key: Optional[str] = None,
+        task_keys: Optional[List[str]] = None,
+        selected: bool = False,
+    ):
+        """手动整理指定任务或页面已选任务，跳过插件的秒传预检。"""
         if not self._enabled:
             return
+        pending_statuses = {"waiting", "manual", "stale", "error", "verify"}
         try:
             if not self._u115_lock.acquire(blocking=False):
                 logger.info("[115Instant] 已有 115 整理正在执行，人工强制上传顺延")
                 return
             try:
-                pending_statuses = {"manual", "stale", "error", "verify"}
-                selected = None
-                with self._lock:
-                    for key, task in self._tasks.items():
-                        if task.get("status") in pending_statuses:
-                            selected = (key, dict(task))
-                            break
-                if not selected:
-                    self._notify_user("115 秒传暂无人工任务", "当前没有可强制上传的等待任务")
-                    return
+                requested_keys = []
+                if task_key:
+                    requested_keys.append(str(task_key))
+                if task_keys:
+                    requested_keys.extend(str(key) for key in task_keys)
 
-                key, task = selected
-                source = Path(task["path"])
-                if not self._signature(source):
-                    self._record_state(source, "stale", "源文件已不存在，无法强制上传")
-                    return
-                history_id = self._resolve_history_id(task)
-                if not history_id:
-                    self._record_state(source, "error", "找不到整理历史记录，无法强制上传")
+                selected_tasks = []
+                with self._lock:
+                    if requested_keys:
+                        seen = set()
+                        for raw_key in requested_keys:
+                            key = self._resolve_task_key(raw_key)
+                            if key and key not in seen:
+                                task = self._tasks.get(key)
+                                if task and task.get("status") in pending_statuses:
+                                    selected_tasks.append((key, dict(task)))
+                                    seen.add(key)
+                    elif selected:
+                        selected_tasks = [
+                            (key, dict(task))
+                            for key, task in self._tasks.items()
+                            if task.get("selected") and task.get("status") in pending_statuses
+                        ]
+                    else:
+                        selected_tasks = next(
+                            (
+                                [(key, dict(task))]
+                                for key, task in self._tasks.items()
+                                if task.get("status") in pending_statuses
+                            ),
+                            [],
+                        )
+
+                if not selected_tasks:
+                    self._notify_user("115 秒传暂无可整理任务", "请先选择等待任务，或等待任务进入人工处理状态")
                     return
 
                 original = self._get_u115_target()
@@ -1163,55 +1342,68 @@ class u115instant(_PluginBase):
                 if remaining > 0:
                     reason = (
                         f"115 风控冷却中，剩余 {self._cooldown_minutes(remaining)} 分钟；"
-                        "人工强制上传已保留"
+                        "人工整理已保留"
                     )
                     with self._lock:
-                        current = self._tasks.get(key)
-                        if current:
-                            current.update({"last_error": reason, "updated_at": time.time()})
-                            self._save_tasks()
-                    self._notify_user("115 仍在风控冷却", f"{source.name}\n{reason}")
-                    return
-
-                with self._lock:
-                    current = self._tasks.get(key)
-                    if not current or current.get("status") not in pending_statuses:
-                        return
-                    current.update({
-                        "status": "forcing",
-                        "history_id": history_id,
-                        "updated_at": time.time(),
-                        "last_error": "人工确认强制上传，已跳过秒传预检",
-                    })
-                    self._save_tasks()
-
-                self._context.value = {"force_upload": True, "path": str(source)}
-                try:
-                    try:
-                        state, message = TransferChain().redo_transfer_history(history_id)
-                    except Exception as exc:
-                        state, message = False, f"强制上传异常：{exc}"
-                finally:
-                    self._context.value = None
-
-                if state:
-                    with self._lock:
-                        self._tasks.pop(key, None)
+                        for key, _ in selected_tasks:
+                            current = self._tasks.get(key)
+                            if current:
+                                current.update({"last_error": reason, "updated_at": time.time()})
                         self._save_tasks()
-                    self._notify_user("115 强制上传完成", source.name)
+                    self._notify_user("115 仍在风控冷却", f"已保留 {len(selected_tasks)} 个手动整理任务\n{reason}")
                     return
 
-                with self._lock:
-                    current = self._tasks.get(key)
-                    if current and current.get("status") == "forcing":
+                for key, task in selected_tasks:
+                    source = Path(task["path"])
+                    if not self._signature(source):
+                        self._record_state(source, "stale", "源文件已不存在，无法强制上传")
+                        continue
+                    history_id = self._resolve_history_id(task)
+                    if not history_id:
+                        self._record_state(source, "error", "找不到整理历史记录，无法强制上传")
+                        continue
+
+                    with self._lock:
+                        current = self._tasks.get(key)
+                        if not current or current.get("status") not in pending_statuses:
+                            continue
                         current.update({
-                            "status": "manual",
-                            "next_at": None,
-                            "last_error": f"强制上传失败：{message or '未知错误'}",
+                            "status": "forcing",
+                            "selected": False,
+                            "history_id": history_id,
                             "updated_at": time.time(),
+                            "last_error": "人工确认强制上传，已跳过秒传预检",
                         })
                         self._save_tasks()
-                self._notify_user("115 强制上传失败", f"{source.name}\n{message or '未知错误'}")
+
+                    self._context.value = {"force_upload": True, "path": str(source)}
+                    try:
+                        try:
+                            state, message = TransferChain().redo_transfer_history(history_id)
+                        except Exception as exc:
+                            state, message = False, f"强制上传异常：{exc}"
+                    finally:
+                        self._context.value = None
+
+                    if state:
+                        with self._lock:
+                            self._tasks.pop(key, None)
+                            self._save_tasks()
+                        self._notify_user("115 强制上传完成", source.name)
+                        continue
+
+                    with self._lock:
+                        current = self._tasks.get(key)
+                        if current and current.get("status") == "forcing":
+                            current.update({
+                                "status": "manual",
+                                "selected": bool(task.get("selected", False)),
+                                "next_at": None,
+                                "last_error": f"强制上传失败：{message or '未知错误'}",
+                                "updated_at": time.time(),
+                            })
+                            self._save_tasks()
+                    self._notify_user("115 强制上传失败", f"{source.name}\n{message or '未知错误'}")
             finally:
                 self._u115_lock.release()
         except Exception as exc:
