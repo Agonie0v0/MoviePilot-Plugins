@@ -40,8 +40,8 @@ class _U115InstantProxy:
 class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，保留源文件并延迟重试"
-    plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.svg"
-    plugin_version = "1.2.0"
+    plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
+    plugin_version = "1.2.1"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
