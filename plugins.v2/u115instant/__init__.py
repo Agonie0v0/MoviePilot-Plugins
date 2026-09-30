@@ -39,9 +39,9 @@ class _U115InstantProxy:
 
 class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
-    plugin_desc = "115 未命中秒传时取消普通上传，保留源文件并延迟重试"
+    plugin_desc = "115 未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -74,6 +74,7 @@ class u115instant(_PluginBase):
         self._first_retry_minutes = 10
         self._second_retry_minutes = 120
         self._later_retry_minutes = 360
+        self._max_retry_attempts = 5
         self._max_wait_hours = 72
         self._tasks: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -92,6 +93,9 @@ class u115instant(_PluginBase):
         )
         self._later_retry_minutes = self._positive_int(
             config.get("later_retry_minutes", 360), 360, 1, 10080
+        )
+        self._max_retry_attempts = self._positive_int(
+            config.get("max_retry_attempts", 5), 5, 1, 100
         )
         self._max_wait_hours = self._positive_int(
             config.get("max_wait_hours", 72), 72, 1, 720
@@ -121,16 +125,25 @@ class u115instant(_PluginBase):
                 "desc": "立即重试 115 秒传等待任务",
                 "category": "整理",
                 "data": {"action": "retry"},
-            }
+            },
+            {
+                "cmd": "/115instant_force",
+                "event": EventType.PluginAction,
+                "desc": "强制上传一条 115 人工处理任务（忽略秒传）",
+                "category": "整理",
+                "data": {"action": "force_upload"},
+            },
         ]
 
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event: Event):
         if not event or not isinstance(event.event_data, dict):
             return
-        if event.event_data.get("action") != "retry":
-            return
-        self.retry_pending(force=True)
+        action = event.event_data.get("action")
+        if action == "retry":
+            self.retry_pending(force=True)
+        elif action == "force_upload":
+            self.force_upload_pending()
 
     @eventmanager.register(ChainEventType.StorageOperSelection, priority=5)
     def select_storage_oper(self, event: Event):
@@ -158,11 +171,15 @@ class u115instant(_PluginBase):
         data = event.event_data
         fileitem = self._field(data, "fileitem")
         path = self._field(fileitem, "path")
+        previous = getattr(self._context, "value", None)
         self._context.value = {
             "source_storage": self._field(fileitem, "storage"),
             "target_storage": self._field(data, "target_storage"),
             "transfer_type": self._field(data, "transfer_type"),
             "path": str(path) if path else "",
+            "force_upload": bool(previous.get("force_upload"))
+            if isinstance(previous, dict)
+            else False,
         }
 
     @eventmanager.register(ChainEventType.TransferOverwriteCheck, priority=5)
@@ -199,7 +216,7 @@ class u115instant(_PluginBase):
             return
         with self._lock:
             task = self._tasks.get(key)
-            if task and task.get("status") in {"waiting", "retrying"}:
+            if task and task.get("status") in {"waiting", "retrying", "manual", "forcing"}:
                 task["history_id"] = int(history_id)
                 task["updated_at"] = time.time()
                 self._save_tasks()
@@ -308,10 +325,17 @@ class u115instant(_PluginBase):
                         "component": "VRow",
                         "props": {"dense": True, "class": "mx-n2"},
                         "content": [
-                            field_col("first_retry_minutes", "首次重试（分钟）", "mdi-timer-sand", 1, 1440, 3),
-                            field_col("second_retry_minutes", "第二次重试（分钟）", "mdi-timer-outline", 1, 10080, 3),
-                            field_col("later_retry_minutes", "之后间隔（分钟）", "mdi-repeat", 1, 10080, 3),
-                            field_col("max_wait_hours", "最长等待（小时）", "mdi-clock-alert-outline", 1, 720, 3),
+                            field_col("first_retry_minutes", "首次重试（分钟）", "mdi-timer-sand", 1, 1440, 4),
+                            field_col("second_retry_minutes", "第二次重试（分钟）", "mdi-timer-outline", 1, 10080, 4),
+                            field_col("later_retry_minutes", "之后间隔（分钟）", "mdi-repeat", 1, 10080, 4),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True, "class": "mx-n2"},
+                        "content": [
+                            field_col("max_retry_attempts", "最大重试次数（不含首次）", "mdi-counter", 1, 100, 6),
+                            field_col("max_wait_hours", "最长等待（小时）", "mdi-clock-alert-outline", 1, 720, 6),
                         ],
                     },
                     {
@@ -321,7 +345,7 @@ class u115instant(_PluginBase):
                             {
                                 "component": "div",
                                 "props": {"class": "text-caption text-medium-emphasis mb-2"},
-                                "text": "默认节奏为 10 分钟、2 小时、6 小时，也可以在上方分别调整。",
+                                "text": "默认节奏为 10 分钟、2 小时、6 小时，最多自动重试 5 次；超过上限后转人工处理。",
                             },
                             {
                                 "component": "div",
@@ -341,6 +365,11 @@ class u115instant(_PluginBase):
                                         "component": "VChip",
                                         "props": {"size": "small", "variant": "tonal", "color": "secondary", "prepend-icon": "mdi-repeat"},
                                         "text": "之后：可自定义",
+                                    },
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "error", "prepend-icon": "mdi-account-alert-outline"},
+                                        "text": "超限：人工处理",
                                     },
                                 ],
                             },
@@ -365,6 +394,7 @@ class u115instant(_PluginBase):
             "first_retry_minutes": 10,
             "second_retry_minutes": 120,
             "later_retry_minutes": 360,
+            "max_retry_attempts": 5,
             "max_wait_hours": 72,
         }
 
@@ -372,8 +402,8 @@ class u115instant(_PluginBase):
         with self._lock:
             tasks = [dict(task) for task in self._tasks.values()]
         waiting = sum(task.get("status") == "waiting" for task in tasks)
-        retrying = sum(task.get("status") == "retrying" for task in tasks)
-        needs_action = sum(task.get("status") in {"stale", "error", "verify"} for task in tasks)
+        retrying = sum(task.get("status") in {"retrying", "forcing"} for task in tasks)
+        needs_action = sum(task.get("status") in {"manual", "stale", "error", "verify"} for task in tasks)
 
         def format_time(value: Any) -> str:
             try:
@@ -385,6 +415,8 @@ class u115instant(_PluginBase):
             return {
                 "waiting": ("等待重试", "info", "mdi-clock-outline"),
                 "retrying": ("正在重试", "primary", "mdi-sync"),
+                "forcing": ("强制上传中", "primary", "mdi-cloud-upload-outline"),
+                "manual": ("人工处理", "error", "mdi-account-alert-outline"),
                 "verify": ("待核验", "warning", "mdi-shield-search-outline"),
                 "error": ("需处理", "error", "mdi-alert-circle-outline"),
                 "stale": ("源文件变化", "warning", "mdi-file-alert-outline"),
@@ -420,12 +452,12 @@ class u115instant(_PluginBase):
         if not self._enabled:
             alert_type, alert_icon, alert_title = "warning", "mdi-power-off", "插件当前未启用"
             alert_text = "启用插件并保存配置后，MP 才会拦截本地到 115 的视频移动整理。"
+        elif needs_action:
+            alert_type, alert_icon, alert_title = "warning", "mdi-alert-outline", "有任务需要人工处理"
+            alert_text = f"当前有 {needs_action} 个任务需要人工处理；执行 /115instant_force 后会忽略秒传检查并强制上传。"
         elif waiting or retrying:
             alert_type, alert_icon, alert_title = "info", "mdi-sync", "115 秒传保护正在工作"
             alert_text = f"当前有 {waiting} 个文件等待重试，{retrying} 个文件正在执行。普通上传已被阻止。"
-        elif needs_action:
-            alert_type, alert_icon, alert_title = "warning", "mdi-alert-outline", "有任务需要人工处理"
-            alert_text = f"当前有 {needs_action} 个任务处于异常或待核验状态，请查看下方队列。"
         else:
             alert_type, alert_icon, alert_title = "success", "mdi-check-circle-outline", "队列为空，保护已就绪"
             alert_text = "暂无等待任务。新的未命中秒传文件会自动出现在这里。"
@@ -435,7 +467,14 @@ class u115instant(_PluginBase):
             status, color, icon = status_meta(str(task.get("status", "")))
             path = str(task.get("path", ""))
             reason = str(task.get("last_error", "") or "—")
-            next_at = "执行中" if task.get("status") == "retrying" else format_time(task.get("next_at"))
+            if task.get("status") == "forcing":
+                next_at = "强制上传中"
+            elif task.get("status") == "manual":
+                next_at = "等待人工操作"
+            elif task.get("status") == "retrying":
+                next_at = "执行中"
+            else:
+                next_at = format_time(task.get("next_at"))
             rows.append(
                 {
                     "component": "tr",
@@ -477,7 +516,7 @@ class u115instant(_PluginBase):
                             "props": {"colspan": 5, "class": "text-center py-8"},
                             "content": [
                                 {"component": "VIcon", "props": {"icon": "mdi-inbox-outline", "size": "34", "color": "disabled"}},
-                                {"component": "div", "props": {"class": "text-subtitle-2 text-medium-emphasis mt-2"}, "text": "暂无等待任务"},
+                                {"component": "div", "props": {"class": "text-subtitle-2 text-medium-emphasis mt-2"}, "text": "暂无等待或人工任务"},
                                 {"component": "div", "props": {"class": "text-caption text-disabled mt-1"}, "text": "未命中秒传的文件会在这里显示并按策略自动重试。"},
                             ],
                         }
@@ -523,7 +562,7 @@ class u115instant(_PluginBase):
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4, "class": "py-1"},
-                                "content": [{"component": "VListItem", "props": {"density": "compact", "prepend-icon": "mdi-reload", "title": "可使用命令立即重试", "subtitle": "/115instant_retry"}}],
+                                "content": [{"component": "VListItem", "props": {"density": "compact", "prepend-icon": "mdi-reload", "title": "可使用命令重试或强制上传", "subtitle": "/115instant_retry · /115instant_force"}}],
                             },
                         ],
                     },
@@ -541,7 +580,7 @@ class u115instant(_PluginBase):
                                 "component": "div",
                                 "props": {"class": "d-flex align-center justify-space-between w-100"},
                                 "content": [
-                                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1 font-weight-bold pa-0"}, "text": "等待队列"},
+                                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1 font-weight-bold pa-0"}, "text": "等待与人工队列"},
                                     {"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": "primary"}, "text": f"最近 {min(len(tasks), 30)} 条"},
                                 ],
                             }
@@ -628,6 +667,7 @@ class u115instant(_PluginBase):
             old = self._tasks.get(key, {})
             attempts = int(old.get("attempts", 0)) + 1
             first_at = float(old.get("first_at", now))
+            manual = attempts > self._max_retry_attempts
             if attempts == 1:
                 delay_minutes = self._first_retry_minutes
             elif attempts == 2:
@@ -635,21 +675,32 @@ class u115instant(_PluginBase):
             else:
                 delay_minutes = self._later_retry_minutes
             next_at = now + delay_minutes * 60
+            last_error = reason
+            if manual:
+                retry_count = max(attempts - 1, 0)
+                last_error = f"{reason}；已完成 {retry_count} 次重试，已转人工处理"
             self._tasks[key] = {
                 "path": str(local_path),
                 "target_path": str(target_path),
                 "signature": signature,
-                "status": "waiting",
+                "status": "manual" if manual else "waiting",
                 "attempts": attempts,
                 "first_at": first_at,
-                "next_at": next_at,
+                "next_at": None if manual else next_at,
                 "history_id": old.get("history_id"),
                 "updated_at": now,
-                "last_error": reason,
+                "last_error": last_error,
             }
             self._save_tasks()
-        logger.warning(f"[115Instant] {local_path.name} 未命中秒传，{delay_minutes} 分钟后重试")
-        if attempts == 1:
+        if manual:
+            logger.warning(f"[115Instant] {local_path.name} 已达到最大重试次数，转人工处理")
+            self._notify_user(
+                "115 秒传转人工处理",
+                f"{local_path.name}\n已完成 {max(attempts - 1, 0)} 次重试\n可执行 /115instant_force 强制上传",
+            )
+        else:
+            logger.warning(f"[115Instant] {local_path.name} 未命中秒传，{delay_minutes} 分钟后重试")
+        if attempts == 1 and not manual:
             self._notify_user("115 秒传等待中", f"{local_path.name}\n{reason}\n源文件已保留")
 
     def _record_state(self, local_path: Path, status: str, reason: str):
@@ -691,6 +742,10 @@ class u115instant(_PluginBase):
 
     def _instant_upload(self, original: U115Pan, target_dir, local_path: Path, new_name: Optional[str]):
         local_path = Path(local_path)
+        context = getattr(self._context, "value", None)
+        if isinstance(context, dict) and context.get("force_upload"):
+            # 人工处理明确要求放弃秒传拦截，交回 MP 原生上传流程。
+            return original.upload(target_dir, local_path, new_name)
         if not self._enabled or not self._protected(local_path):
             try:
                 return original.upload(target_dir, local_path, new_name)
@@ -778,6 +833,71 @@ class u115instant(_PluginBase):
             logger.debug(f"[115Instant] 查询失败历史记录失败：{exc}")
         return None
 
+    def force_upload_pending(self):
+        """强制上传一条人工任务，跳过插件的秒传预检。"""
+        if not self._enabled:
+            return
+        pending_statuses = {"manual", "stale", "error", "verify"}
+        selected = None
+        with self._lock:
+            for key, task in self._tasks.items():
+                if task.get("status") in pending_statuses:
+                    selected = (key, dict(task))
+                    break
+        if not selected:
+            self._notify_user("115 秒传暂无人工任务", "当前没有可强制上传的等待任务")
+            return
+
+        key, task = selected
+        source = Path(task["path"])
+        if not self._signature(source):
+            self._record_state(source, "stale", "源文件已不存在，无法强制上传")
+            return
+        history_id = self._resolve_history_id(task)
+        if not history_id:
+            self._record_state(source, "error", "找不到整理历史记录，无法强制上传")
+            return
+
+        with self._lock:
+            current = self._tasks.get(key)
+            if not current or current.get("status") not in pending_statuses:
+                return
+            current.update({
+                "status": "forcing",
+                "history_id": history_id,
+                "updated_at": time.time(),
+                "last_error": "人工确认强制上传，已跳过秒传预检",
+            })
+            self._save_tasks()
+
+        self._context.value = {"force_upload": True, "path": str(source)}
+        try:
+            try:
+                state, message = TransferChain().redo_transfer_history(history_id)
+            except Exception as exc:
+                state, message = False, f"强制上传异常：{exc}"
+        finally:
+            self._context.value = None
+
+        if state:
+            with self._lock:
+                self._tasks.pop(key, None)
+                self._save_tasks()
+            self._notify_user("115 强制上传完成", source.name)
+            return
+
+        with self._lock:
+            current = self._tasks.get(key)
+            if current and current.get("status") == "forcing":
+                current.update({
+                    "status": "manual",
+                    "next_at": None,
+                    "last_error": f"强制上传失败：{message or '未知错误'}",
+                    "updated_at": time.time(),
+                })
+                self._save_tasks()
+        self._notify_user("115 强制上传失败", f"{source.name}\n{message or '未知错误'}")
+
     def retry_pending(self, force: bool = False):
         if not self._enabled:
             return
@@ -802,7 +922,7 @@ class u115instant(_PluginBase):
                 continue
             first_at = float(task.get("first_at", now))
             if now - first_at > self._max_wait_hours * 3600:
-                self._record_state(source, "stale", "已超过最大等待时间，未自动启动普通上传")
+                self._record_state(source, "stale", "已超过最大等待时间，请人工执行强制上传")
                 continue
             history_id = self._resolve_history_id(task)
             if not history_id:
