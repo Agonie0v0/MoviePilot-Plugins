@@ -41,7 +41,7 @@ class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
-    plugin_version = "1.5.2"
+    plugin_version = "1.5.3"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -726,10 +726,13 @@ class u115instant(_PluginBase):
             alert_text = "暂无等待任务。新的未命中秒传文件会自动出现在这里。"
 
         rows = []
+        mobile_rows = []
         for task_key, task in task_items[-30:]:
-            status, color, icon = status_meta(str(task.get("status", "")))
+            raw_status = str(task.get("status", ""))
+            status, color, icon = status_meta(raw_status)
             path = str(task.get("path", ""))
             task_key = task_key or self._task_key(path)
+            filename = Path(path).name or path
             reason = str(task.get("last_error", "") or "—")
             if task.get("status") == "forcing":
                 next_at = "强制上传中"
@@ -740,7 +743,7 @@ class u115instant(_PluginBase):
             else:
                 next_at = format_time(task.get("next_at"))
 
-            if status in {"等待重试", "人工处理", "待核验", "需处理", "源文件变化"}:
+            if raw_status in actionable_statuses:
                 action_content = [
                     {
                         "component": "VBtn",
@@ -752,6 +755,7 @@ class u115instant(_PluginBase):
                             "aria-label": f"手动整理 {Path(path).name or path}",
                             "title": "跳过秒传预检并立即整理",
                             "class": "text-no-wrap",
+                            "style": "min-width: 108px; min-height: 44px;",
                         },
                         "events": {
                             "click": {
@@ -763,7 +767,7 @@ class u115instant(_PluginBase):
                         "text": "手动整理",
                     }
                 ]
-            elif status in {"正在重试", "强制上传中"}:
+            elif raw_status in {"retrying", "forcing"}:
                 action_content = [
                     {
                         "component": "VChip",
@@ -774,6 +778,26 @@ class u115instant(_PluginBase):
             else:
                 action_content = [{"component": "span", "props": {"class": "text-disabled"}, "text": "—"}]
 
+            selection_control = {
+                "component": "VCheckbox",
+                "props": {
+                    "model-value": bool(task.get("selected", False)),
+                    "disabled": raw_status not in actionable_statuses,
+                    "density": "compact",
+                    "hide-details": True,
+                    "color": "primary",
+                    "aria-label": f"选择 {filename}",
+                    "title": "选择后可批量手动整理",
+                },
+                "events": {
+                    "click": {
+                        "api": "/plugin/u115instant/toggle_selection",
+                        "method": "POST",
+                        "params": {"key": task_key},
+                    }
+                },
+            }
+
             rows.append(
                 {
                     "component": "tr",
@@ -781,40 +805,20 @@ class u115instant(_PluginBase):
                         {
                             "component": "td",
                             "props": {"class": "text-center", "style": "width: 52px;"},
-                            "content": [
-                                {
-                                    "component": "VCheckbox",
-                                    "props": {
-                                        "model-value": bool(task.get("selected", False)),
-                                        "disabled": task.get("status") not in actionable_statuses,
-                                        "density": "compact",
-                                        "hide-details": True,
-                                        "color": "primary",
-                                        "aria-label": f"选择 {Path(path).name or path}",
-                                        "title": "选择后可批量手动整理",
-                                    },
-                                    "events": {
-                                        "click": {
-                                            "api": "/plugin/u115instant/toggle_selection",
-                                            "method": "POST",
-                                            "params": {"key": task_key},
-                                        }
-                                    },
-                                }
-                            ],
+                            "content": [selection_control],
                         },
                         {
                             "component": "td",
-                            "props": {"style": "max-width: 330px;"},
+                            "props": {"style": "width: 30%; max-width: 330px; overflow: hidden;"},
                             "content": [
                                 {
                                     "component": "div",
-                                    "props": {"class": "text-body-2 font-weight-medium text-truncate", "style": "max-width: 330px;"},
-                                    "text": Path(path).name or path,
+                                    "props": {"class": "text-body-2 font-weight-medium text-truncate", "style": "max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"},
+                                    "text": filename,
                                 },
                                 {
                                     "component": "div",
-                                    "props": {"class": "text-caption text-medium-emphasis text-truncate", "style": "max-width: 330px;"},
+                                    "props": {"class": "text-caption text-medium-emphasis text-truncate", "style": "max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"},
                                     "text": path,
                                 },
                             ],
@@ -825,8 +829,43 @@ class u115instant(_PluginBase):
                         },
                         {"component": "td", "props": {"class": "text-body-2 text-no-wrap"}, "text": next_at},
                         {"component": "td", "props": {"class": "text-body-2 text-center"}, "text": str(task.get("attempts", 0))},
-                        {"component": "td", "props": {"class": "text-caption text-medium-emphasis", "style": "max-width: 300px;"}, "text": reason},
-                        {"component": "td", "props": {"class": "text-right", "style": "min-width: 112px;"}, "content": action_content},
+                        {"component": "td", "props": {"style": "width: 260px; max-width: 260px; overflow: hidden;"}, "content": [{"component": "div", "props": {"class": "text-caption text-medium-emphasis text-truncate", "style": "max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "title": reason}, "text": reason}]},
+                        {"component": "td", "props": {"class": "text-right", "style": "width: 128px; min-width: 128px; white-space: nowrap;"}, "content": action_content},
+                    ],
+                }
+            )
+
+            mobile_rows.append(
+                {
+                    "component": "VListItem",
+                    "props": {"class": "px-3 py-3 border-b", "style": "min-height: 0;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-start ga-2 w-100"},
+                            "content": [
+                                {"component": "div", "props": {"class": "flex-shrink-0 pt-1"}, "content": [selection_control]},
+                                {
+                                    "component": "div",
+                                    "props": {"class": "min-w-0 flex-grow-1"},
+                                    "content": [
+                                        {"component": "div", "props": {"class": "text-body-2 font-weight-medium", "style": "overflow-wrap: anywhere;"}, "text": filename},
+                                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1", "style": "overflow-wrap: anywhere; white-space: normal;"}, "text": path},
+                                    ],
+                                },
+                                {"component": "div", "props": {"class": "flex-shrink-0 ms-1"}, "content": action_content},
+                            ],
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-center flex-wrap ga-2 mt-2"},
+                            "content": [
+                                {"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": color, "prepend-icon": icon}, "text": status},
+                                {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"下次执行：{next_at}"},
+                                {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"重试次数：{task.get('attempts', 0)}"},
+                            ],
+                        },
+                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2", "style": "white-space: normal; overflow-wrap: anywhere;"}, "text": f"最近原因：{reason}"},
                     ],
                 }
             )
@@ -845,6 +884,17 @@ class u115instant(_PluginBase):
                                 {"component": "div", "props": {"class": "text-caption text-disabled mt-1"}, "text": "未命中秒传的文件会在这里显示并按策略自动重试。"},
                             ],
                         }
+                    ],
+                }
+            ]
+            mobile_rows = [
+                {
+                    "component": "VListItem",
+                    "props": {"class": "px-3 py-6 text-center"},
+                    "content": [
+                        {"component": "VIcon", "props": {"icon": "mdi-inbox-outline", "size": "34", "color": "disabled"}},
+                        {"component": "div", "props": {"class": "text-subtitle-2 text-medium-emphasis mt-2"}, "text": "暂无等待或人工任务"},
+                        {"component": "div", "props": {"class": "text-caption text-disabled mt-1"}, "text": "未命中秒传的文件会在这里显示并按策略自动重试。"},
                     ],
                 }
             ]
@@ -915,6 +965,7 @@ class u115instant(_PluginBase):
                                             "prepend-icon": "mdi-cloud-upload-outline",
                                             "disabled": selected_count == 0,
                                             "class": "text-no-wrap",
+                                            "style": "min-height: 44px;",
                                             "aria-label": "批量手动整理已选择任务",
                                             "title": "跳过秒传预检并整理已选择任务",
                                         },
@@ -938,11 +989,11 @@ class u115instant(_PluginBase):
                         "content": [
                             {
                                 "component": "div",
-                                "props": {"class": "overflow-x-auto"},
+                                "props": {"class": "d-none d-md-block overflow-x-auto"},
                                 "content": [
                                     {
                                         "component": "VTable",
-                                        "props": {"density": "comfortable", "hover": True, "class": "w-100 text-no-wrap", "style": "min-width: 900px;"},
+                                        "props": {"density": "comfortable", "hover": True, "class": "w-100 text-no-wrap", "style": "min-width: 980px;"},
                                         "content": [
                                             {
                                                 "component": "thead",
@@ -965,7 +1016,18 @@ class u115instant(_PluginBase):
                                         ],
                                     }
                                 ],
-                            }
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "d-block d-md-none"},
+                                "content": [
+                                    {
+                                        "component": "VList",
+                                        "props": {"class": "pa-0", "lines": "three"},
+                                        "content": mobile_rows,
+                                    }
+                                ],
+                            },
                         ],
                     },
                 ],
