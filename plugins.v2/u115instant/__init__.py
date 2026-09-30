@@ -109,15 +109,6 @@ class u115instant(_PluginBase):
         saved = self.get_data("tasks") or {}
         self._tasks = saved if isinstance(saved, dict) else {}
         if self._enabled:
-            # 提前保护共享的 U115Pan 实例，覆盖仪表盘、存储用量和目录查询等
-            # 不经过 StorageOperSelection 的后台调用。
-            try:
-                original = self._get_u115_target()
-                if original is not None:
-                    self._install_request_guard(original)
-                    logger.info("[115Instant] 已安装全局 115 请求保护")
-            except Exception as exc:
-                logger.warning(f"[115Instant] 安装全局 115 请求保护失败：{exc}")
             logger.info("[115Instant] 已启用，仅拦截本地到 115 的视频移动整理")
 
     @staticmethod
@@ -252,7 +243,8 @@ class u115instant(_PluginBase):
                     f"剩余 {remaining:.0f} 秒"
                 )
                 return None
-            # 宿主的重试会在风控响应上同步等待；重试调度交给插件队列。
+            # 只禁止这条插件整理请求的宿主自动重试；重试调度交给插件队列。
+            kwargs.pop("retry_limit", None)
             kwargs["retry_limit"] = 0
             response = self._raw_request_api(original)(
                 method,
