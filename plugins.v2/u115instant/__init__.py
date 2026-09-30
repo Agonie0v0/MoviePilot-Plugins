@@ -11,6 +11,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app import schemas
 from app.chain.transfer import TransferChain
 from app.core.event import Event, eventmanager
+from app.helper.progress import ProgressHelper
 from app.plugins import _PluginBase
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.log import logger
@@ -41,7 +42,7 @@ class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，达到上限转人工处理并支持强制上传"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.png"
-    plugin_version = "1.5.3"
+    plugin_version = "1.6.0"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -441,6 +442,13 @@ class u115instant(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {
+                "path": "/progress",
+                "endpoint": self.progress_api,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "读取 115 上传进度",
+            },
+            {
                 "path": "/toggle_selection",
                 "endpoint": self.toggle_selection_api,
                 "methods": ["POST"],
@@ -455,6 +463,21 @@ class u115instant(_PluginBase):
                 "summary": "手动整理指定或已选 115 秒传任务",
             },
         ]
+
+    def progress_api(self):
+        """读取当前任务的 MP 进度缓存，不触发任何 115 请求。"""
+        with self._lock:
+            task_items = [(str(key), dict(task)) for key, task in self._tasks.items()]
+        snapshots = {
+            key: self._upload_progress(task) for key, task in task_items
+        }
+        return {
+            "code": 0,
+            "data": {
+                "updated_at": time.time(),
+                "tasks": snapshots,
+            },
+        }
 
     def toggle_selection_api(self, payload: Optional[Dict[str, Any]] = None):
         """切换页面队列中一条任务的选中状态。"""
@@ -649,6 +672,12 @@ class u115instant(_PluginBase):
         with self._lock:
             task_items = [(str(key), dict(task)) for key, task in self._tasks.items()]
         tasks = [task for _, task in task_items]
+        progress_by_key = {
+            key: self._upload_progress(task) for key, task in task_items
+        }
+        uploading = sum(
+            bool(progress.get("active")) for progress in progress_by_key.values()
+        )
         waiting = sum(task.get("status") == "waiting" for task in tasks)
         retrying = sum(task.get("status") in {"retrying", "forcing"} for task in tasks)
         needs_action = sum(task.get("status") in {"manual", "stale", "error", "verify"} for task in tasks)
@@ -720,7 +749,10 @@ class u115instant(_PluginBase):
             alert_text = f"当前有 {needs_action} 个任务需要人工处理；可在对应行直接手动整理。"
         elif waiting or retrying:
             alert_type, alert_icon, alert_title = "info", "mdi-sync", "115 秒传保护正在工作"
-            alert_text = f"当前有 {waiting} 个文件等待重试，{retrying} 个文件正在执行。普通上传已被阻止。"
+            alert_text = (
+                f"当前有 {waiting} 个文件等待重试，{retrying} 个文件正在执行，"
+                f"其中 {uploading} 个正在分片上传。普通上传已被阻止。"
+            )
         else:
             alert_type, alert_icon, alert_title = "success", "mdi-check-circle-outline", "队列为空，保护已就绪"
             alert_text = "暂无等待任务。新的未命中秒传文件会自动出现在这里。"
@@ -734,6 +766,7 @@ class u115instant(_PluginBase):
             task_key = task_key or self._task_key(path)
             filename = Path(path).name or path
             reason = str(task.get("last_error", "") or "—")
+            progress_info = progress_by_key.get(task_key) or self._upload_progress(task)
             if task.get("status") == "forcing":
                 next_at = "强制上传中"
             elif task.get("status") == "manual":
@@ -742,6 +775,36 @@ class u115instant(_PluginBase):
                 next_at = "执行中"
             else:
                 next_at = format_time(task.get("next_at"))
+
+            if progress_info.get("active"):
+                progress_content = [
+                    {
+                        "component": "VProgressLinear",
+                        "props": {
+                            "model-value": progress_info["percent"],
+                            "color": "primary",
+                            "height": 6,
+                            "rounded": True,
+                            "aria-label": f"{filename} 上传进度",
+                        },
+                    },
+                    {
+                        "component": "div",
+                        "props": {
+                            "class": "text-caption text-medium-emphasis mt-1",
+                            "style": "white-space: normal; overflow-wrap: anywhere;",
+                        },
+                        "text": progress_info["label"],
+                    },
+                ]
+            else:
+                progress_content = [
+                    {
+                        "component": "span",
+                        "props": {"class": "text-caption text-medium-emphasis"},
+                        "text": progress_info["label"],
+                    }
+                ]
 
             if raw_status in actionable_statuses:
                 action_content = [
@@ -827,6 +890,11 @@ class u115instant(_PluginBase):
                             "component": "td",
                             "content": [{"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": color, "prepend-icon": icon}, "text": status}],
                         },
+                        {
+                            "component": "td",
+                            "props": {"style": "width: 190px; min-width: 190px;"},
+                            "content": progress_content,
+                        },
                         {"component": "td", "props": {"class": "text-body-2 text-no-wrap"}, "text": next_at},
                         {"component": "td", "props": {"class": "text-body-2 text-center"}, "text": str(task.get("attempts", 0))},
                         {"component": "td", "props": {"style": "width: 260px; max-width: 260px; overflow: hidden;"}, "content": [{"component": "div", "props": {"class": "text-caption text-medium-emphasis text-truncate", "style": "max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "title": reason}, "text": reason}]},
@@ -861,6 +929,7 @@ class u115instant(_PluginBase):
                             "props": {"class": "d-flex align-center flex-wrap ga-2 mt-2"},
                             "content": [
                                 {"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": color, "prepend-icon": icon}, "text": status},
+                                {"component": "div", "props": {"class": "w-100 mt-2"}, "content": progress_content},
                                 {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"下次执行：{next_at}"},
                                 {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"重试次数：{task.get('attempts', 0)}"},
                             ],
@@ -877,7 +946,7 @@ class u115instant(_PluginBase):
                     "content": [
                         {
                             "component": "td",
-                            "props": {"colspan": 7, "class": "text-center py-8"},
+                            "props": {"colspan": 8, "class": "text-center py-8"},
                             "content": [
                                 {"component": "VIcon", "props": {"icon": "mdi-inbox-outline", "size": "34", "color": "disabled"}},
                                 {"component": "div", "props": {"class": "text-subtitle-2 text-medium-emphasis mt-2"}, "text": "暂无等待或人工任务"},
@@ -959,6 +1028,23 @@ class u115instant(_PluginBase):
                                     {
                                         "component": "VBtn",
                                         "props": {
+                                            "icon": "mdi-refresh",
+                                            "size": "small",
+                                            "variant": "tonal",
+                                            "color": "primary",
+                                            "aria-label": "刷新上传进度",
+                                            "title": "刷新上传进度",
+                                        },
+                                        "events": {
+                                            "click": {
+                                                "api": "/plugin/u115instant/progress",
+                                                "method": "GET",
+                                            }
+                                        },
+                                    },
+                                    {
+                                        "component": "VBtn",
+                                        "props": {
                                             "size": "small",
                                             "variant": "tonal",
                                             "color": "primary",
@@ -993,7 +1079,7 @@ class u115instant(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VTable",
-                                        "props": {"density": "comfortable", "hover": True, "class": "w-100 text-no-wrap", "style": "min-width: 980px;"},
+                                        "props": {"density": "comfortable", "hover": True, "class": "w-100 text-no-wrap", "style": "min-width: 1160px;"},
                                         "content": [
                                             {
                                                 "component": "thead",
@@ -1004,6 +1090,7 @@ class u115instant(_PluginBase):
                                                             {"component": "th", "props": {"style": "width: 52px;"}, "text": "选择"},
                                                             {"component": "th", "props": {"style": "min-width: 250px;"}, "text": "文件"},
                                                             {"component": "th", "props": {"style": "width: 120px;"}, "text": "状态"},
+                                                            {"component": "th", "props": {"style": "width: 190px;"}, "text": "上传进度"},
                                                             {"component": "th", "props": {"style": "width: 120px;"}, "text": "下次执行"},
                                                             {"component": "th", "props": {"style": "width: 70px;"}, "text": "次数"},
                                                             {"component": "th", "props": {"style": "min-width: 260px;"}, "text": "最近原因"},
@@ -1095,6 +1182,98 @@ class u115instant(_PluginBase):
 
     def _save_tasks(self):
         self.save_data("tasks", self._tasks)
+
+    @staticmethod
+    def _format_size(value: Any) -> str:
+        """把字节数格式化为适合详情页展示的大小。"""
+        try:
+            size = max(0, float(value))
+        except (TypeError, ValueError):
+            return "—"
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        unit_index = 0
+        while size >= 1024 and unit_index < len(units) - 1:
+            size /= 1024
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(size)} {units[unit_index]}"
+        return f"{size:.1f} {units[unit_index]}"
+
+    @staticmethod
+    def _progress_key(path: str) -> str:
+        """生成与 MP transfer_process 相同的路径进度键。"""
+        return hashlib.md5(path.encode("utf-8")).hexdigest()
+
+    def _read_progress(self, path: str) -> Optional[Dict[str, Any]]:
+        """读取 MP 进度缓存，兼容 Windows 路径和 POSIX 路径写法。"""
+        candidates = []
+        try:
+            normalized = Path(path).as_posix()
+            if normalized:
+                candidates.append(normalized)
+        except (OSError, ValueError):
+            pass
+        if path and path not in candidates:
+            candidates.append(path)
+
+        for candidate in candidates:
+            try:
+                detail = ProgressHelper(self._progress_key(candidate)).get()
+            except Exception as exc:
+                logger.debug(f"[115Instant] 读取上传进度失败：{exc}")
+                continue
+            if isinstance(detail, dict) and detail.get("enable"):
+                return detail
+        return None
+
+    def _upload_progress(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """返回一条任务的上传进度快照，不执行网络操作。"""
+        status = str(task.get("status") or "")
+        empty = {
+            "active": False,
+            "percent": 0,
+            "uploaded": 0,
+            "total": 0,
+            "text": "",
+            "label": "—",
+        }
+        if status not in {"retrying", "forcing"}:
+            return empty
+
+        signature = task.get("signature")
+        total = signature.get("size", 0) if isinstance(signature, dict) else 0
+        try:
+            total = max(0, int(total))
+        except (TypeError, ValueError):
+            total = 0
+
+        detail = self._read_progress(str(task.get("path") or ""))
+        if not detail:
+            return {
+                **empty,
+                "label": "准备上传",
+                "total": total,
+            }
+
+        try:
+            percent = max(0.0, min(float(detail.get("value", 0) or 0), 100.0))
+        except (TypeError, ValueError):
+            percent = 0.0
+        uploaded = int(round(total * percent / 100)) if total else 0
+        percent_text = f"{percent:.0f}%"
+        size_text = (
+            f"{self._format_size(uploaded)} / {self._format_size(total)}"
+            if total
+            else "大小未知"
+        )
+        return {
+            "active": True,
+            "percent": percent,
+            "uploaded": uploaded,
+            "total": total,
+            "text": str(detail.get("text") or ""),
+            "label": f"{percent_text}，已传 {size_text}",
+        }
 
     def _notify_user(self, title: str, text: str):
         if self._notify:
