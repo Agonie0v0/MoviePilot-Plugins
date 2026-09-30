@@ -40,8 +40,8 @@ class _U115InstantProxy:
 class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，保留源文件并延迟重试"
-    plugin_icon = "mdi-cloud-sync-outline"
-    plugin_version = "1.1.0"
+    plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/u115instant.svg"
+    plugin_version = "1.2.0"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -71,7 +71,9 @@ class u115instant(_PluginBase):
         super().__init__()
         self._enabled = False
         self._notify = True
-        self._first_retry_minutes = 30
+        self._first_retry_minutes = 10
+        self._second_retry_minutes = 120
+        self._later_retry_minutes = 360
         self._max_wait_hours = 72
         self._tasks: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -83,7 +85,13 @@ class u115instant(_PluginBase):
         self._enabled = bool(config.get("enabled", False))
         self._notify = bool(config.get("notify", True))
         self._first_retry_minutes = self._positive_int(
-            config.get("first_retry_minutes", 30), 30, 1, 1440
+            config.get("first_retry_minutes", 10), 10, 1, 1440
+        )
+        self._second_retry_minutes = self._positive_int(
+            config.get("second_retry_minutes", 120), 120, 1, 10080
+        )
+        self._later_retry_minutes = self._positive_int(
+            config.get("later_retry_minutes", 360), 360, 1, 10080
         )
         self._max_wait_hours = self._positive_int(
             config.get("max_wait_hours", 72), 72, 1, 720
@@ -216,10 +224,10 @@ class u115instant(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        def field_col(model: str, label: str, icon: str, minimum: int, maximum: int) -> dict:
+        def field_col(model: str, label: str, icon: str, minimum: int, maximum: int, md: int = 6) -> dict:
             return {
                 "component": "VCol",
-                "props": {"cols": 12, "md": 6, "class": "py-1 px-2"},
+                "props": {"cols": 12, "sm": 6, "md": md, "class": "py-1 px-2"},
                 "content": [
                     {
                         "component": "VTextField",
@@ -300,8 +308,10 @@ class u115instant(_PluginBase):
                         "component": "VRow",
                         "props": {"dense": True, "class": "mx-n2"},
                         "content": [
-                            field_col("first_retry_minutes", "首次重试间隔（分钟）", "mdi-timer-sand", 1, 1440),
-                            field_col("max_wait_hours", "最长等待时间（小时）", "mdi-clock-alert-outline", 1, 720),
+                            field_col("first_retry_minutes", "首次重试（分钟）", "mdi-timer-sand", 1, 1440, 3),
+                            field_col("second_retry_minutes", "第二次重试（分钟）", "mdi-timer-outline", 1, 10080, 3),
+                            field_col("later_retry_minutes", "之后间隔（分钟）", "mdi-repeat", 1, 10080, 3),
+                            field_col("max_wait_hours", "最长等待（小时）", "mdi-clock-alert-outline", 1, 720, 3),
                         ],
                     },
                     {
@@ -311,7 +321,7 @@ class u115instant(_PluginBase):
                             {
                                 "component": "div",
                                 "props": {"class": "text-caption text-medium-emphasis mb-2"},
-                                "text": "系统使用固定退避节奏重试，避免持续请求 115 接口。",
+                                "text": "默认节奏为 10 分钟、2 小时、6 小时，也可以在上方分别调整。",
                             },
                             {
                                 "component": "div",
@@ -320,17 +330,17 @@ class u115instant(_PluginBase):
                                     {
                                         "component": "VChip",
                                         "props": {"size": "small", "variant": "tonal", "color": "primary", "prepend-icon": "mdi-numeric-1-circle-outline"},
-                                        "text": "首次：按上方间隔",
+                                        "text": "首次：可自定义",
                                     },
                                     {
                                         "component": "VChip",
                                         "props": {"size": "small", "variant": "tonal", "color": "info", "prepend-icon": "mdi-numeric-2-circle-outline"},
-                                        "text": "第二次：2 小时",
+                                        "text": "第二次：可自定义",
                                     },
                                     {
                                         "component": "VChip",
                                         "props": {"size": "small", "variant": "tonal", "color": "secondary", "prepend-icon": "mdi-repeat"},
-                                        "text": "之后：每 6 小时",
+                                        "text": "之后：可自定义",
                                     },
                                 ],
                             },
@@ -352,7 +362,9 @@ class u115instant(_PluginBase):
         ], {
             "enabled": False,
             "notify": True,
-            "first_retry_minutes": 30,
+            "first_retry_minutes": 10,
+            "second_retry_minutes": 120,
+            "later_retry_minutes": 360,
             "max_wait_hours": 72,
         }
 
@@ -617,12 +629,12 @@ class u115instant(_PluginBase):
             attempts = int(old.get("attempts", 0)) + 1
             first_at = float(old.get("first_at", now))
             if attempts == 1:
-                delay = self._first_retry_minutes * 60
+                delay_minutes = self._first_retry_minutes
             elif attempts == 2:
-                delay = 2 * 3600
+                delay_minutes = self._second_retry_minutes
             else:
-                delay = 6 * 3600
-            next_at = now + delay
+                delay_minutes = self._later_retry_minutes
+            next_at = now + delay_minutes * 60
             self._tasks[key] = {
                 "path": str(local_path),
                 "target_path": str(target_path),
@@ -636,7 +648,7 @@ class u115instant(_PluginBase):
                 "last_error": reason,
             }
             self._save_tasks()
-        logger.warning(f"[115Instant] {local_path.name} 未命中秒传，{self._first_retry_minutes} 分钟后重试")
+        logger.warning(f"[115Instant] {local_path.name} 未命中秒传，{delay_minutes} 分钟后重试")
         if attempts == 1:
             self._notify_user("115 秒传等待中", f"{local_path.name}\n{reason}\n源文件已保留")
 
@@ -822,8 +834,7 @@ class u115instant(_PluginBase):
                     current = self._tasks.get(key)
                     if current and current.get("status") == "retrying":
                         current["status"] = "waiting"
-                        current["attempts"] = int(current.get("attempts", 0)) + 1
-                        current["next_at"] = time.time() + 6 * 3600
+                        current["next_at"] = time.time() + self._later_retry_minutes * 60
                         current["last_error"] = str(message or "再次未命中秒传")
                         current["updated_at"] = time.time()
                         self._save_tasks()
