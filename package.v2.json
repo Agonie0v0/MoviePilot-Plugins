@@ -3,7 +3,7 @@
     "name": "115秒传整理",
     "description": "115未命中秒传时取消普通上传，保留源文件并延迟重试",
     "labels": "115,秒传,整理",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "mdi-cloud-sync-outline",
     "author": "Agonie",
     "github": "Agonie0v0/MoviePilot-Plugins",
@@ -11,6 +11,7 @@
     "level": 1,
     "v2": true,
     "history": {
+      "v1.1.0": "重做配置与队列详情页面，增加状态总览与可读的等待队列",
       "v1.0.0": "首版：115未命中秒传时取消普通上传并延迟重试"
     }
   },

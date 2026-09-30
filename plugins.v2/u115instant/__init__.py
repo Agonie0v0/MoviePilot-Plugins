@@ -41,7 +41,7 @@ class u115instant(_PluginBase):
     plugin_name = "115秒传整理"
     plugin_desc = "115 未命中秒传时取消普通上传，保留源文件并延迟重试"
     plugin_icon = "mdi-cloud-sync-outline"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0"
     plugin_config_prefix = "u115instant"
@@ -216,50 +216,136 @@ class u115instant(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return [
-            {
-                "component": "VForm",
+        def field_col(model: str, label: str, icon: str, minimum: int, maximum: int) -> dict:
+            return {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 6, "class": "py-1 px-2"},
+                "content": [
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": model,
+                            "label": label,
+                            "type": "number",
+                            "min": minimum,
+                            "max": maximum,
+                            "variant": "outlined",
+                            "density": "comfortable",
+                            "hide-details": "auto",
+                            "prepend-inner-icon": icon,
+                        },
+                    }
+                ],
+            }
+
+        def switch_col(model: str, label: str, icon: str, color: str) -> dict:
+            return {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 6, "class": "py-1 px-2"},
                 "content": [
                     {
                         "component": "VSwitch",
                         "props": {
-                            "model": "enabled",
-                            "label": "启用 115 仅秒传整理",
-                            "color": "primary",
+                            "model": model,
+                            "label": label,
+                            "color": color,
+                            "inset": True,
+                            "density": "comfortable",
+                            "hide-details": True,
+                            "prepend-icon": icon,
                         },
+                    }
+                ],
+            }
+
+        return [
+            {
+                "component": "VForm",
+                "props": {"class": "pa-1"},
+                "content": [
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "icon": "mdi-cloud-check-outline",
+                            "title": "115 秒传保护",
+                            "class": "mb-3",
+                        },
+                        "text": "只保护本地到内置 115 的视频移动整理。未命中秒传会保留源文件并进入等待队列，不会启动普通 OSS 上传。",
                     },
                     {
-                        "component": "VSwitch",
-                        "props": {
-                            "model": "notify",
-                            "label": "等待或异常时发送通知",
-                            "color": "info",
-                        },
+                        "component": "div",
+                        "props": {"class": "text-subtitle-2 font-weight-bold px-2 mt-1 mb-1"},
+                        "text": "运行开关",
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "first_retry_minutes",
-                            "label": "首次重试间隔（分钟）",
-                            "type": "number",
-                            "min": 1,
-                            "max": 1440,
-                        },
+                        "component": "VRow",
+                        "props": {"dense": True, "class": "mx-n2 mb-1"},
+                        "content": [
+                            switch_col("enabled", "启用 115 仅秒传整理", "mdi-power", "primary"),
+                            switch_col("notify", "等待或异常时通知", "mdi-bell-outline", "info"),
+                        ],
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "max_wait_hours",
-                            "label": "最长等待时间（小时）",
-                            "type": "number",
-                            "min": 1,
-                            "max": 720,
-                        },
+                        "component": "VDivider",
+                        "props": {"class": "my-3"},
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-subtitle-2 font-weight-bold px-2 mt-1 mb-1"},
+                        "text": "重试策略",
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True, "class": "mx-n2"},
+                        "content": [
+                            field_col("first_retry_minutes", "首次重试间隔（分钟）", "mdi-timer-sand", 1, 1440),
+                            field_col("max_wait_hours", "最长等待时间（小时）", "mdi-clock-alert-outline", 1, 720),
+                        ],
+                    },
+                    {
+                        "component": "VSheet",
+                        "props": {"class": "pa-3 mt-2 mb-2 rounded-lg bg-grey-lighten-5", "border": True},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis mb-2"},
+                                "text": "系统使用固定退避节奏重试，避免持续请求 115 接口。",
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "d-flex flex-wrap ga-2"},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "prepend-icon": "mdi-numeric-1-circle-outline"},
+                                        "text": "首次：按上方间隔",
+                                    },
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "info", "prepend-icon": "mdi-numeric-2-circle-outline"},
+                                        "text": "第二次：2 小时",
+                                    },
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "secondary", "prepend-icon": "mdi-repeat"},
+                                        "text": "之后：每 6 小时",
+                                    },
+                                ],
+                            },
+                        ],
                     },
                     {
                         "component": "VAlert",
-                        "props": {"type": "warning", "variant": "tonal", "class": "mt-3"},
-                        "text": "首版只保护本地到 115 的视频移动整理，未命中秒传不会启动普通上传；请将整理覆盖模式设为不覆盖。",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "icon": "mdi-shield-alert-outline",
+                            "title": "整理前请确认保护边界",
+                            "class": "mt-3",
+                        },
+                        "text": "媒体库整理方式请选择“移动”，覆盖模式请选择“不覆盖”。插件只保护视频主文件，字幕、NFO 和封面仍按 MP 原生逻辑处理。",
                     },
                 ],
             }
@@ -272,24 +358,211 @@ class u115instant(_PluginBase):
 
     def get_page(self) -> List[dict]:
         with self._lock:
-            tasks = list(self._tasks.values())
+            tasks = [dict(task) for task in self._tasks.values()]
         waiting = sum(task.get("status") == "waiting" for task in tasks)
-        stale = sum(task.get("status") in {"stale", "error", "verify"} for task in tasks)
+        retrying = sum(task.get("status") == "retrying" for task in tasks)
+        needs_action = sum(task.get("status") in {"stale", "error", "verify"} for task in tasks)
+
+        def format_time(value: Any) -> str:
+            try:
+                return time.strftime("%m-%d %H:%M", time.localtime(float(value)))
+            except (TypeError, ValueError, OverflowError):
+                return "—"
+
+        def status_meta(status: str) -> Tuple[str, str, str]:
+            return {
+                "waiting": ("等待重试", "info", "mdi-clock-outline"),
+                "retrying": ("正在重试", "primary", "mdi-sync"),
+                "verify": ("待核验", "warning", "mdi-shield-search-outline"),
+                "error": ("需处理", "error", "mdi-alert-circle-outline"),
+                "stale": ("源文件变化", "warning", "mdi-file-alert-outline"),
+            }.get(status, ("未知状态", "secondary", "mdi-help-circle-outline"))
+
+        def stat_tile(label: str, value: int, color: str, icon: str) -> dict:
+            return {
+                "component": "VCol",
+                "props": {"cols": 6, "sm": 3, "class": "py-1 px-2"},
+                "content": [
+                    {
+                        "component": "VCard",
+                        "props": {"variant": "tonal", "class": "pa-3 rounded-lg", "color": color},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "d-flex align-center justify-space-between mb-2"},
+                                "content": [
+                                    {"component": "VIcon", "props": {"icon": icon, "size": "20"}},
+                                    {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": label},
+                                ],
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-h5 font-weight-bold", "style": "line-height: 1.15;"},
+                                "text": str(value),
+                            },
+                        ],
+                    }
+                ],
+            }
+
+        if not self._enabled:
+            alert_type, alert_icon, alert_title = "warning", "mdi-power-off", "插件当前未启用"
+            alert_text = "启用插件并保存配置后，MP 才会拦截本地到 115 的视频移动整理。"
+        elif waiting or retrying:
+            alert_type, alert_icon, alert_title = "info", "mdi-sync", "115 秒传保护正在工作"
+            alert_text = f"当前有 {waiting} 个文件等待重试，{retrying} 个文件正在执行。普通上传已被阻止。"
+        elif needs_action:
+            alert_type, alert_icon, alert_title = "warning", "mdi-alert-outline", "有任务需要人工处理"
+            alert_text = f"当前有 {needs_action} 个任务处于异常或待核验状态，请查看下方队列。"
+        else:
+            alert_type, alert_icon, alert_title = "success", "mdi-check-circle-outline", "队列为空，保护已就绪"
+            alert_text = "暂无等待任务。新的未命中秒传文件会自动出现在这里。"
+
+        rows = []
+        for task in tasks[-30:]:
+            status, color, icon = status_meta(str(task.get("status", "")))
+            path = str(task.get("path", ""))
+            reason = str(task.get("last_error", "") or "—")
+            next_at = "执行中" if task.get("status") == "retrying" else format_time(task.get("next_at"))
+            rows.append(
+                {
+                    "component": "tr",
+                    "content": [
+                        {
+                            "component": "td",
+                            "props": {"style": "max-width: 330px;"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-body-2 font-weight-medium text-truncate", "style": "max-width: 330px;"},
+                                    "text": Path(path).name or path,
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis text-truncate", "style": "max-width: 330px;"},
+                                    "text": path,
+                                },
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "content": [{"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": color, "prepend-icon": icon}, "text": status}],
+                        },
+                        {"component": "td", "props": {"class": "text-body-2 text-no-wrap"}, "text": next_at},
+                        {"component": "td", "props": {"class": "text-body-2 text-center"}, "text": str(task.get("attempts", 0))},
+                        {"component": "td", "props": {"class": "text-caption text-medium-emphasis", "style": "max-width: 300px;"}, "text": reason},
+                    ],
+                }
+            )
+
+        if not rows:
+            rows = [
+                {
+                    "component": "tr",
+                    "content": [
+                        {
+                            "component": "td",
+                            "props": {"colspan": 5, "class": "text-center py-8"},
+                            "content": [
+                                {"component": "VIcon", "props": {"icon": "mdi-inbox-outline", "size": "34", "color": "disabled"}},
+                                {"component": "div", "props": {"class": "text-subtitle-2 text-medium-emphasis mt-2"}, "text": "暂无等待任务"},
+                                {"component": "div", "props": {"class": "text-caption text-disabled mt-1"}, "text": "未命中秒传的文件会在这里显示并按策略自动重试。"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+
         return [
             {
                 "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal", "class": "mb-3"},
-                "text": f"等待秒传：{waiting} 个；需人工处理：{stale} 个。",
+                "props": {"type": alert_type, "variant": "tonal", "icon": alert_icon, "title": alert_title, "class": "mb-3"},
+                "text": alert_text,
             },
             {
-                "component": "VList",
-                "props": {"density": "compact"},
+                "component": "VRow",
+                "props": {"dense": True, "class": "mx-n2 mb-3"},
+                "content": [
+                    stat_tile("等待重试", waiting, "info", "mdi-clock-outline"),
+                    stat_tile("正在执行", retrying, "primary", "mdi-sync"),
+                    stat_tile("需人工处理", needs_action, "warning", "mdi-alert-outline"),
+                    stat_tile("队列总数", len(tasks), "secondary", "mdi-format-list-bulleted"),
+                ],
+            },
+            {
+                "component": "VSheet",
+                "props": {"class": "pa-3 mb-3 rounded-lg bg-grey-lighten-5", "border": True},
+                "content": [
+                    {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold mb-2"}, "text": "运行边界"},
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4, "class": "py-1"},
+                                "content": [{"component": "VListItem", "props": {"density": "compact", "prepend-icon": "mdi-file-video-outline", "title": "只保护视频主文件", "subtitle": "字幕和 NFO 仍走 MP 原生逻辑"}}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4, "class": "py-1"},
+                                "content": [{"component": "VListItem", "props": {"density": "compact", "prepend-icon": "mdi-cloud-off-outline", "title": "未命中不启动普通上传", "subtitle": "源文件保留在本地"}}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4, "class": "py-1"},
+                                "content": [{"component": "VListItem", "props": {"density": "compact", "prepend-icon": "mdi-reload", "title": "可使用命令立即重试", "subtitle": "/115instant_retry"}}],
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "rounded-lg"},
                 "content": [
                     {
-                        "component": "VListItem",
-                        "props": {"title": task.get("path", ""), "subtitle": task.get("last_error", "")},
-                    }
-                    for task in tasks[-20:]
+                        "component": "VCardItem",
+                        "props": {"class": "pb-2"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "d-flex align-center justify-space-between w-100"},
+                                "content": [
+                                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1 font-weight-bold pa-0"}, "text": "等待队列"},
+                                    {"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": "primary"}, "text": f"最近 {min(len(tasks), 30)} 条"},
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pt-0 px-0"},
+                        "content": [
+                            {
+                                "component": "VTable",
+                                "props": {"density": "comfortable", "hover": True, "class": "w-100"},
+                                "content": [
+                                    {
+                                        "component": "thead",
+                                        "content": [
+                                            {
+                                                "component": "tr",
+                                                "content": [
+                                                    {"component": "th", "props": {"style": "min-width: 250px;"}, "text": "文件"},
+                                                    {"component": "th", "props": {"style": "width: 120px;"}, "text": "状态"},
+                                                    {"component": "th", "props": {"style": "width: 120px;"}, "text": "下次执行"},
+                                                    {"component": "th", "props": {"style": "width: 70px;"}, "text": "次数"},
+                                                    {"component": "th", "text": "最近原因"},
+                                                ],
+                                            }
+                                        ],
+                                    },
+                                    {"component": "tbody", "content": rows},
+                                ],
+                            }
+                        ],
+                    },
                 ],
             },
         ]
