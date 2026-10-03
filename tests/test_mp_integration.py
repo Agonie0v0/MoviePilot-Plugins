@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 from pathlib import Path, PurePosixPath
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests.support import remote, store
 
@@ -120,6 +120,131 @@ class MoviePilotTests(unittest.TestCase):
     def attempt(self, key):
         self.engine.store.update(key, next_at=0)
         self.engine.execute(self.engine.store.claim())
+
+    def attach_plugin_notifier(self):
+        """Load the real entry point and MP's native post_message adapter."""
+        import enum
+        import importlib.util
+        import sys
+        import types
+        from typing import Optional
+        from tests.mp_harness import selected
+        from tests.support import PLUGIN
+        ns = {"Enum": enum.Enum}
+        selected("app/schemas/types.py", {"NotificationType"}, ns)
+        ns.update(Optional=Optional, MessageChannel=object,
+                  Notification=lambda **kw: types.SimpleNamespace(**kw),
+                  settings=types.SimpleNamespace(MP_DOMAIN=lambda path: path))
+        selected("app/plugins/__init__.py", {"_PluginBase"}, ns,
+                 methods={"post_message"}, bases="object")
+        plugins = types.ModuleType("app.plugins")
+        plugins._PluginBase = ns["_PluginBase"]
+        fastapi = types.ModuleType("fastapi")
+        fastapi.HTTPException = RuntimeError
+        spec = importlib.util.spec_from_file_location("instantwait_test.plugin_entry", PLUGIN / "__init__.py")
+        spec.submodule_search_locations = None
+        entry = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"app.plugins": plugins, "fastapi": fastapi}), \
+                patch.object(self.h.schemas, "NotificationType", ns["NotificationType"], create=True):
+            spec.loader.exec_module(entry)
+        plugin = entry.P115InstantWait()
+        plugin.systemmessage, plugin.chain = Mock(), Mock()
+        self.engine.notify = plugin._notify
+        return plugin
+
+    def test_notifications_reach_mp_channels_on_first_wait_and_retry_exhaustion(self):
+        plugin = self.attach_plugin_notifier()
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.engine.config["max_retries"] = 2
+        self.attempt(row["id"])
+        first = plugin.chain.post_message.call_args.args[0]
+        self.assertEqual(first.mtype.value, "整理入库")
+        self.assertIn("A.mkv", first.text)
+        self.assertIn(f"#{row['history_id']}", first.text)
+        self.assertIn(self.h.bridge.log_time(self.engine.store.get(row["id"])["next_at"]), first.text)
+        self.attempt(row["id"])
+        self.assertEqual(plugin.chain.post_message.call_count, 1)
+        self.attempt(row["id"])
+        last = plugin.chain.post_message.call_args.args[0]
+        self.assertEqual(plugin.chain.post_message.call_count, 2)
+        self.assertEqual(last.mtype.value, "手动处理")
+        self.assertIn("自动重试次数已用完", last.text)
+        self.assertIn("3/3", last.text)
+        self.assertIn(row["id"], last.text)
+        self.assertIn("P115InstantWait", last.link)
+        self.assertEqual(plugin.systemmessage.put.call_count, 2)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.engine.restore()
+        self.assertEqual(plugin.chain.post_message.call_count, 2)
+
+    def test_notification_toggle_suppresses_both_local_and_push_messages(self):
+        plugin = self.attach_plugin_notifier()
+        plugin._config["notify"] = False
+        self.engine.config["max_retries"] = 0
+        self.enroll()
+        self.attempt(self.engine.store.all()[0]["id"])
+        plugin.systemmessage.put.assert_not_called()
+        plugin.chain.post_message.assert_not_called()
+
+    def test_failed_notification_cannot_change_pause_or_block_next_task(self):
+        plugin = self.attach_plugin_notifier()
+        plugin.chain.post_message.side_effect = RuntimeError("channel unavailable secret")
+        self.engine.config["max_retries"] = 0
+        self.enroll()
+        row = self.engine.store.all()[0]
+        with patch.object(self.h.bridge.logger, "warning") as warning:
+            self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertIn("自动重试次数已用完", self.engine.store.get(row["id"])["message"])
+        self.assertEqual(plugin.chain.post_message.call_count, 1)
+        self.assertTrue(any("通知提交失败" in c.args[0] for c in warning.call_args_list))
+        self.assertFalse(any("secret" in c.args[0] for c in warning.call_args_list))
+        task = self.enroll(name="B.mkv")
+        second = self.engine.store.active_for(self.h.bridge.source_key(task.fileitem))
+        self.api.hit = True
+        self.attempt(second["id"])
+        self.assertEqual(self.engine.store.get(second["id"])["state"], "completed")
+
+    def test_local_message_failure_still_dispatches_channel_notification(self):
+        plugin = self.attach_plugin_notifier()
+        plugin.systemmessage.put.side_effect = RuntimeError("local message store failed")
+        self.engine.config["max_retries"] = 0
+        self.enroll()
+        self.attempt(self.engine.store.all()[0]["id"])
+        plugin.chain.post_message.assert_called_once()
+
+    def test_timeout_auth_error_and_manual_upload_error_send_actionable_notifications(self):
+        plugin = self.attach_plugin_notifier()
+        self.enroll()
+        row = self.engine.store.all()[0]
+        row["payload"]["wait_since"] = time.time() - 90000
+        self.engine.store.update(row["id"], payload=row["payload"])
+        self.attempt(row["id"])
+        self.assertIn("等待超过设定期限", plugin.chain.post_message.call_args.args[0].text)
+        self.engine.control(row["id"], "resume")
+        with patch.object(self.api, "instant", side_effect=remote.PauseTask("115 授权失效")):
+            self.attempt(row["id"])
+        self.assertIn("授权失效", plugin.chain.post_message.call_args.args[0].text)
+        self.engine.control(row["id"], "upload")
+        with patch.object(self.api, "upload", side_effect=remote.RetryLater("网络连接中断")):
+            self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertIn("手动处理未完成", plugin.chain.post_message.call_args.args[0].text)
+        self.assertEqual(plugin.chain.post_message.call_count, 3)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+
+    def test_user_pause_is_quiet_and_native_failure_notification_is_not_duplicated(self):
+        plugin = self.attach_plugin_notifier()
+        task = self.enroll()
+        row = self.engine.store.all()[0]
+        self.engine.control(row["id"], "pause")
+        plugin.chain.post_message.assert_not_called()
+        self.engine.control(row["id"], "resume")
+        self.engine.finish_failure(row, task, self.h.TransferInfo(success=False, message="目标冲突"))
+        self.assertEqual(len(self.h.notifications), 1)
+        self.assertEqual(self.h.notifications[0]["mtype"], "Manual")
+        plugin.chain.post_message.assert_not_called()
 
     def test_wait_is_failed_history_without_failure_events_or_success_side_effects(self):
         task = self.enroll()
