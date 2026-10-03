@@ -14,6 +14,7 @@ class Fake115:
         self.h = harness
         self.files = {}
         self.inits = 0
+        self.uploads = 0
         self.moves = []
         self.hit = False
         self.entered, self.release = threading.Event(), threading.Event()
@@ -58,6 +59,16 @@ class Fake115:
         if item.size != hashes["fingerprint"]["size"]:
             raise remote.PauseTask("大小错误")
         return item.model_copy(update={"path": str(path)})
+
+    def upload(self, path, folder, hashes, init, payload, checkpoint):
+        self.uploads += 1
+        name = PurePosixPath(payload["final_path"]).name
+        item = self.h.FileItem(storage="u115", type="file", fileid="123",
+            path=str(PurePosixPath(folder.path) / name), name=name,
+            size=hashes["fingerprint"]["size"])
+        self.files[item.fileid] = item
+        payload["upload_confirmed"] = True
+        checkpoint()
 
     def move_id(self, file_id, folder, name):
         if self.fail_move and ".mp115-backups" not in folder.path:
@@ -122,6 +133,154 @@ class MoviePilotTests(unittest.TestCase):
         self.assertFalse(any(kind in ("TransferFailed", "TransferComplete") for kind, _ in self.h.events))
         self.assertFalse(self.h.chain.jobview.is_done(task))
         self.assertIn(task.fileitem.path, self.h.chain._scrape_batches[task.transfer_batch_id]["pending"])
+
+    def test_retry_limit_pauses_then_manual_miss_uploads_and_updates_original_history(self):
+        task = self.enroll(mode="move")
+        row = self.engine.store.all()[0]
+        self.engine.config["max_retries"] = 2
+        for _ in range(3):
+            self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertEqual(self.api.inits, 3)
+        self.assertEqual(self.api.uploads, 0)
+        self.assertIsNone(self.engine.store.claim(now=time.time() + 9999))
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertTrue(Path(task.fileitem.path).exists())
+        self.engine.control(row["id"], "upload")
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.api.uploads, 1)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.h.db.query(self.h.History).count(), 1)
+        self.assertFalse(Path(task.fileitem.path).exists())
+
+    def test_manual_hit_never_sends_file_contents(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.engine.control(row["id"], "upload")
+        self.api.hit = True
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.api.uploads, 0)
+        self.assertEqual(self.api.inits, 1)
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+
+    def test_zero_retry_and_continue_waiting_reset_auto_budget(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.engine.config["max_retries"] = 0
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.engine.control(row["id"], "resume")
+        self.attempt(row["id"])
+        current = self.engine.store.get(row["id"])
+        self.assertEqual(current["state"], "paused")
+        self.assertEqual(current["attempts"], 2)
+        self.assertEqual(current["payload"]["auto_attempts"], 1)
+        self.assertEqual(self.api.uploads, 0)
+
+    def test_manual_recovery_reconciles_existing_file_without_uploading_again(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        payload = row["payload"]
+        path = Path(payload["task"]["fileitem"]["path"])
+        payload["hashes"] = remote.hash_file(path, threading.Event())
+        payload["upload_session"] = {"upload_id": "interrupted"}
+        final = PurePosixPath(payload["final_path"])
+        self.api.files["123"] = self.h.FileItem(storage="u115", type="file", fileid="123",
+            path=str(final.parent / ".mp115-staging" / row["id"] / final.name),
+            name=final.name, size=path.stat().st_size)
+        self.engine.store.update(row["id"], state="uploading", payload=payload)
+        self.engine.stop()
+        self.engine = self.new_engine()
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.engine.control(row["id"], "upload")
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.api.inits, 0)
+        self.assertEqual(self.api.uploads, 0)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.h.db.query(self.h.History).count(), 1)
+
+    def test_manual_upload_failure_pauses_and_preserves_source(self):
+        task = self.enroll(mode="move")
+        row = self.engine.store.all()[0]
+        self.engine.control(row["id"], "upload")
+        with patch.object(self.api, "upload", side_effect=remote.RetryLater("网络中断")):
+            self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertIsNone(self.engine.store.claim(now=time.time() + 9999))
+        self.assertIsNone(self.engine.store.claim(manual=True))
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertTrue(Path(task.fileitem.path).exists())
+
+    def test_manual_upload_bypasses_expired_wait_limit_but_not_source_guard(self):
+        task = self.enroll()
+        row = self.engine.store.all()[0]
+        payload = row["payload"]
+        payload["wait_since"] = 0
+        payload["auto_attempts"] = 99
+        self.engine.store.update(row["id"], payload=payload)
+        self.engine.control(row["id"], "upload")
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        other = self.enroll("changed.mkv")
+        changed = self.engine.store.active_for(self.h.bridge.source_key(other.fileitem))
+        Path(other.fileitem.path).write_bytes(b"changed")
+        self.engine.control(changed["id"], "upload")
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.engine.store.get(changed["id"])["state"], "paused")
+        self.assertEqual(self.api.uploads, 1)
+
+    def test_confirmed_manual_upload_not_repeated_when_metadata_is_delayed(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        real_upload = self.api.upload
+        hidden = {}
+        def delayed(*args):
+            real_upload(*args)
+            hidden.update(self.api.files)
+            self.api.files.clear()
+        self.engine.control(row["id"], "upload")
+        with patch.object(self.api, "upload", side_effect=delayed):
+            self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.engine.control(row["id"], "upload")
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.api.inits, 1)
+        self.assertEqual(self.api.uploads, 1)
+        self.api.files.update(hidden)
+        self.engine.control(row["id"], "upload")
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+
+    def test_manual_upload_does_not_block_auto_queue_or_local_organization(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.engine.control(row["id"], "upload")
+        entered, release = threading.Event(), threading.Event()
+        real = self.api.upload
+        def blocked(*args):
+            entered.set()
+            if not release.wait(10):
+                raise remote.RetryLater("test timeout")
+            return real(*args)
+        with patch.object(self.api, "upload", side_effect=blocked):
+            worker = threading.Thread(target=lambda: self.engine.execute(self.engine.store.claim(manual=True)))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                other = self.enroll("other.mkv")
+                waiting = self.engine.store.active_for(self.h.bridge.source_key(other.fileitem))
+                self.attempt(waiting["id"])
+                self.assertEqual(self.engine.store.get(waiting["id"])["state"], "waiting")
+                local = self.enroll("local.mkv", target="local")
+                self.assertTrue(self.h.Oper().get_by_src(local.fileitem.path, "local").status)
+                self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
 
     def test_retry_success_updates_same_native_history_id(self):
         task = self.enroll()

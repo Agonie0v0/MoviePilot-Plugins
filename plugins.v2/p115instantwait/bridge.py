@@ -86,6 +86,8 @@ class InstantWaitEngine:
         self.live_tasks = {}
         self.chain = TransferChain()
         self.worker = None
+        self.upload_worker = None
+        self.upload_wake = threading.Event()
         self.extensions = {ext.strip().lower().lstrip(".") for ext in config["extensions"].split(",") if ext.strip()}
 
     def patch(self, cls, name, method):
@@ -233,8 +235,11 @@ class InstantWaitEngine:
             self.restore()
             self.worker = threading.Thread(target=self.run, name="p115-instant-wait", daemon=True)
             self.worker.start()
+            self.upload_worker = threading.Thread(target=self.run, kwargs={"manual": True},
+                                                  name="p115-manual-upload", daemon=True)
+            self.upload_worker.start()
         except Exception:
-            self.uninstall()
+            self.stop()
             raise
 
     def in_scope(self, values):
@@ -256,9 +261,12 @@ class InstantWaitEngine:
     def stop(self):
         self.stop_event.set()
         self.wake.set()
-        if self.worker:
-            self.worker.join(timeout=35)
-            if self.worker.is_alive():
+        self.upload_wake.set()
+        deadline = time.monotonic() + 35
+        for worker in (self.worker, self.upload_worker):
+            if worker and worker.ident is not None:
+                worker.join(timeout=max(0, deadline - time.monotonic()))
+            if worker and worker.is_alive():
                 raise RuntimeError("后台请求仍在结束，暂不能重新初始化插件")
         self.uninstall()
 
@@ -311,6 +319,8 @@ class InstantWaitEngine:
                 self.chain.jobview.add_task(task, state="waiting")
                 self.chain._TransferChain__register_scrape_batch_task(task)
                 self.ensure_history(row["id"], task)
+                if row["state"] == "paused":
+                    self.history_message(row["id"], row["message"])
                 self.store.update(row["id"], ready=1)
             except Exception:
                 self.store.update(row["id"], state="paused", message="任务恢复失败，请检查 MP 版本与队列数据")
@@ -329,13 +339,14 @@ class InstantWaitEngine:
         for batch in active_batches:
             self.chain._TransferChain__close_scrape_batch(batch)
 
-    def run(self):
+    def run(self, manual=False):
+        wake = self.upload_wake if manual else self.wake
         while not self.stop_event.is_set():
             try:
-                row = self.store.claim()
+                row = self.store.claim(manual=manual)
                 if not row:
-                    self.wake.wait(5)
-                    self.wake.clear()
+                    wake.wait(5)
+                    wake.clear()
                     continue
                 self.execute(row)
             except Exception:
@@ -344,6 +355,7 @@ class InstantWaitEngine:
 
     def execute(self, row):
         key = row["id"]
+        manual = row["state"] == "uploading"
         api = None
         try:
             payload = row["payload"]
@@ -360,8 +372,10 @@ class InstantWaitEngine:
                 self.complete(row, task, info)
                 return
             limit = self.config["max_wait_hours"] * 3600
-            if limit and time.time() - payload.get("wait_since", row["created"]) > limit:
+            if not manual and limit and time.time() - payload.get("wait_since", row["created"]) > limit:
                 raise PauseTask("等待超过设定期限，可手动恢复继续等待")
+            if not manual and payload.get("auto_attempts", row["attempts"]) > self.config.get("max_retries", 3) + 1:
+                raise PauseTask("自动重试次数已用完，请手动处理；强制上传会在未秒传时普通上传")
             path = Path(task.fileitem.path)
             if not path.is_file():
                 raise PauseTask("源文件不存在，已暂停")
@@ -382,17 +396,33 @@ class InstantWaitEngine:
                 existing = api.raw_path(stage_path)
                 if existing and existing.get("file_id"):
                     file_id = existing["file_id"]
-                elif not payload.get("instant_confirmed"):
-                    file_id = api.instant(path, stage_dir, final.name, payload["hashes"])
+                elif payload.get("upload_session") and not payload.get("upload_confirmed"):
+                    if not manual:
+                        raise PauseTask("有未完成的普通上传，请点强制上传继续")
+                    api.upload(path, stage_dir, payload["hashes"], None, payload,
+                               lambda: self.store.update(key, payload=payload))
+                    existing = api.raw_path(stage_path)
+                    file_id = existing.get("file_id") if existing else None
+                elif not payload.get("instant_confirmed") and not payload.get("upload_confirmed"):
+                    try:
+                        file_id = api.instant(path, stage_dir, final.name, payload["hashes"])
+                    except NotInstant as exc:
+                        if not manual:
+                            raise
+                        self.store.update(key, message="未命中秒传，正在普通上传")
+                        self.history_message(key, "手动处理：未命中秒传，正在普通上传")
+                        api.upload(path, stage_dir, payload["hashes"], exc.upload_data, payload,
+                                   lambda: self.store.update(key, payload=payload))
+                    else:
+                        payload["instant_confirmed"] = True
                     # A hit without an ID must wait for visibility, not submit
                     # another init that can create a duplicate remote file.
-                    payload["instant_confirmed"] = True
                     self.store.update(key, payload=payload)
                     if not file_id:
                         existing = api.raw_path(stage_path)
                         file_id = existing.get("file_id") if existing else None
                 if not file_id:
-                    raise RetryLater("秒传已命中，等待远端文件 ID 可见")
+                    raise RetryLater("已提交上传结果，等待远端文件 ID 可见")
                 payload["remote_id"] = str(file_id)
                 self.store.update(key, payload=payload)
             staged = api.verify(file_id, str(stage_path), payload["hashes"])
@@ -429,8 +459,14 @@ class InstantWaitEngine:
                 api.close()
 
     def defer(self, row, state, reason):
+        if row["state"] == "uploading":
+            state = "paused"
+            reason = f"手动处理未完成：{reason}；可再次点强制上传核对并继续"
+        elif state == "waiting" and row["payload"].get("auto_attempts", row["attempts"]) >= self.config.get("max_retries", 3) + 1:
+            state = "paused"
+            reason = f"自动重试次数已用完，请手动处理。最后结果：{reason}"
         delays = self.config["retry_delays"]
-        base = delays[min(max(0, row["attempts"] - 1), len(delays) - 1)]
+        base = delays[min(max(0, row["payload"].get("auto_attempts", row["attempts"]) - 1), len(delays) - 1)]
         delay = base * random.uniform(0.9, 1.1)
         message = f"等待秒传：{reason}" if state == "waiting" else f"秒传等待已暂停：{reason}"
         self.store.update(row["id"], state=state, next_at=time.time() + delay, message=message)
@@ -471,7 +507,7 @@ class InstantWaitEngine:
                 LocalStorage().delete(task.fileitem)
                 if path.exists():
                     raise RetryLater("整理已成功，等待源文件清理完成")
-        self.store.update(key, state="completed", message="秒传与 MP 整理完成")
+        self.store.update(key, state="completed", message="文件传输与 MP 整理完成")
         self.original_finish_batch(self.chain, task)
         self.chain.jobview.try_remove_job(task)
         self.live_tasks.pop(key, None)
@@ -498,4 +534,5 @@ class InstantWaitEngine:
                 self.original_finish_batch(self.chain, task)
                 self.chain.jobview.try_remove_job(task)
         self.wake.set()
+        self.upload_wake.set()
         return row

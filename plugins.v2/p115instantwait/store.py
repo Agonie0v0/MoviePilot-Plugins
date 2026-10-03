@@ -84,22 +84,29 @@ class QueueStore:
             db.execute("UPDATE jobs SET " + ",".join(f"{k}=?" for k in changes) + " WHERE id=?",
                        (*changes.values(), key))
 
-    def claim(self, now=None):
+    def claim(self, now=None, manual=False):
         now = time.time() if now is None else now
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM jobs WHERE ready=1 AND state IN ('queued','waiting') "
+            states = "('upload_queued')" if manual else "('queued','waiting')"
+            row = db.execute(f"SELECT * FROM jobs WHERE ready=1 AND state IN {states} "
                              "AND next_at<=? ORDER BY next_at,created LIMIT 1", (now,)).fetchone()
             if row is None:
                 return None
-            db.execute("UPDATE jobs SET state='running', attempts=attempts+1, updated=? WHERE id=?",
-                       (now, row["id"]))
+            payload = json.loads(row["payload"])
+            if not manual:
+                payload["auto_attempts"] = payload.get("auto_attempts", row["attempts"]) + 1
+            db.execute("UPDATE jobs SET state=?, attempts=attempts+1, payload=?, updated=? WHERE id=?",
+                       ("uploading" if manual else "running", json.dumps(payload), now, row["id"]))
             return self.decode(db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone())
 
     def recover(self):
         with self.connect() as db:
             db.execute("UPDATE jobs SET state='waiting',next_at=?,ready=1 WHERE state='running'",
                        (time.time(),))
+            # Never resume sending file contents without a new manual action.
+            db.execute("UPDATE jobs SET state='paused',ready=1,message=? WHERE state='uploading'",
+                       ("手动上传被中断，请点强制上传继续；将先核对远端及已保存的上传进度",))
 
     def command(self, key, action):
         """Do not race an in-flight upload or completion callback."""
@@ -108,20 +115,24 @@ class QueueStore:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (key,)).fetchone()
             if not row:
                 raise KeyError(key)
-            if row["state"] == "running":
+            if row["state"] in ("running", "uploading"):
                 raise ValueError("任务正在执行，请在本轮完成后操作")
             if action == "resume" and row["state"] == "paused":
                 state = "waiting"
                 payload = json.loads(row["payload"])
                 payload["wait_since"] = time.time()
+                payload["auto_attempts"] = 0
                 db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), key))
-            elif action == "pause" and row["state"] in ("queued", "waiting"):
+            elif action == "upload" and row["state"] in ("queued", "waiting", "paused"):
+                state = "upload_queued"
+            elif action == "pause" and row["state"] in ("queued", "waiting", "upload_queued"):
                 state = "paused"
-            elif action == "cancel" and row["state"] in ("queued", "waiting", "paused"):
+            elif action == "cancel" and row["state"] in ("queued", "waiting", "paused", "upload_queued"):
                 state = "cancelled"
             else:
                 raise ValueError("当前状态不支持此操作")
             db.execute("UPDATE jobs SET state=?,message=?,next_at=?,updated=? WHERE id=?",
-                       (state, {"waiting": "等待秒传", "paused": "已暂停", "cancelled": "已取消"}[state],
+                       (state, {"waiting": "等待秒传", "paused": "已暂停", "cancelled": "已取消",
+                                "upload_queued": "已安排手动处理：先秒传，未命中则普通上传"}[state],
                         time.time(), time.time(), key))
         return self.get(key)

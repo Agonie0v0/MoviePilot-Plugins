@@ -24,7 +24,7 @@ icons/                 # 插件图标资源
 
 各插件的功能、配置项和使用限制请查看对应插件目录中的 README。仓库版本以对应的 `package*.json` 索引为准。
 
-[115秒传等待](plugins.v2/p115instantwait/README.md)：适配 MoviePilot V2.15.6 内置 115，未秒传时后台等待，成功后更新原整理记录。当前为 0.1.2 测试版，尚待真实账号验证。
+[115秒传等待](plugins.v2/p115instantwait/README.md)：适配 MoviePilot V2.15.6 内置 115，限次等待秒传，支持手动强制上传，成功后更新原整理记录。当前为 0.2.0 测试版，尚待真实账号验证。
 
 ## 相关链接
 

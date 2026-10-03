@@ -16,6 +16,7 @@ DEFAULTS = {
     "extensions": "mkv,mp4,m4v,avi,mov,wmv,ts,m2ts,mpg,mpeg,iso,flv,webm",
     "retry_intervals": "60,180,600,1800",
     "max_wait_hours": 24,
+    "max_retries": 3,
     "notify": True,
     "task_id": "",
     "action": "pause",
@@ -25,9 +26,9 @@ DEFAULTS = {
 
 class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
-    plugin_desc = "接管内置115视频整理，未秒传后台等待，成功后更新原整理记录"
+    plugin_desc = "内置115整理限次等待秒传，支持手动强制上传并更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.1.2"
+    plugin_version = "0.2.0"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -56,9 +57,12 @@ class P115InstantWait(_PluginBase):
             delays = [int(v.strip()) for v in self._config["retry_intervals"].split(",")]
             if not delays or any(v < 30 or v > 86400 for v in delays):
                 raise ValueError("每个重试间隔必须在 30 到 86400 秒之间")
+            retries = float(self._config["max_retries"])
+            if not retries.is_integer() or not 0 <= retries <= 100:
+                raise ValueError("自动重试次数必须是 0 到 100 的整数；0 表示首次未成功就暂停")
             if not self._config["extensions"].strip():
                 raise ValueError("请配置需要接管的文件扩展名")
-            runtime = {**self._config, "max_wait_hours": hours, "retry_delays": delays}
+            runtime = {**self._config, "max_wait_hours": hours, "max_retries": int(retries), "retry_delays": delays}
             engine = InstantWaitEngine(self.get_data_path(), runtime, self._notify)
             engine.install()
             self._engine = engine
@@ -89,7 +93,7 @@ class P115InstantWait(_PluginBase):
             {"path": "/tasks", "endpoint": self.list_tasks, "methods": ["GET"],
              "auth": "bear", "summary": "查看秒传等待队列"},
             {"path": "/tasks/{task_id}/{action}", "endpoint": self.control_task,
-             "methods": ["POST"], "auth": "bear", "summary": "暂停、恢复或取消等待任务"},
+             "methods": ["POST"], "auth": "bear", "summary": "暂停、继续等待、强制上传或取消任务"},
         ]
 
     def queue(self):
@@ -108,7 +112,7 @@ class P115InstantWait(_PluginBase):
     def control_task(self, task_id: str, action: str):
         if not self.get_state():
             raise HTTPException(status_code=409, detail="请先启用插件")
-        if action not in ("pause", "resume", "cancel"):
+        if action not in ("pause", "resume", "cancel", "upload"):
             raise HTTPException(status_code=400, detail="不支持此操作")
         try:
             row = self._engine.control(task_id, action)
