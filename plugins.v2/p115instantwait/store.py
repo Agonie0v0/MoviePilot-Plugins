@@ -94,6 +94,7 @@ class QueueStore:
             if row is None:
                 return None
             payload = json.loads(row["payload"])
+            payload.setdefault("auto_attempts", row["attempts"])
             if not manual:
                 payload["auto_attempts"] = payload.get("auto_attempts", row["attempts"]) + 1
             db.execute("UPDATE jobs SET state=?, attempts=attempts+1, payload=?, updated=? WHERE id=?",

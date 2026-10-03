@@ -27,6 +27,15 @@ from .store import QueueStore
 WAIT_MESSAGE = "等待秒传，将自动重试（115 秒传等待插件）"
 
 
+def log_text(value):
+    # Keep externally supplied filenames/messages on one log line.
+    return " ".join(str(value).split())[:400]
+
+
+def log_time(value):
+    return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
 def json_value(value):
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -90,6 +99,17 @@ class InstantWaitEngine:
         self.upload_wake = threading.Event()
         self.extensions = {ext.strip().lower().lstrip(".") for ext in config["extensions"].split(",") if ext.strip()}
 
+    def log_task(self, row, event, level="info", **details):
+        payload = row["payload"]
+        source = payload.get("task", {}).get("fileitem", {}).get("path", "")
+        fields = {"任务": row["id"], "整理记录": row.get("history_id") or "待生成",
+                  "文件": PurePosixPath(str(source).replace("\\", "/")).name,
+                  "已尝试": row["attempts"],
+                  "本轮自动尝试": f"{payload.get('auto_attempts', row['attempts'])}/{self.config.get('max_retries', 3) + 1}",
+                  **details}
+        getattr(logger, level)(f"【115秒传等待】{event} | " +
+                               " | ".join(f"{key}={log_text(value)}" for key, value in fields.items()))
+
     def patch(self, cls, name, method):
         original = getattr(cls, name)
         if getattr(original, "__instant_wait_owner__", None):
@@ -121,6 +141,7 @@ class InstantWaitEngine:
             previous = getattr(engine.context, "task", None)
             engine.context.task = task
             engine.context.deferred = None
+            engine.context.enrolled_new = False
 
             def receive(actual_task, info):
                 key = getattr(engine.context, "deferred", None)
@@ -136,6 +157,7 @@ class InstantWaitEngine:
                 key = getattr(engine.context, "deferred", None)
                 # Activate only after MP's original finally has released its batch execution.
                 if key:
+                    engine.log_task(engine.store.get(key), "任务入队" if engine.context.enrolled_new else "复用已有任务")
                     engine.store.update(key, ready=1)
                     engine.wake.set()
                 engine.context.task = previous
@@ -170,7 +192,8 @@ class InstantWaitEngine:
                 payload = {"version": 1, "task": dump_task(task),
                     "final_path": preview.target_item.path, "preview": preview.model_dump(mode="json"),
                     "source_initial": fingerprint(task.fileitem.path), "wait_since": time.time()}
-                row, _ = engine.store.enqueue(source_key(task.fileitem), payload)
+                row, created = engine.store.enqueue(source_key(task.fileitem), payload)
+                engine.context.enrolled_new = created
             except (PauseTask, TypeError, OSError) as exc:
                 return TransferInfo(success=False, fileitem=task.fileitem, message=str(exc))
             engine.live_tasks[row["id"]] = task
@@ -321,10 +344,12 @@ class InstantWaitEngine:
                 self.ensure_history(row["id"], task)
                 if row["state"] == "paused":
                     self.history_message(row["id"], row["message"])
+                self.log_task(self.store.get(row["id"]), "恢复持久化任务", 状态=row["state"],
+                              原因=row["message"], 下次重试=log_time(row["next_at"]) if row["state"] in ("queued", "waiting") else "无")
                 self.store.update(row["id"], ready=1)
             except Exception:
                 self.store.update(row["id"], state="paused", message="任务恢复失败，请检查 MP 版本与队列数据")
-                logger.error("【115秒传等待】任务恢复失败，已保留队列并暂停")
+                logger.error(f"【115秒传等待】任务恢复失败 | 任务={row['id']} | 整理记录={row['history_id'] or '待生成'} | 已保留队列并暂停")
         active_batches = {task.transfer_batch_id for task in self.live_tasks.values() if task.transfer_batch_id}
         # Recover already completed peers from our own durable checkpoint.
         for row in self.store.all(limit=100000):
@@ -362,7 +387,9 @@ class InstantWaitEngine:
             task = self.live_tasks.get(key) or load_task(payload["task"])
             self.live_tasks[key] = task
             self.ensure_history(key, task)
+            self.log_task(self.store.get(key), "开始手动处理" if manual else "开始自动尝试")
             if payload.get("result"):
+                self.log_task(row, "恢复整理结果", 说明="核对远端后继续原记录回写")
                 info = TransferInfo.model_validate(payload["result"])
                 api = OpenAPI(U115Pan(), FileItem, self.stop_event)
                 visible = api.raw_path(info.target_item.path)
@@ -382,6 +409,7 @@ class InstantWaitEngine:
             if fingerprint(path) != payload["source_initial"]:
                 raise PauseTask("源文件在等待期间发生变化，已暂停")
             if not payload.get("hashes"):
+                self.log_task(row, "开始计算文件哈希")
                 payload["hashes"] = hash_file(path, self.stop_event)
                 if payload["hashes"]["fingerprint"] != payload["source_initial"]:
                     raise PauseTask("源文件在开始计算哈希前发生变化，已暂停")
@@ -396,11 +424,14 @@ class InstantWaitEngine:
                 existing = api.raw_path(stage_path)
                 if existing and existing.get("file_id"):
                     file_id = existing["file_id"]
+                    self.log_task(row, "发现已有暂存文件", 说明="核对后继续整理，不重复上传")
                 elif payload.get("upload_session") and not payload.get("upload_confirmed"):
                     if not manual:
                         raise PauseTask("有未完成的普通上传，请点强制上传继续")
+                    self.log_task(row, "继续普通上传", 已完成分片=len(payload["upload_session"].get("parts", [])))
                     api.upload(path, stage_dir, payload["hashes"], None, payload,
                                lambda: self.store.update(key, payload=payload))
+                    self.log_task(row, "普通上传已提交", 说明="等待远端校验与整理完成")
                     existing = api.raw_path(stage_path)
                     file_id = existing.get("file_id") if existing else None
                 elif not payload.get("instant_confirmed") and not payload.get("upload_confirmed"):
@@ -409,12 +440,15 @@ class InstantWaitEngine:
                     except NotInstant as exc:
                         if not manual:
                             raise
+                        self.log_task(row, "秒传未命中，转普通上传", 触发方式="用户手动")
                         self.store.update(key, message="未命中秒传，正在普通上传")
                         self.history_message(key, "手动处理：未命中秒传，正在普通上传")
                         api.upload(path, stage_dir, payload["hashes"], exc.upload_data, payload,
                                    lambda: self.store.update(key, payload=payload))
+                        self.log_task(row, "普通上传已提交", 说明="等待远端校验与整理完成")
                     else:
                         payload["instant_confirmed"] = True
+                        self.log_task(row, "秒传命中", 说明="等待远端校验与整理完成")
                     # A hit without an ID must wait for visibility, not submit
                     # another init that can create a duplicate remote file.
                     self.store.update(key, payload=payload)
@@ -470,6 +504,11 @@ class InstantWaitEngine:
         delay = base * random.uniform(0.9, 1.1)
         message = f"等待秒传：{reason}" if state == "waiting" else f"秒传等待已暂停：{reason}"
         self.store.update(row["id"], state=state, next_at=time.time() + delay, message=message)
+        saved = self.store.get(row["id"])
+        self.log_task(saved, "等待下次重试" if state == "waiting" else "任务暂停",
+                      level="info" if state == "waiting" else "warning", 原因=reason,
+                      下次重试=log_time(saved["next_at"]) if state == "waiting" else "无，等待手动处理",
+                      **({"间隔秒": round(delay)} if state == "waiting" else {}))
         self.history_message(row["id"], message)
         task = self.live_tasks.get(row["id"])
         if task:
@@ -511,7 +550,7 @@ class InstantWaitEngine:
         self.original_finish_batch(self.chain, task)
         self.chain.jobview.try_remove_job(task)
         self.live_tasks.pop(key, None)
-        logger.info(f"【115秒传等待】整理完成，原记录 ID={self.store.get(key)['history_id']}")
+        self.log_task(self.store.get(key), "整理成功", 结果="原整理记录已更新成功")
 
     def finish_failure(self, row, task, info):
         self.context.history_job = row["id"]
@@ -520,12 +559,15 @@ class InstantWaitEngine:
         finally:
             self.context.history_job = None
         self.store.update(row["id"], state="failed", message=info.message or "整理失败")
+        self.log_task(self.store.get(row["id"]), "整理失败", level="warning", 原因=info.message or "整理失败")
         self.original_finish_batch(self.chain, task)
         self.chain.jobview.try_remove_job(task)
         self.live_tasks.pop(row["id"], None)
 
     def control(self, key, action):
         row = self.store.command(key, action)
+        self.log_task(row, "用户操作", 操作={"upload": "强制上传", "resume": "继续等待秒传",
+                                           "pause": "暂停", "cancel": "取消"}[action], 结果=row["message"])
         self.history_message(key, "等待秒传，将自动重试" if action == "resume" else row["message"])
         if action == "cancel":
             task = self.live_tasks.pop(key, None)

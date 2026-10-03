@@ -139,42 +139,73 @@ def config_form(tasks, error=""):
     return [node("VForm", content=content)]
 
 
-def retry_caption(task):
+TONES = {"waiting": ("warning", "mdi-clock-outline"), "queued": ("info", "mdi-clock-outline"),
+         "paused": ("warning", "mdi-pause-circle-outline"), "running": ("primary", "mdi-sync"),
+         "uploading": ("primary", "mdi-cloud-upload-outline"), "upload_queued": ("info", "mdi-cloud-clock-outline"),
+         "completed": ("success", "mdi-check-circle-outline"), "failed": ("error", "mdi-alert-circle-outline"),
+         "cancelled": ("secondary", "mdi-close-circle-outline")}
+INK = "color:rgb(var(--v-theme-on-surface));opacity:1;"
+
+
+def tone_style(tone, background=False):
+    # Mix semantic colors with theme ink for readable text in both MP themes.
+    style = INK + f"color:color-mix(in srgb,rgb(var(--v-theme-{tone})) 40%,rgb(var(--v-theme-on-surface)));"
+    if background:
+        style += f"background:rgba(var(--v-theme-{tone}),.14);"
+    return style
+
+
+def status_chip(state, label=None):
+    tone, icon = TONES.get(state, ("secondary", "mdi-circle-outline"))
+    return node("VChip", content=[node("VIcon", icon, size=18, **{"class": "mr-1"}),
+                                  node("span", label or LABELS.get(state, state))],
+                variant="flat", size="small", **{"style": tone_style(tone, True) + "font-weight:700"})
+
+
+def schedule_summary(task, enabled, now):
     state = task["state"]
-    if state == "uploading":
-        return "手动处理中：先尝试秒传，未命中则普通上传；整理完成前原记录仍为失败"
-    if state == "upload_queued":
-        return "已安排手动处理，等待独立上传线程；未命中秒传就普通上传"
-    if state == "running":
-        return "正在计算哈希、尝试秒传或完成整理"
-    if state in ("waiting", "queued"):
-        next_at = task.get("next_at") or 0
-        if next_at <= time.time():
-            return "已到执行时间，等待后台调度"
-        return "下次尝试 " + datetime.fromtimestamp(next_at).strftime("%m-%d %H:%M:%S")
-    if state == "paused":
-        return "等待手动处理：可强制上传，也可继续只等秒传"
     if state == "completed":
-        return "原整理记录已更新为成功"
-    return "这个任务已结束"
+        return "整理结果", "原记录已成功", "success"
+    if state in ("failed", "cancelled"):
+        return "后续安排", "不再重试", "error" if state == "failed" else "secondary"
+    if not enabled:
+        return "后续安排", "插件已关闭", "secondary"
+    if state == "paused":
+        return "后续安排", "等待手动处理", "warning"
+    if state == "upload_queued":
+        return "后续安排", "排队等待上传", "info"
+    if state in ("running", "uploading"):
+        return "当前进度", "手动处理中" if state == "uploading" else "本轮正在执行", "primary"
+    next_at = task.get("next_at") or 0
+    if next_at <= now:
+        return "下次尝试", "已到时间 · 待调度", "primary"
+    return "下次重试 · MP 时间", datetime.fromtimestamp(next_at).strftime("%m-%d %H:%M:%S"), "primary"
 
 
 def task_button(task, action, label):
     button = node("VBtn", label, variant="tonal" if action == "upload" else "outlined",
-                  **{"size": "small", "style": "min-height:36px"})
+                  **{"size": "small", "style": "min-height:40px"})
     button["events"] = {"click": {"api": f"plugin/P115InstantWait/tasks/{task['id']}/{action}", "method": "POST"}}
     return button
 
 
-def task_page(tasks, enabled, error=""):
+def task_page(tasks, enabled, error="", max_retries=None):
+    now = time.time()
     active = sum(t["state"] in ACTIVE for t in tasks)
     content = [node("div", content=[
         node("div", "整理任务", **{"class": "text-h6 font-weight-bold"}),
         node("VChip", "运行中" if enabled else "插件已关闭", size="small", variant="tonal"),
     ], **{"class": "d-flex align-center justify-space-between ga-2 mb-2"}),
-        paragraph(f"显示最近 {len(tasks)} 条任务，其中 {active} 条尚未结束。展开文件可查看路径和操作。" if tasks else
+        paragraph(f"最近 {len(tasks)} 条 · {active} 条未结束。展开任务可操作，路径默认收起。" if tasks else
                   "启用插件后，在 MP 发起本地 → 内置 115 的视频整理，任务会出现在这里。",
                   **{"class": "text-body-2 mb-4"})]
+    if tasks:
+        counts = [("paused", "待处理", ("paused",)), ("waiting", "等待重试", ("queued", "waiting")),
+                  ("running", "执行中", ("running", "uploading")), ("upload_queued", "上传排队", ("upload_queued",)),
+                  ("completed", "已成功", ("completed",)), ("failed", "失败", ("failed",))]
+        content.append(node("div", content=[status_chip(state, f"{label} {sum(t['state'] in states for t in tasks)}")
+            for state, label, states in counts if any(t["state"] in states for t in tasks)],
+            **{"class": "d-flex flex-wrap ga-2 mb-4"}))
     if error:
         content.append(node("VAlert", error, type="error", variant="tonal", **{"class": "mb-4"}))
     if tasks and not enabled:
@@ -183,36 +214,43 @@ def task_page(tasks, enabled, error=""):
     panels = []
     for task in sorted(tasks, key=lambda t: t["state"] not in ACTIVE):
         status = task["state"]
+        next_label, next_value, next_tone = schedule_summary(task, enabled, now)
+        auto = task.get("auto_attempts", task["attempts"])
+        budget = f"本轮自动 {auto}/{max_retries + 1}" if max_retries is not None and status in ACTIVE else f"自动尝试 {auto} 次"
         title = node("VExpansionPanelTitle", content=[
             node("div", content=[
                 node("div", filename(task["source"]),
-                     **{"class": "text-subtitle-2 font-weight-bold", "style": "overflow-wrap:anywhere;line-height:1.5"}),
-                node("div", content=[
-                    paragraph(f"整理记录 #{task['history_id'] or '待生成'} · 已尝试 {task['attempts']} 次"),
-                    node("VChip", LABELS.get(status, status), size="small", variant="tonal"),
-                ], **{"class": "d-flex align-center flex-wrap ga-2 mt-2"}),
+                     **{"class": "text-subtitle-1 font-weight-bold", "style": INK + "overflow-wrap:anywhere;line-height:1.5"}),
+                paragraph(f"整理记录 #{task['history_id'] or '待生成'}", **{"class": "text-body-2 mt-1"}),
+                node("VRow", content=[
+                    node("VCol", content=[paragraph("当前状态", **{"class": "text-caption mb-2"}), status_chip(status)], cols=6, sm=3),
+                    node("VCol", content=[paragraph("累计尝试", **{"class": "text-caption mb-1"}),
+                        node("div", f"{task['attempts']} 次", **{"style": INK + "font-size:20px;font-weight:700;line-height:1.4;font-variant-numeric:tabular-nums"}),
+                        paragraph(budget, **{"class": "text-caption mt-1"})], cols=6, sm=3),
+                    node("VCol", content=[paragraph(next_label, **{"class": "text-caption mb-1"}),
+                        node("div", next_value, **{"style": tone_style(next_tone) + "font-size:20px;font-weight:700;line-height:1.4;font-variant-numeric:tabular-nums;overflow-wrap:anywhere"})], cols=12, sm=6),
+                ], **{"class": "mt-1"}),
             ], **{"style": "min-width:0;flex:1"}),
-        ], **{"class": "ga-3"})
-        details = [paragraph(retry_caption(task), **{"class": "text-body-2 mb-3 font-weight-medium"})]
-        for label, value in (("当前说明", task["message"] or "等待后台首次尝试秒传"),
-                             ("本地源文件", task["source"]), ("115 目标文件", task["target"]), ("任务 ID", task["id"])):
-            details.append(node("div", content=[
-                node("div", label, **{"class": "text-caption mb-1"}),
-                paragraph(str(value), **{"style": "line-height:1.6;overflow-wrap:anywhere;user-select:text"}),
-            ], **{"class": "mb-3"}))
-        if task.get("backup_files"):
-            details.append(paragraph(f"已保留 {len(task['backup_files'])} 个旧版本文件，位于目标目录的 .mp115-backups。",
-                                     **{"class": "text-body-2 mb-3"}))
+        ], **{"class": "ga-3 align-start py-4"})
+        details = [node("div", content=[paragraph("最新结果", **{"class": "text-caption mb-1"}),
+            paragraph(task["message"] or ("等待首次执行" if status == "queued" else LABELS.get(status, status)),
+                      **{"style": INK + "line-height:1.65;overflow-wrap:anywhere"})],
+            **{"class": "pa-3 rounded mb-3", "style": f"background:rgba(var(--v-theme-{TONES.get(status, ('secondary', ''))[0]}),.08)"})]
         if status in ("queued", "waiting", "paused", "upload_queued") and enabled:
             buttons = [task_button(task, "resume", "继续等待秒传") if status == "paused" else task_button(task, "pause", "暂停重试"),
                        task_button(task, "cancel", "取消等待")]
             if status != "upload_queued":
                 buttons.insert(0, task_button(task, "upload", "强制上传"))
-            details.extend([node("div", content=buttons, **{"class": "d-flex flex-wrap ga-2 mt-4"}),
-                            paragraph("强制上传会先试秒传，未命中就上传整个文件，使用上行带宽。失败后暂停，需再次手动处理。",
-                                      **{"class": "text-body-2 mt-3"}),
-                            paragraph("取消只停止后续重试，保留源文件、远端已有文件和整理记录。",
-                                      **{"class": "text-body-2 mt-3"})])
+            details.extend([node("div", content=buttons, **{"class": "d-flex flex-wrap ga-2"}),
+                            paragraph("强制上传：未秒传就上传文件，占用上行带宽。取消等待不会删除文件。",
+                                      **{"class": "text-body-2 mt-2 mb-3"})])
+        paths = [node("summary", "路径与日志定位", **{"style": "cursor:pointer;min-height:40px;line-height:40px;font-weight:600;" + INK})]
+        for label, value in (("本地源文件", task["source"]), ("115 目标文件", task["target"]), ("任务 ID（可在 MP 日志中搜索）", task["id"])):
+            paths.append(node("div", content=[paragraph(label, **{"class": "text-caption mb-1"}),
+                paragraph(str(value), **{"style": "line-height:1.6;overflow-wrap:anywhere;user-select:text"})], **{"class": "my-3"}))
+        if task.get("backup_files"):
+            paths.append(paragraph(f"旧版本备份 {len(task['backup_files'])} 个，位于目标目录 .mp115-backups。"))
+        details.append(node("details", content=paths, **{"class": "mt-3"}))
         panels.append(node("VExpansionPanel", content=[title, node("VExpansionPanelText", content=details)]))
     if panels:
         content.append(node("VExpansionPanels", content=panels, variant="accordion",
@@ -223,4 +261,8 @@ def task_page(tasks, enabled, error=""):
             node("div", "还没有整理任务", **{"class": "text-subtitle-1 font-weight-bold mb-2"}),
             paragraph("先确认 MP 内置 115 已授权，再启用插件并整理一个视频文件。"),
         ], **{"class": "border rounded-lg pa-6 text-center"}))
-    return [node("VContainer", content=content, **{"class": "pa-0"})]
+    if tasks:
+        content.append(paragraph("页面快照 " + datetime.fromtimestamp(now).astimezone().strftime("%m-%d %H:%M:%S %z") +
+                                 " · 重新打开可更新；MP 日志搜索「115秒传等待」查看过程。",
+                                 **{"class": "text-caption mt-3"}))
+    return [node("VContainer", content=content, **{"class": "pa-0", "style": INK})]
