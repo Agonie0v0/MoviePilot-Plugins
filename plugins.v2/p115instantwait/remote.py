@@ -1,4 +1,4 @@
-"""115 open API adapter: initialization only; never uploads file contents to OSS."""
+"""115 open API adapter; OSS upload is only called by the manual worker."""
 import hashlib
 import time
 from pathlib import Path, PurePosixPath
@@ -13,7 +13,20 @@ class PauseTask(Exception):
 
 
 class NotInstant(RetryLater):
-    pass
+    def __init__(self, message, upload_data=None):
+        super().__init__(message)
+        self.upload_data = upload_data
+
+
+class StoppableReader:
+    """Interrupt an OSS request while its streaming body is being read."""
+    def __init__(self, stream, stop):
+        self.stream, self.stop = stream, stop
+
+    def read(self, size=-1):
+        if self.stop.is_set():
+            raise RetryLater("插件正在停止，上传进度已保留")
+        return self.stream.read(size)
 
 
 def fingerprint(path):
@@ -226,12 +239,96 @@ class OpenAPI:
                     remaining -= len(block)
             data.update(pick_code=result.get("pick_code"), sign_key=result.get("sign_key"),
                         sign_val=sha.hexdigest().upper())
-            result = self.request("POST", "/open/upload/init", data=data)
-            if not isinstance(result, dict):
+            verified = self.request("POST", "/open/upload/init", data=data)
+            if not isinstance(verified, dict):
                 raise RetryLater("115 二次校验响应不完整")
+            # The second response may omit bucket/object/callback from the first.
+            result = {**result, **verified}
         if result.get("status") != 2:
-            raise NotInstant("未命中秒传，等待下次重试")
+            raise NotInstant("未命中秒传，等待下次重试", result)
         return result.get("file_id")
+
+    def upload(self, path, folder, hashes, init, payload, checkpoint):
+        """Manual multipart upload using MP's existing oss2 dependency.
+
+        Persist part receipts, never credentials. Retrying uses the same upload
+        ID, including an uncertain completion, instead of creating another file.
+        """
+        import oss2
+        from oss2.models import PartInfo
+
+        def check_source():
+            if self.stop.is_set():
+                raise RetryLater("插件正在停止，上传进度已保留")
+            if fingerprint(path) != hashes["fingerprint"]:
+                raise PauseTask("源文件在普通上传期间发生变化，已停止提交")
+
+        check_source()
+        saved = payload.get("upload_session")
+        details = saved or init or {}
+        if not all(details.get(k) for k in ("bucket", "object", "pick_code")):
+            raise PauseTask("115 普通上传参数不完整，请检查授权后重试")
+        token = self.request("GET", "/open/upload/get_token")
+        if not isinstance(token, dict) or not all(token.get(k) for k in
+                ("endpoint", "AccessKeyId", "AccessKeySecret", "SecurityToken")):
+            raise PauseTask("115 未返回完整的普通上传凭证")
+        resumed = self.request("POST", "/open/upload/resume", data={
+            "file_size": hashes["fingerprint"]["size"], "target": f"U_1_{folder.fileid}",
+            "fileid": hashes["sha1"], "pick_code": details["pick_code"]})
+        callback = (resumed or {}).get("callback") or (init or {}).get("callback")
+        if not isinstance(callback, dict) or not all(callback.get(k) for k in ("callback", "callback_var")):
+            raise PauseTask("115 未返回上传完成回调参数，未发送文件内容")
+        # Force TLS even when the credential endpoint is returned as http://.
+        endpoint = token["endpoint"]
+        if endpoint.startswith("http://"):
+            endpoint = "https://" + endpoint[len("http://"):]
+        auth = oss2.StsAuth(token["AccessKeyId"], token["AccessKeySecret"], token["SecurityToken"])
+        bucket = oss2.Bucket(auth, endpoint, details["bucket"], connect_timeout=30)
+        try:
+            if not saved:
+                upload_id = bucket.init_multipart_upload(details["object"],
+                    params={"encoding-type": "url", "sequential": ""}).upload_id
+                # Stable part sizes allow a manual retry to resume from receipts.
+                part_size = oss2.determine_part_size(hashes["fingerprint"]["size"], preferred_size=10 * 1024 * 1024)
+                saved = {"bucket": details["bucket"], "object": details["object"],
+                         "pick_code": details["pick_code"], "upload_id": upload_id,
+                         "part_size": part_size, "parts": []}
+                payload["upload_session"] = saved
+                checkpoint()
+            size = hashes["fingerprint"]["size"]
+            offset = min(len(saved["parts"]) * saved["part_size"], size)
+            with open(path, "rb") as stream:
+                stream.seek(offset)
+                while offset < size:
+                    check_source()
+                    length = min(saved["part_size"], size - offset)
+                    number = len(saved["parts"]) + 1
+                    part = bucket.upload_part(saved["object"], saved["upload_id"], number,
+                        data=oss2.SizedFileAdapter(StoppableReader(stream, self.stop), length))
+                    saved["parts"].append({"number": number, "etag": part.etag})
+                    offset += length
+                    checkpoint()
+            check_source()
+            # Persist before committing: after response loss retry this exact ID.
+            saved["completing"] = True
+            checkpoint()
+            result = bucket.complete_multipart_upload(saved["object"], saved["upload_id"],
+                [PartInfo(p["number"], p["etag"]) for p in saved["parts"]], headers={
+                    "X-oss-callback": oss2.utils.b64encode_as_string(callback["callback"]),
+                    "x-oss-callback-var": oss2.utils.b64encode_as_string(callback["callback_var"]),
+                    "x-oss-forbid-overwrite": "false"})
+            if result.status != 200:
+                raise RetryLater("普通上传提交未确认，上传进度已保留")
+            response = result.resp.response.json()
+            if not isinstance(response, dict) or not response.get("state"):
+                raise RetryLater("115 上传完成回调未确认，需核对远端结果")
+            payload["upload_confirmed"] = True
+            checkpoint()
+        except (RetryLater, PauseTask):
+            raise
+        except Exception:
+            # SDK exception text can contain signed URLs or temporary credentials.
+            raise RetryLater("普通上传未完成，上传进度已保留；请手动重试") from None
 
 
 class PreparedStorage:

@@ -1,4 +1,6 @@
 import hashlib
+import copy
+import json
 import tempfile
 import threading
 import unittest
@@ -79,6 +81,43 @@ class QueueTests(unittest.TestCase):
         self.db.command(row["id"], "cancel")
         _, fresh = self.db.enqueue("A", {})
         self.assertTrue(fresh)
+
+    def test_manual_queue_has_its_own_claim_and_is_deduplicated(self):
+        a, _ = self.db.enqueue("A", {})
+        b, _ = self.db.enqueue("B", {})
+        for row in (a, b):
+            self.db.update(row["id"], ready=1)
+        self.db.command(a["id"], "upload")
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            claims = list(executor.map(lambda _: self.db.claim(manual=True), range(8)))
+        self.assertEqual(sum(r is not None for r in claims), 1)
+        self.assertEqual(self.db.get(a["id"])["state"], "uploading")
+        self.assertEqual(self.db.claim()["id"], b["id"])
+        for action in ("upload", "pause", "resume", "cancel"):
+            with self.assertRaises(ValueError):
+                self.db.command(a["id"], action)
+
+    def test_restart_pauses_manual_upload_and_preserves_parts(self):
+        row, _ = self.db.enqueue("A", {"upload_session": {"parts": [1]}})
+        self.db.update(row["id"], ready=1)
+        self.db.command(row["id"], "upload")
+        self.db.claim(manual=True)
+        self.db.recover()
+        recovered = self.db.get(row["id"])
+        self.assertEqual(recovered["state"], "paused")
+        self.assertEqual(recovered["payload"]["upload_session"]["parts"], [1])
+        self.assertIsNone(self.db.claim())
+        self.assertIsNone(self.db.claim(manual=True))
+
+    def test_resume_resets_only_auto_counter_and_manual_claim_does_not_increment_it(self):
+        row, _ = self.db.enqueue("A", {"auto_attempts": 4})
+        self.db.update(row["id"], ready=1, attempts=7)
+        self.db.command(row["id"], "pause")
+        self.db.command(row["id"], "resume")
+        self.db.command(row["id"], "upload")
+        claimed = self.db.claim(manual=True)
+        self.assertEqual(claimed["payload"]["auto_attempts"], 0)
+        self.assertEqual(claimed["attempts"], 8)
 
 
 class APITests(unittest.TestCase):
@@ -191,6 +230,114 @@ class APITests(unittest.TestCase):
         stop.set()
         with self.assertRaises(remote.RetryLater):
             remote.hash_file(self.path, stop)
+
+    def upload_api(self):
+        return self.api([(200, {"state": True, "data": {
+            "endpoint": "http://oss.example", "AccessKeyId": "id", "AccessKeySecret": "secret",
+            "SecurityToken": "token"}}), (200, {"state": True, "data": {
+                "callback": {"callback": "callback-url", "callback_var": "vars"}}})])
+
+    def test_manual_upload_checkpoints_parts_and_uses_tls_without_persisting_credentials(self):
+        import oss2
+        from unittest.mock import Mock
+        api = self.upload_api()
+        bucket = Mock()
+        bucket.init_multipart_upload.return_value.upload_id = "upload-1"
+        chunks = []
+        def upload_part(*args, **kwargs):
+            chunks.append(kwargs["data"].read())
+            return SimpleNamespace(etag="receipt")
+        bucket.upload_part.side_effect = upload_part
+        bucket.complete_multipart_upload.return_value = SimpleNamespace(status=200,
+            resp=SimpleNamespace(response=SimpleNamespace(json=lambda: {"state": True})))
+        payload, snapshots = {}, []
+        with patch.object(oss2, "Bucket", return_value=bucket) as factory:
+            api.upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                {"bucket": "bucket", "object": "object", "pick_code": "pick"}, payload,
+                lambda: snapshots.append(copy.deepcopy(payload)))
+        self.assertEqual(b"".join(chunks), self.path.read_bytes())
+        self.assertEqual(factory.call_args.args[1], "https://oss.example")
+        self.assertTrue(payload["upload_confirmed"])
+        self.assertTrue(snapshots[-2]["upload_session"]["completing"])
+        self.assertNotIn("secret", json.dumps(payload))
+        self.assertNotIn("callback-url", json.dumps(payload))
+
+    def test_manual_retry_resumes_same_session_after_lost_complete_response(self):
+        import oss2
+        from unittest.mock import Mock
+        bucket = Mock()
+        bucket.init_multipart_upload.return_value.upload_id = "upload-1"
+        bucket.upload_part.return_value.etag = "receipt"
+        bucket.complete_multipart_upload.side_effect = RuntimeError("signed-url-secret")
+        payload = {}
+        with patch.object(oss2, "Bucket", return_value=bucket):
+            with self.assertRaises(remote.RetryLater) as exc:
+                self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                    {"bucket": "bucket", "object": "object", "pick_code": "pick"}, payload, lambda: None)
+            self.assertNotIn("signed-url-secret", str(exc.exception))
+            bucket.complete_multipart_upload.side_effect = None
+            bucket.complete_multipart_upload.return_value = SimpleNamespace(status=200,
+                resp=SimpleNamespace(response=SimpleNamespace(json=lambda: {"state": True})))
+            self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                                     None, payload, lambda: None)
+        self.assertEqual(bucket.init_multipart_upload.call_count, 1)
+        self.assertEqual(bucket.upload_part.call_count, 1)
+        self.assertEqual(bucket.complete_multipart_upload.call_count, 2)
+        self.assertEqual(bucket.complete_multipart_upload.call_args.args[1], "upload-1")
+
+    def test_source_change_during_upload_never_commits(self):
+        import oss2
+        from unittest.mock import Mock
+        bucket = Mock()
+        bucket.init_multipart_upload.return_value.upload_id = "upload-1"
+        def mutate(*args, **kwargs):
+            self.path.write_bytes(b"changed file contents")
+            return SimpleNamespace(etag="receipt")
+        bucket.upload_part.side_effect = mutate
+        with patch.object(oss2, "Bucket", return_value=bucket):
+            with self.assertRaises(remote.PauseTask):
+                self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                    {"bucket": "bucket", "object": "object", "pick_code": "pick"}, {}, lambda: None)
+        bucket.complete_multipart_upload.assert_not_called()
+
+    def test_retry_after_part_failure_continues_from_saved_offset(self):
+        import oss2
+        from unittest.mock import Mock
+        bucket = Mock()
+        bucket.init_multipart_upload.return_value.upload_id = "upload-1"
+        attempts, received = [], {}
+        failed = False
+        def upload_part(key, upload_id, number, data):
+            nonlocal failed
+            attempts.append(number)
+            block = data.read()
+            if number == 2 and not failed:
+                failed = True
+                raise RuntimeError("connection lost")
+            received[number] = block
+            return SimpleNamespace(etag=f"receipt-{number}")
+        bucket.upload_part.side_effect = upload_part
+        bucket.complete_multipart_upload.return_value = SimpleNamespace(status=200,
+            resp=SimpleNamespace(response=SimpleNamespace(json=lambda: {"state": True})))
+        payload = {}
+        with patch.object(oss2, "Bucket", return_value=bucket), patch.object(oss2, "determine_part_size", return_value=8):
+            with self.assertRaises(remote.RetryLater):
+                self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                    {"bucket": "bucket", "object": "object", "pick_code": "pick"}, payload, lambda: None)
+            self.assertEqual(len(payload["upload_session"]["parts"]), 1)
+            self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                                     None, payload, lambda: None)
+        self.assertEqual(attempts, [1, 2, 2, 3])
+        self.assertEqual(b"".join(received.values()), self.path.read_bytes())
+        bucket.init_multipart_upload.assert_called_once()
+
+    def test_stop_interrupts_upload_body(self):
+        import io
+        stop = threading.Event()
+        reader = remote.StoppableReader(io.BytesIO(b"data"), stop)
+        stop.set()
+        with self.assertRaises(remote.RetryLater):
+            reader.read()
 
 
 if __name__ == "__main__":

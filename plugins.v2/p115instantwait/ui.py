@@ -5,9 +5,10 @@ import time
 
 
 LABELS = {"queued": "等待首次秒传", "waiting": "等待重试", "running": "正在执行",
-          "paused": "已暂停", "completed": "整理成功", "failed": "整理失败", "cancelled": "已取消"}
-ACTIVE = {"queued", "waiting", "running", "paused"}
-ACTION_HINT = "暂停后可恢复；恢复会重置等待时限；取消后不再重试，文件和记录保留。"
+          "paused": "已暂停 · 待处理", "completed": "整理成功", "failed": "整理失败", "cancelled": "已取消",
+          "upload_queued": "等待手动上传", "uploading": "手动处理中"}
+ACTIVE = {"queued", "waiting", "running", "paused", "upload_queued", "uploading"}
+ACTION_HINT = "强制上传：先试秒传，未命中就上传文件。继续等待：只试秒传，重置次数和时限。取消：停止任务，保留文件。"
 
 
 def node(component, text=None, content=None, **props):
@@ -46,18 +47,18 @@ def filename(path):
 def config_form(tasks, error=""):
     choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}"
                          f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
-                "props": {"disabled": t["state"] == "running"}}
+                "props": {"disabled": t["state"] in ("running", "uploading")}}
                for t in tasks if t["state"] in ACTIVE]
     intro = node("div", content=[
         node("div", content=[
             node("span", "让整理在后台等待秒传", **{"class": "text-subtitle-1 font-weight-bold"}),
             node("VChip", "MP V2.15.6 · 内置 115", size="small", variant="outlined"),
         ], **{"class": "d-flex align-center justify-space-between flex-wrap ga-2 mb-2"}),
-        paragraph("启用后照常在 MP 整理。本地视频未秒传时留在队列中，其他整理继续进行。"),
+        paragraph("自动尝试秒传，用完重试次数后暂停。你可以随时对等待任务强制上传，其他整理继续进行。"),
         node("div", content=[
             node("VChip", "等待：原记录显示失败", size="small", variant="tonal"),
             node("VIcon", "mdi-arrow-right", size=18),
-            node("VChip", "秒传成功：原记录更新成功", size="small", variant="tonal"),
+            node("VChip", "整理完成：原记录更新成功", size="small", variant="tonal"),
         ], **{"class": "d-flex align-center flex-wrap ga-2 mt-3"}),
     ], **{"class": "mb-5"})
     switches = node("VRow", content=[
@@ -69,21 +70,26 @@ def config_form(tasks, error=""):
         col([
             node("VSwitch", model="notify", label="任务暂停时通知我", color="primary",
                  **{"inset": True, "hide-details": True, "density": "comfortable"}),
-            paragraph("授权失效、文件变化或等待到期时发系统消息；每次未秒传不通知。"),
+            paragraph("重试用完、等待到期、授权异常或手动上传失败时通知；每次未秒传不通知。"),
         ]),
     ], **{"class": "mb-4"})
     strategy = node("div", content=[
         node("div", "等待策略", **{"class": "text-subtitle-1 font-weight-bold mb-1"}),
-        paragraph("一般保持默认即可。重试只能再次尝试秒传，不能保证最终命中。", **{"class": "text-body-2 mb-4"}),
+        paragraph("自动流程只试秒传。达到次数或时限就暂停，普通上传必须手动触发。", **{"class": "text-body-2 mb-4"}),
         node("VRow", content=[
             col([field("VTextField", "retry_intervals", "未秒传后，隔多久重试",
-                       "按顺序使用，之后一直沿用最后一项。默认约 1、3、10、30 分钟；每轮结束后计时。",
+                       "按顺序使用，不够时沿用最后一项。默认间隔约 1、3、10、30 分钟；每轮结束后计时。",
                        placeholder="60,180,600,1800", suffix="秒",
                        **{"spellcheck": False})]),
             col([field("VTextField", "max_wait_hours", "最多自动等待多久",
-                       "默认 24 小时，到期暂停并保留文件。填 0 可一直等待，手动恢复后重新计时。",
+                       "默认 24 小时，到期暂停并保留文件。填 0 只取消时限，仍受重试次数限制。",
                        type="number", suffix="小时", min=0, max=8760, step=1)]),
         ]),
+        node("VRow", content=[
+            col([field("VTextField", "max_retries", "最多自动重试次数",
+                       "默认重试 3 次，共尝试 4 次。用完后暂停，需手动处理；填 0 表示首次未成功就暂停。",
+                       type="number", suffix="次", min=0, max=100, step=1)]),
+        ], **{"class": "mt-2"}),
         paragraph("重试间隔用英文逗号分隔，每项为 30～86400 秒；实际间隔会有约 ±10% 浮动。",
                   **{"class": "text-body-2 mt-3"}),
     ], **{"class": "mb-5"})
@@ -96,7 +102,7 @@ def config_form(tasks, error=""):
             paragraph("例如：mkv,mp4,iso。未列出的格式仍走 MP 原流程。", **{"class": "text-body-2 mt-3"}),
             node("VDivider", **{"class": "my-4"}),
             paragraph("只支持本地文件整理到 MP 内置 115，整理方式为复制或移动。字幕、NFO 和图片沿用 MP。"),
-            paragraph("等待期间保留本地视频，已接管的视频只尝试秒传。蓝光原盘目录暂不支持。", **{"class": "text-body-2 mt-2"}),
+            paragraph("等待期间保留本地视频。自动任务只尝试秒传；点强制上传后，未秒传就通过网络上传文件。蓝光原盘目录暂不支持。", **{"class": "text-body-2 mt-2"}),
             paragraph("覆盖时旧文件保存在目标目录的 .mp115-backups 中，确认无误后可以自行清理。",
                       **{"class": "text-body-2 mt-2"}),
         ]),
@@ -104,7 +110,7 @@ def config_form(tasks, error=""):
     operations = node("VExpansionPanel", content=[
         node("VExpansionPanelTitle", "单个任务操作"),
         node("VExpansionPanelText", content=[
-            paragraph("也可以点左下角「查看数据」，在任务详情里直接暂停、恢复或取消。这里的操作只在保存时执行一次。",
+            paragraph("推荐点「查看数据」，在任务详情直接强制上传或管理等待任务。这里的操作只在保存时执行一次。",
                       **{"class": "text-body-2 mb-4"}),
             node("VRow", content=[
                 col([field("VSelect", "task_id", "选择需要操作的文件",
@@ -112,8 +118,9 @@ def config_form(tasks, error=""):
                            items=choices, **{"item-title": "title", "item-value": "value",
                                             "clearable": True, "disabled": not choices})], sm=8),
                 col([field("VSelect", "action", "对这个任务做什么", ACTION_HINT,
-                           items=[{"title": "暂停自动重试", "value": "pause"},
-                                  {"title": "恢复自动重试", "value": "resume"},
+                           items=[{"title": "强制上传（未秒传就上传）", "value": "upload"},
+                                  {"title": "暂停自动重试", "value": "pause"},
+                                  {"title": "继续等待秒传", "value": "resume"},
                                   {"title": "取消等待", "value": "cancel"}],
                            **{"disabled": "{{ !task_id }}"})], sm=4),
             ]),
@@ -134,6 +141,10 @@ def config_form(tasks, error=""):
 
 def retry_caption(task):
     state = task["state"]
+    if state == "uploading":
+        return "手动处理中：先尝试秒传，未命中则普通上传；整理完成前原记录仍为失败"
+    if state == "upload_queued":
+        return "已安排手动处理，等待独立上传线程；未命中秒传就普通上传"
     if state == "running":
         return "正在计算哈希、尝试秒传或完成整理"
     if state in ("waiting", "queued"):
@@ -142,14 +153,14 @@ def retry_caption(task):
             return "已到执行时间，等待后台调度"
         return "下次尝试 " + datetime.fromtimestamp(next_at).strftime("%m-%d %H:%M:%S")
     if state == "paused":
-        return "已停止自动重试，可手动恢复"
+        return "等待手动处理：可强制上传，也可继续只等秒传"
     if state == "completed":
         return "原整理记录已更新为成功"
     return "这个任务已结束"
 
 
 def task_button(task, action, label):
-    button = node("VBtn", label, variant="outlined",
+    button = node("VBtn", label, variant="tonal" if action == "upload" else "outlined",
                   **{"size": "small", "style": "min-height:36px"})
     button["events"] = {"click": {"api": f"plugin/P115InstantWait/tasks/{task['id']}/{action}", "method": "POST"}}
     return button
@@ -192,10 +203,14 @@ def task_page(tasks, enabled, error=""):
         if task.get("backup_files"):
             details.append(paragraph(f"已保留 {len(task['backup_files'])} 个旧版本文件，位于目标目录的 .mp115-backups。",
                                      **{"class": "text-body-2 mb-3"}))
-        if status in ("queued", "waiting", "paused") and enabled:
-            buttons = [task_button(task, "resume", "恢复重试") if status == "paused" else task_button(task, "pause", "暂停重试"),
+        if status in ("queued", "waiting", "paused", "upload_queued") and enabled:
+            buttons = [task_button(task, "resume", "继续等待秒传") if status == "paused" else task_button(task, "pause", "暂停重试"),
                        task_button(task, "cancel", "取消等待")]
+            if status != "upload_queued":
+                buttons.insert(0, task_button(task, "upload", "强制上传"))
             details.extend([node("div", content=buttons, **{"class": "d-flex flex-wrap ga-2 mt-4"}),
+                            paragraph("强制上传会先试秒传，未命中就上传整个文件，使用上行带宽。失败后暂停，需再次手动处理。",
+                                      **{"class": "text-body-2 mt-3"}),
                             paragraph("取消只停止后续重试，保留源文件、远端已有文件和整理记录。",
                                       **{"class": "text-body-2 mt-3"})])
         panels.append(node("VExpansionPanel", content=[title, node("VExpansionPanelText", content=details)]))
