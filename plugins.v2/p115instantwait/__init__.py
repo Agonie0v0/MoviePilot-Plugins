@@ -8,6 +8,7 @@ from app.plugins import _PluginBase
 
 from .bridge import InstantWaitEngine
 from .store import QueueStore
+from .ui import config_form, task_page
 
 
 DEFAULTS = {
@@ -20,15 +21,13 @@ DEFAULTS = {
     "action": "pause",
     "apply_action": False,
 }
-LABELS = {"queued": "等待首次秒传", "waiting": "等待重试", "running": "正在执行",
-          "paused": "已暂停", "completed": "整理成功", "failed": "整理失败", "cancelled": "已取消"}
 
 
 class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "接管内置115视频整理，未秒传后台等待，成功后更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -120,37 +119,10 @@ class P115InstantWait(_PluginBase):
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
     def get_form(self):
-        fields = [
-            {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}},
-            {"component": "VTextField", "props": {"model": "extensions", "label": "接管的扩展名（逗号分隔）"}},
-            {"component": "VTextField", "props": {"model": "retry_intervals", "label": "重试间隔（秒，逗号分隔）"}},
-            {"component": "VTextField", "props": {"model": "max_wait_hours", "type": "number",
-                "label": "最长等待小时数（0 表示不限时）"}},
-            {"component": "VSwitch", "props": {"model": "notify", "label": "暂停时发送系统消息"}},
-            {"component": "VAlert", "props": {"type": "info", "variant": "tonal"}, "text":
-                "适配 MP V2.15.6 内置115。等待时原整理记录显示失败，秒传成功后原记录更新为成功。"
-                "视频不会转为普通上传；字幕、NFO、图片沿用 MP。旧版本文件保留在 .mp115-backups。"},
-            {"component": "VTextField", "props": {"model": "task_id", "label": "要操作的任务 ID（从详情复制）"}},
-            {"component": "VSelect", "props": {"model": "action", "label": "任务操作", "items": [
-                {"title": "暂停", "value": "pause"}, {"title": "恢复", "value": "resume"},
-                {"title": "取消", "value": "cancel"}]}},
-            {"component": "VSwitch", "props": {"model": "apply_action", "label": "保存配置时执行一次操作"}},
-        ]
-        return [{"component": "VForm", "content": fields}], dict(DEFAULTS)
+        return config_form(self.list_tasks(), self._error), dict(DEFAULTS)
 
     def get_page(self):
-        content = []
-        if self._error:
-            content.append({"component": "VAlert", "props": {"type": "error"}, "text": self._error})
-        for task in self.list_tasks():
-            content.append({"component": "VCard", "props": {"variant": "outlined", "class": "mb-3"},
-                "content": [{"component": "VCardTitle", "text": Path(task["source"]).name},
-                    {"component": "VCardText", "text":
-                        f"{LABELS[task['state']]} · 重试 {task['attempts']} 次 · 整理记录 {task['history_id']}\n"
-                        f"任务 ID：{task['id']}\n目标：{task['target']}\n{task['message']}"}]})
-        if not content:
-            content = [{"component": "VAlert", "props": {"type": "info"}, "text": "暂无秒传等待任务"}]
-        return [{"component": "VContainer", "content": content}]
+        return task_page(self.list_tasks(), self.get_state(), self._error)
 
     def stop_service(self):
         if self._engine:

@@ -35,7 +35,7 @@ def main():
         shutil.copytree(destination, backup)
         print(f"现有插件源码备份：{backup}")
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("__init__.py", "bridge.py", "remote.py", "store.py"):
+    for name in ("__init__.py", "bridge.py", "remote.py", "store.py", "ui.py"):
         shutil.copy2(source / name, destination / name)
     if "P115InstantWait" not in installed:
         system.set(SystemConfigKey.UserInstalledPlugins, [*installed, "P115InstantWait"])
