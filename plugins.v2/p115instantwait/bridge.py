@@ -110,6 +110,31 @@ class InstantWaitEngine:
         getattr(logger, level)(f"【115秒传等待】{event} | " +
                                " | ".join(f"{key}={log_text(value)}" for key, value in fields.items()))
 
+    def notify_task(self, row, manual=True):
+        if not self.notify:
+            return
+        payload = row["payload"]
+        source = payload.get("task", {}).get("fileitem", {}).get("path", "")
+        name = PurePosixPath(str(source).replace("\\", "/")).name
+        title = "115秒传等待 · 需要手动处理" if manual else "115秒传等待 · 整理暂未成功"
+        text = "\n".join([
+            f"文件：{log_text(name)}",
+            f"整理记录：#{row.get('history_id') or '待生成'}",
+            f"累计尝试：{row['attempts']} 次；本轮自动：{payload.get('auto_attempts', row['attempts'])}/{self.config.get('max_retries', 3) + 1}",
+            f"原因：{log_text(row['message'])}",
+            "后续：自动重试已停止，请在插件「查看数据」中强制上传或继续等待秒传。" if manual else
+            f"下次重试：{log_time(row['next_at'])}；后台继续等待，不影响其他整理。",
+            f"任务 ID：{row['id']}",
+        ])
+        try:
+            submitted = self.notify(title, text, manual=manual)
+            self.log_task(row, "通知已关闭" if submitted is False else "通知已提交 MP",
+                          通知类型="手动处理" if manual else "整理入库")
+        except Exception:
+            # Notification failures must never re-enter execute's retry handler,
+            # change a paused task back to waiting, or interrupt other tasks.
+            self.log_task(row, "通知提交失败", level="warning", 说明="请检查 MP 通知渠道；任务状态保持不变")
+
     def patch(self, cls, name, method):
         original = getattr(cls, name)
         if getattr(original, "__instant_wait_owner__", None):
@@ -350,6 +375,8 @@ class InstantWaitEngine:
             except Exception:
                 self.store.update(row["id"], state="paused", message="任务恢复失败，请检查 MP 版本与队列数据")
                 logger.error(f"【115秒传等待】任务恢复失败 | 任务={row['id']} | 整理记录={row['history_id'] or '待生成'} | 已保留队列并暂停")
+                if row["state"] != "paused":
+                    self.notify_task(self.store.get(row["id"]))
         active_batches = {task.transfer_batch_id for task in self.live_tasks.values() if task.transfer_batch_id}
         # Recover already completed peers from our own durable checkpoint.
         for row in self.store.all(limit=100000):
@@ -493,6 +520,7 @@ class InstantWaitEngine:
                 api.close()
 
     def defer(self, row, state, reason):
+        previous_state = self.store.get(row["id"])["state"]
         if row["state"] == "uploading":
             state = "paused"
             reason = f"手动处理未完成：{reason}；可再次点强制上传核对并继续"
@@ -509,12 +537,14 @@ class InstantWaitEngine:
                       level="info" if state == "waiting" else "warning", 原因=reason,
                       下次重试=log_time(saved["next_at"]) if state == "waiting" else "无，等待手动处理",
                       **({"间隔秒": round(delay)} if state == "waiting" else {}))
+        if state == "paused" and previous_state != "paused":
+            self.notify_task(saved)
+        elif state == "waiting" and previous_state != "waiting" and saved["payload"].get("auto_attempts", saved["attempts"]) == 1:
+            self.notify_task(saved, manual=False)
         self.history_message(row["id"], message)
         task = self.live_tasks.get(row["id"])
         if task:
             self.waiting_view(task)
-        if state == "paused" and self.notify:
-            self.notify(message)
 
     def complete(self, row, task, info):
         key = row["id"]

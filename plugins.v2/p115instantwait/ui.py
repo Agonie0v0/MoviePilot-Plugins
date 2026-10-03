@@ -31,11 +31,20 @@ def col(content, sm=6):
 
 
 def field(component, model, label, hint, **props):
-    # Native input hints use tightly spaced 12px text. Keep explanations readable
-    # using ordinary theme-aware body text, without modifying MoviePilot's CSS.
+    if component == "VTextField":
+        control_id = f"p115wait-{model}"
+        return node("div", content=[
+            node("label", label, **{"for": control_id, "class": "d-block mb-2",
+                                   "style": INK + "font-size:15px;font-weight:600"}),
+            node(component, model=model, id=control_id,
+                 **{"variant": "outlined", "density": "comfortable", "hide-details": "auto",
+                    "color": "primary", "style": INK, **props}),
+            paragraph(hint, **{"class": "text-body-2 mt-2"}),
+        ])
     return node("div", content=[
         node(component, model=model, label=label,
-             **{"variant": "outlined", "density": "comfortable", "hide-details": "auto", **props}),
+             **{"variant": "outlined", "density": "comfortable", "hide-details": "auto",
+                "color": "primary", "style": INK, **props}),
         paragraph(hint, **{"class": "text-body-2 mt-2"}),
     ])
 
@@ -49,68 +58,60 @@ def config_form(tasks, error=""):
                          f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
                 "props": {"disabled": t["state"] in ("running", "uploading")}}
                for t in tasks if t["state"] in ACTIVE]
-    intro = node("div", content=[
-        node("div", content=[
-            node("span", "让整理在后台等待秒传", **{"class": "text-subtitle-1 font-weight-bold"}),
-            node("VChip", "MP V2.15.6 · 内置 115", size="small", variant="outlined"),
-        ], **{"class": "d-flex align-center justify-space-between flex-wrap ga-2 mb-2"}),
-        paragraph("自动尝试秒传，用完重试次数后暂停。你可以随时对等待任务强制上传，其他整理继续进行。"),
-        node("div", content=[
-            node("VChip", "等待：原记录显示失败", size="small", variant="tonal"),
-            node("VIcon", "mdi-arrow-right", size=18),
-            node("VChip", "整理完成：原记录更新成功", size="small", variant="tonal"),
-        ], **{"class": "d-flex align-center flex-wrap ga-2 mt-3"}),
-    ], **{"class": "mb-5"})
-    switches = node("VRow", content=[
-        col([
-            node("VSwitch", model="enabled", label="启用秒传等待", color="primary",
-                 **{"inset": True, "hide-details": True, "density": "comfortable"}),
-            paragraph("接管本地 → 内置 115 的视频整理。首次尝试也由后台执行。"),
-        ]),
-        col([
-            node("VSwitch", model="notify", label="任务暂停时通知我", color="primary",
-                 **{"inset": True, "hide-details": True, "density": "comfortable"}),
-            paragraph("重试用完、等待到期、授权异常或手动上传失败时通知；每次未秒传不通知。"),
-        ]),
-    ], **{"class": "mb-4"})
+    def toggle(model, title, hint):
+        control_id = f"p115wait-{model}"
+        return node("div", content=[
+            node("div", content=[
+                node("label", title, **{"for": control_id, "style": INK + "font-size:16px;font-weight:700;cursor:pointer"}),
+                paragraph(hint, **{"class": "text-body-2 mt-1"}),
+            ], **{"style": "min-width:0"}),
+            node("VSwitch", model=model, id=control_id, color="primary",
+                 **{"inset": True, "hide-details": True, "density": "comfortable", "style": "flex:0 0 auto"}),
+        ], **{"class": "d-flex align-center justify-space-between ga-3"})
+
+    intro = node("div", content=[node("VRow", content=[
+        col([toggle("enabled", "启用秒传等待", "后台等待，其他整理照常进行。")]),
+        col([toggle("notify", "等待与暂停通知", "首次等待、耗尽重试或异常时推送。")]),
+    ])], **{"class": "pa-4 rounded-lg mb-5", "style": "background:rgba(var(--v-theme-primary),.06);" + INK})
     strategy = node("div", content=[
-        node("div", "等待策略", **{"class": "text-subtitle-1 font-weight-bold mb-1"}),
-        paragraph("自动流程只试秒传。达到次数或时限就暂停，普通上传必须手动触发。", **{"class": "text-body-2 mb-4"}),
+        node("div", "自动重试", **{"class": "text-subtitle-1 font-weight-bold mb-4", "style": INK}),
         node("VRow", content=[
-            col([field("VTextField", "retry_intervals", "未秒传后，隔多久重试",
-                       "按顺序使用，不够时沿用最后一项。默认间隔约 1、3、10、30 分钟；每轮结束后计时。",
-                       placeholder="60,180,600,1800", suffix="秒",
-                       **{"spellcheck": False})]),
-            col([field("VTextField", "max_wait_hours", "最多自动等待多久",
-                       "默认 24 小时，到期暂停并保留文件。填 0 只取消时限，仍受重试次数限制。",
+            col([field("VTextField", "max_retries", "最多重试", "不含首次；填 3 即最多尝试 4 次。",
+                       type="number", suffix="次", min=0, max=100, step=1)]),
+            col([field("VTextField", "max_wait_hours", "最长等待", "填 0 不限时，仍受次数限制。",
                        type="number", suffix="小时", min=0, max=8760, step=1)]),
         ]),
         node("VRow", content=[
-            col([field("VTextField", "max_retries", "最多自动重试次数",
-                       "默认重试 3 次，共尝试 4 次。用完后暂停，需手动处理；填 0 表示首次未成功就暂停。",
-                       type="number", suffix="次", min=0, max=100, step=1)]),
-        ], **{"class": "mt-2"}),
-        paragraph("重试间隔用英文逗号分隔，每项为 30～86400 秒；实际间隔会有约 ±10% 浮动。",
-                  **{"class": "text-body-2 mt-3"}),
+            col([field("VTextField", "retry_intervals", "每次重试间隔", "单位为秒，英文逗号分隔；用完后沿用最后一项。",
+                       placeholder="60,180,600,1800", suffix="秒", **{"spellcheck": False})], sm=12),
+        ], **{"class": "mt-1"}),
+        node("div", content=[node("VIcon", "mdi-pause-circle-outline", size=20),
+            node("span", "达到次数或时限就暂停，普通上传需手动触发。")],
+            **{"class": "d-flex align-center ga-2 mt-4", "style": tone_style("warning") + "font-size:14px;font-weight:600"}),
     ], **{"class": "mb-5"})
-    scope = node("VExpansionPanel", content=[
-        node("VExpansionPanelTitle", "文件范围与使用说明"),
-        node("VExpansionPanelText", content=[
-            field("VTextarea", "extensions", "需要等待秒传的视频格式",
-                  "填写文件后缀，用英文逗号分隔，不需要加点。默认已包含常见视频和 ISO，通常不用修改。",
-                  rows=2, **{"auto-grow": True, "spellcheck": False}),
-            paragraph("例如：mkv,mp4,iso。未列出的格式仍走 MP 原流程。", **{"class": "text-body-2 mt-3"}),
-            node("VDivider", **{"class": "my-4"}),
-            paragraph("只支持本地文件整理到 MP 内置 115，整理方式为复制或移动。字幕、NFO 和图片沿用 MP。"),
-            paragraph("等待期间保留本地视频。自动任务只尝试秒传；点强制上传后，未秒传就通过网络上传文件。蓝光原盘目录暂不支持。", **{"class": "text-body-2 mt-2"}),
-            paragraph("覆盖时旧文件保存在目标目录的 .mp115-backups 中，确认无误后可以自行清理。",
-                      **{"class": "text-body-2 mt-2"}),
-        ]),
+    def disclosure(title, children):
+        return node("details", content=[
+            node("summary", title, **{"style": INK + "cursor:pointer;box-sizing:border-box;min-height:48px;padding:12px 0;font-weight:600;line-height:24px"}),
+            node("div", content=children, **{"class": "pt-2 pb-4"}),
+        ], **{"style": "border-top:1px solid rgba(var(--v-theme-on-surface),.15)"})
+
+    help_section = disclosure("规则与通知说明", [
+        paragraph("整理记录：等待时显示失败，完成后原记录更新成功；本地文件保留到整理完成。"),
+        paragraph("重试：次数填 0 时只试首次。间隔每项 30～86400 秒，从每轮结束后计时，实际有 ±10% 浮动。",
+                  **{"class": "text-body-2 mt-3"}),
+        paragraph("通知：请在 MP 通知渠道中开启「整理入库」和「手动处理」。首次等待走整理入库，暂停走手动处理；中间重试不重复推送。成功及最终整理失败沿用 MP 原生通知。",
+                  **{"class": "text-body-2 mt-3"}),
+        paragraph("兼容：MP V2.15.6，本地到内置 115 的复制/移动；字幕、NFO、图片沿用 MP，蓝光原盘目录暂不支持。",
+                  **{"class": "text-body-2 mt-3"}),
+        paragraph("覆盖备份：旧文件放在目标目录 .mp115-backups，确认无误后可自行清理。",
+                  **{"class": "text-body-2 mt-3"}),
     ])
-    operations = node("VExpansionPanel", content=[
-        node("VExpansionPanelTitle", "单个任务操作"),
-        node("VExpansionPanelText", content=[
-            paragraph("推荐点「查看数据」，在任务详情直接强制上传或管理等待任务。这里的操作只在保存时执行一次。",
+    scope = disclosure("视频格式 · 通常无需修改", [
+        field("VTextarea", "extensions", "接管的视频后缀", "例如 mkv,mp4,iso，不加点号；未列出的格式走 MP 原流程。",
+              rows=2, **{"auto-grow": True, "spellcheck": False}),
+    ])
+    operations = disclosure("单个任务操作", [
+            paragraph("可直接在「查看数据」中操作；也可在这里选择，保存时执行。",
                       **{"class": "text-body-2 mb-4"}),
             node("VRow", content=[
                 col([field("VSelect", "task_id", "选择需要操作的文件",
@@ -127,16 +128,13 @@ def config_form(tasks, error=""):
             node("VCheckbox", model="apply_action", label="保存时执行所选操作（仅一次）",
                  **{"color": "primary", "class": "mt-3", "hide-details": True,
                     "disabled": "{{ !enabled || !task_id }}"}),
-            paragraph("需要先启用插件；只选文件或操作，不勾选这一项，就不会执行。执行后勾选会自动关闭。"),
-        ]),
+            paragraph("需启用插件并勾选才会执行，执行后自动取消勾选。"),
     ])
     content = [intro]
     if error:
         content.append(node("VAlert", error, type="error", variant="tonal", **{"class": "mb-4"}))
-    content.extend([switches, node("VDivider", **{"class": "mb-5"}), strategy,
-                    node("VExpansionPanels", content=[scope, operations], variant="accordion",
-                         **{"class": "border rounded-lg", "elevation": 0})])
-    return [node("VForm", content=content)]
+    content.extend([strategy, help_section, scope, operations])
+    return [node("VForm", content=content, **{"style": INK})]
 
 
 TONES = {"waiting": ("warning", "mdi-clock-outline"), "queued": ("info", "mdi-clock-outline"),
