@@ -28,7 +28,7 @@ class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理限次等待秒传，支持手动强制上传并更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -106,6 +106,7 @@ class P115InstantWait(_PluginBase):
             result.append({"id": row["id"], "history_id": row["history_id"],
                 "source": task["fileitem"]["path"], "target": row["payload"]["final_path"],
                 "state": row["state"], "attempts": row["attempts"], "next_at": row["next_at"],
+                "auto_attempts": row["payload"].get("auto_attempts", row["attempts"]),
                 "message": row["message"], "backup_files": row["payload"].get("backups", [])})
         return result
 
@@ -126,7 +127,8 @@ class P115InstantWait(_PluginBase):
         return config_form(self.list_tasks(), self._error), dict(DEFAULTS)
 
     def get_page(self):
-        return task_page(self.list_tasks(), self.get_state(), self._error)
+        return task_page(self.list_tasks(), self.get_state(), self._error,
+                         max_retries=int(self._engine.config["max_retries"]) if self._engine else None)
 
     def stop_service(self):
         if self._engine:

@@ -134,6 +134,44 @@ class MoviePilotTests(unittest.TestCase):
         self.assertFalse(self.h.chain.jobview.is_done(task))
         self.assertIn(task.fileitem.path, self.h.chain._scrape_batches[task.transfer_batch_id]["pending"])
 
+    def test_retry_logs_correlate_history_and_exact_next_time(self):
+        with patch.object(self.h.bridge.logger, "info") as info, patch.object(self.h.bridge.logger, "warning") as warning:
+            self.enroll()
+            row = self.engine.store.all()[0]
+            self.attempt(row["id"])
+            waiting = self.engine.store.get(row["id"])
+            lines = [str(call.args[0]) for call in info.call_args_list]
+            self.assertTrue(any("任务入队" in line and f"整理记录={row['history_id']}" in line for line in lines))
+            start = next(line for line in lines if "开始自动尝试" in line)
+            deferred = next(line for line in lines if "等待下次重试" in line)
+            for line in (start, deferred):
+                self.assertIn(row["id"], line)
+                self.assertIn(f"整理记录={row['history_id']}", line)
+                self.assertIn("已尝试=1", line)
+                self.assertIn("本轮自动尝试=1/4", line)
+            self.assertIn(self.h.bridge.log_time(waiting["next_at"]), deferred)
+            self.assertIn("未命中秒传", deferred)
+            self.assertFalse(warning.called)
+            self.engine.config["max_retries"] = 1
+            self.attempt(row["id"])
+            paused = str(warning.call_args.args[0])
+            self.assertIn("自动重试次数已用完", paused)
+            self.assertIn("下次重试=无，等待手动处理", paused)
+
+    def test_manual_success_logs_are_traceable_without_payload_secrets(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        row["payload"]["AccessKeySecret"] = "do-not-log-this"
+        row["payload"]["task"]["fileitem"]["path"] = "/video/Fake\nLog.mkv"
+        with patch.object(self.h.bridge.logger, "info") as info:
+            self.engine.log_task(row, "测试单行日志", 原因="line1\r\nline2")
+            self.engine.control(row["id"], "upload")
+            self.engine.execute(self.engine.store.claim(manual=True))
+            lines = [str(call.args[0]) for call in info.call_args_list if "【115秒传等待】" in str(call.args[0])]
+        self.assertFalse(any("do-not-log-this" in line or "\n" in line or "\r" in line for line in lines))
+        for event in ("用户操作", "开始手动处理", "秒传未命中，转普通上传", "普通上传已提交", "整理成功"):
+            self.assertTrue(any(event in line and row["id"] in line for line in lines), event)
+
     def test_retry_limit_pauses_then_manual_miss_uploads_and_updates_original_history(self):
         task = self.enroll(mode="move")
         row = self.engine.store.all()[0]
