@@ -107,7 +107,7 @@ class QueueStore:
                        (time.time(),))
             # Never resume sending file contents without a new manual action.
             db.execute("UPDATE jobs SET state='paused',ready=1,message=? WHERE state='uploading'",
-                       ("手动上传被中断，请点强制上传继续；将先核对远端及已保存的上传进度",))
+                       ("强制上传被中断，请点强制上传继续；将先核对远端及已保存的上传进度",))
 
     def command(self, key, action):
         """Do not race an in-flight upload or completion callback."""
@@ -126,6 +126,9 @@ class QueueStore:
                 db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), key))
             elif action == "upload" and row["state"] in ("queued", "waiting", "paused"):
                 state = "upload_queued"
+                payload = json.loads(row["payload"])
+                payload["upload_origin"] = "manual"
+                db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), key))
             elif action == "pause" and row["state"] in ("queued", "waiting", "upload_queued"):
                 state = "paused"
             elif action == "cancel" and row["state"] in ("queued", "waiting", "paused", "upload_queued"):

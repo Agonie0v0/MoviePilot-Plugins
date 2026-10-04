@@ -424,6 +424,122 @@ class MoviePilotTests(unittest.TestCase):
         self.assertEqual(self.h.db.query(self.h.History).count(), 1)
         self.assertFalse(Path(task.fileitem.path).exists())
 
+    def test_limit_policy_upload_uses_separate_queue_and_original_history(self):
+        plugin = self.attach_plugin_notifier()
+        task = self.enroll(mode="move")
+        row = self.engine.store.all()[0]
+        self.engine.config.update(max_retries=1, limit_action="upload")
+        for _ in range(2):
+            self.attempt(row["id"])
+        queued = self.engine.store.get(row["id"])
+        self.assertEqual(queued["state"], "upload_queued")
+        self.assertEqual(queued["payload"]["upload_origin"], "limit")
+        self.assertEqual(self.api.uploads, 0)
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertIn("已安排自动上传", plugin.chain.post_message.call_args.args[0].title)
+        self.assertEqual(plugin.chain.post_message.call_args.args[0].mtype.value, "整理入库")
+        self.assertIsNone(self.engine.store.claim(now=time.time() + 9999))
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.api.uploads, 1)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.h.db.query(self.h.History).count(), 1)
+        self.assertFalse(Path(task.fileitem.path).exists())
+
+    def test_time_limit_schedules_deadline_and_does_not_count_unattempted_retry(self):
+        self.engine.config.update(max_wait_hours=1, limit_action="upload")
+        self.enroll()
+        row = self.engine.store.all()[0]
+        deadline = time.time() + 10
+        row["payload"]["wait_since"] = deadline - 3600
+        self.engine.store.update(row["id"], payload=row["payload"])
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["next_at"], deadline)
+        with patch.object(self.h.bridge.time, "time", return_value=deadline):
+            self.engine.execute(self.engine.store.claim(now=deadline))
+        current = self.engine.store.get(row["id"])
+        self.assertEqual(current["state"], "upload_queued")
+        self.assertEqual(current["attempts"], 1)
+        self.assertEqual(current["payload"]["auto_attempts"], 1)
+        self.assertEqual(self.api.inits, 1)
+
+    def test_automatic_force_upload_hit_sends_no_contents(self):
+        self.engine.config.update(max_retries=0, limit_action="upload")
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.attempt(row["id"])
+        self.api.hit = True
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.api.uploads, 0)
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+
+    def test_restoring_changed_deadline_keeps_paused_tasks_paused(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.attempt(row["id"])
+        self.enroll("Paused.mkv")
+        paused = next(t for t in self.engine.store.all() if t["id"] != row["id"])
+        self.engine.control(paused["id"], "pause")
+        self.engine.config.update(max_wait_hours=0.001, limit_action="upload")
+        self.engine.restore()
+        restored = self.engine.store.get(row["id"])
+        self.assertEqual(restored["next_at"], row["payload"]["wait_since"] + 3.6)
+        self.assertEqual(self.engine.store.get(paused["id"])["state"], "paused")
+
+    def test_transition_to_upload_finishes_mp_bookkeeping_before_claim(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.engine.config.update(max_retries=0, limit_action="upload")
+        real_update = self.engine.store.update
+        def fast_worker(key, **changes):
+            real_update(key, **changes)
+            if changes.get("state") == "upload_queued":
+                self.engine.execute(self.engine.store.claim(manual=True))
+        with patch.object(self.engine.store, "update", side_effect=fast_worker):
+            self.attempt(row["id"])
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        jobs = self.h.chain.jobview._job_view.values()
+        self.assertFalse(any(task.state == "waiting" for job in jobs for task in job.tasks))
+
+    def test_automatic_upload_failure_pauses_without_repeating(self):
+        plugin = self.attach_plugin_notifier()
+        self.engine.config.update(max_retries=0, limit_action="upload")
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.attempt(row["id"])
+        with patch.object(self.api, "upload", side_effect=remote.RetryLater("网络中断")):
+            self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertIn("自动强制上传未完成", plugin.chain.post_message.call_args.args[0].text)
+        self.assertIsNone(self.engine.store.claim(manual=True))
+        self.assertIsNone(self.engine.store.claim(now=time.time() + 9999))
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+
+    def test_upload_policy_never_overrides_source_and_authorization_guards(self):
+        self.engine.config.update(max_retries=0, limit_action="upload")
+        self.enroll()
+        row = self.engine.store.all()[0]
+        with patch.object(self.api, "instant", side_effect=remote.PauseTask("授权失效")):
+            self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        task = self.enroll(name="Changed.mkv")
+        changed = next(t for t in self.engine.store.all() if t["id"] != row["id"])
+        self.attempt(changed["id"])
+        Path(task.fileitem.path).write_bytes(b"changed source")
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.engine.store.get(changed["id"])["state"], "paused")
+        self.assertEqual(self.api.uploads, 0)
+
+    def test_invalid_limit_policy_refuses_to_enable(self):
+        import sys
+        import types
+        plugin = self.attach_plugin_notifier()
+        with patch.dict(sys.modules, {"version": types.SimpleNamespace(APP_VERSION="v2.15.6")}):
+            plugin.init_plugin({"enabled": True, "limit_action": "unexpected"})
+        self.assertIn("达到上限后的操作", plugin._error)
+        self.assertIsNone(plugin._engine)
+
     def test_manual_hit_never_sends_file_contents(self):
         self.enroll()
         row = self.engine.store.all()[0]

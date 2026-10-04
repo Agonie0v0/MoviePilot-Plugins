@@ -6,7 +6,7 @@ import time
 
 LABELS = {"queued": "等待首次秒传", "waiting": "等待重试", "running": "正在执行",
           "paused": "已暂停 · 待处理", "completed": "整理成功", "failed": "整理失败", "cancelled": "已取消",
-          "upload_queued": "等待手动上传", "uploading": "手动处理中"}
+          "upload_queued": "强制上传排队", "uploading": "强制上传中"}
 ACTIVE = {"queued", "waiting", "running", "paused", "upload_queued", "uploading"}
 ACTION_HINT = "强制上传：先试秒传，未命中就上传文件。继续等待：只试秒传，重置次数和时限。取消：停止任务，保留文件。"
 
@@ -32,7 +32,7 @@ def col(content, sm=6):
 
 
 def field(component, model, label, hint, **props):
-    if component == "VTextField":
+    if component in ("VTextField", "VSelect"):
         control_id = f"p115wait-{model}"
         return node("div", content=[
             node("label", label, **{"for": control_id, "class": "d-block mb-2",
@@ -72,7 +72,7 @@ def config_form(tasks, error="", batch_result=None):
 
     intro = node("div", content=[node("VRow", content=[
         col([toggle("enabled", "启用秒传等待", "后台等待，其他整理照常进行。")]),
-        col([toggle("notify", "等待与暂停通知", "首次等待、耗尽重试或异常时推送。")]),
+        col([toggle("notify", "任务状态通知", "首次等待、达到上限或异常时推送。")]),
     ])], **{"class": "pa-4 rounded-lg mb-5", "style": "background:rgba(var(--v-theme-primary),.06);" + INK})
     strategy = node("div", content=[
         node("div", "自动重试", **{"class": "text-subtitle-1 font-weight-bold mb-4", "style": INK}),
@@ -87,9 +87,13 @@ def config_form(tasks, error="", batch_result=None):
                  placeholder="60,180,600,1800", suffix="秒", **{"spellcheck": False})],
                  **{"style": "flex:0 1 320px;min-width:0;max-width:100%"}),
         ], **{"class": "d-flex flex-wrap ga-4"}),
-        node("div", content=[node("VIcon", "mdi-pause-circle-outline", size=20),
-            node("span", "达到次数或时限就暂停，普通上传需手动触发。")],
-            **{"class": "d-flex align-center ga-2 mt-4", "style": tone_style("warning") + "font-size:14px;font-weight:600"}),
+        node("div", content=[field("VSelect", "limit_action", "达到上限后", "次数或时限任一达到，即执行所选操作。",
+            items=[{"title": "需要手动操作", "value": "manual"},
+                   {"title": "自动强制上传", "value": "upload"}])],
+            **{"class": "mt-5", "style": "width:320px;max-width:100%"}),
+        node("div", content=[node("VIcon", "mdi-cloud-upload-outline", size=20),
+            node("span", "自动强制上传：先试秒传，未命中就上传文件。")],
+            **{"class": "d-flex align-center ga-2 mt-3", "style": tone_style("info") + "font-size:14px;font-weight:600"}),
     ], **{"class": "mb-5"})
     def disclosure(title, children):
         return node("details", content=[
@@ -99,9 +103,11 @@ def config_form(tasks, error="", batch_result=None):
 
     help_section = disclosure("规则与通知说明", [
         paragraph("整理记录：等待时显示失败，完成后原记录更新成功；本地文件保留到整理完成。"),
+        paragraph("上限策略：默认需手动操作。自动强制上传使用独立队列；上传失败或授权、源文件异常仍暂停。已暂停任务不会因修改策略自动恢复。",
+                  **{"class": "text-body-2 mt-3"}),
         paragraph("重试：次数不含首次，填 3 即最多尝试 4 次，填 0 只试首次。时限填 0 仍受次数限制。间隔每项 30～86400 秒，用完后沿用最后一项，从每轮结束后计时，实际有 ±10% 浮动。",
                   **{"class": "text-body-2 mt-3"}),
-        paragraph("通知：请在 MP 通知渠道中开启「整理入库」和「手动处理」。首次等待走整理入库，暂停走手动处理；中间重试不重复推送。成功及最终整理失败沿用 MP 原生通知。",
+        paragraph("通知：请在 MP 通知渠道中开启「整理入库」和「手动处理」。首次等待及自动转上传走整理入库，暂停走手动处理；中间重试不重复推送。成功及最终整理失败沿用 MP 原生通知。",
                   **{"class": "text-body-2 mt-3"}),
         paragraph("兼容：MP V2.15.6，本地到内置 115 的复制/移动；字幕、NFO、图片沿用 MP，蓝光原盘目录暂不支持。",
                   **{"class": "text-body-2 mt-3"}),
@@ -187,7 +193,7 @@ def schedule_summary(task, enabled, now):
     if state == "upload_queued":
         return "后续安排", "排队等待上传", "info"
     if state in ("running", "uploading"):
-        return "当前进度", "手动处理中" if state == "uploading" else "本轮正在执行", "primary"
+        return "当前进度", "强制上传中" if state == "uploading" else "本轮正在执行", "primary"
     next_at = task.get("next_at") or 0
     if next_at <= now:
         return "下次尝试", "已到时间 · 待调度", "primary"

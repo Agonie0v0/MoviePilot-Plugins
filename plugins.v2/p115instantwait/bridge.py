@@ -116,12 +116,14 @@ class InstantWaitEngine:
         payload = row["payload"]
         source = payload.get("task", {}).get("fileitem", {}).get("path", "")
         name = PurePosixPath(str(source).replace("\\", "/")).name
-        title = "115秒传等待 · 需要手动处理" if manual else "115秒传等待 · 整理暂未成功"
+        automatic_upload = row["state"] == "upload_queued"
+        title = "115秒传等待 · 已安排自动上传" if automatic_upload else ("115秒传等待 · 需要手动处理" if manual else "115秒传等待 · 整理暂未成功")
         text = "\n".join([
             f"文件：{log_text(name)}",
             f"整理记录：#{row.get('history_id') or '待生成'}",
             f"累计尝试：{row['attempts']} 次；本轮自动：{payload.get('auto_attempts', row['attempts'])}/{self.config.get('max_retries', 3) + 1}",
             f"原因：{log_text(row['message'])}",
+            "后续：达到设定上限，已进入独立上传队列；先试秒传，未命中则上传文件。" if automatic_upload else
             "后续：自动重试已停止，请在插件「查看数据」中强制上传或继续等待秒传。" if manual else
             f"下次重试：{log_time(row['next_at'])}；后台继续等待，不影响其他整理。",
             f"任务 ID：{row['id']}",
@@ -372,6 +374,11 @@ class InstantWaitEngine:
                 self.ensure_history(row["id"], task)
                 if row["state"] == "paused":
                     self.history_message(row["id"], row["message"])
+                limit = self.config["max_wait_hours"] * 3600
+                if limit and row["state"] in ("queued", "waiting"):
+                    deadline = row["payload"].get("wait_since", row["created"]) + limit
+                    row["next_at"] = min(row["next_at"], deadline)
+                    self.store.update(row["id"], next_at=row["next_at"])
                 self.log_task(self.store.get(row["id"]), "恢复持久化任务", 状态=row["state"],
                               原因=row["message"], 下次重试=log_time(row["next_at"]) if row["state"] in ("queued", "waiting") else "无")
                 self.store.update(row["id"], ready=1)
@@ -417,7 +424,8 @@ class InstantWaitEngine:
             task = self.live_tasks.get(key) or load_task(payload["task"])
             self.live_tasks[key] = task
             self.ensure_history(key, task)
-            self.log_task(self.store.get(key), "开始手动处理" if manual else "开始自动尝试")
+            origin = "达到上限自动触发" if payload.get("upload_origin") == "limit" else "用户手动"
+            self.log_task(self.store.get(key), ("开始自动强制上传" if origin == "达到上限自动触发" else "开始手动处理") if manual else "开始自动尝试")
             if payload.get("result"):
                 self.log_task(row, "恢复整理结果", 说明="核对远端后继续原记录回写")
                 info = TransferInfo.model_validate(payload["result"])
@@ -429,10 +437,15 @@ class InstantWaitEngine:
                 self.complete(row, task, info)
                 return
             limit = self.config["max_wait_hours"] * 3600
-            if not manual and limit and time.time() - payload.get("wait_since", row["created"]) > limit:
-                raise PauseTask("等待超过设定期限，可手动恢复继续等待")
-            if not manual and payload.get("auto_attempts", row["attempts"]) > self.config.get("max_retries", 3) + 1:
-                raise PauseTask("自动重试次数已用完，请手动处理；强制上传会在未秒传时普通上传")
+            expired = limit and time.time() >= payload.get("wait_since", row["created"]) + limit
+            exhausted = payload.get("auto_attempts", row["attempts"]) > self.config.get("max_retries", 3) + 1
+            if not manual and (expired or exhausted):
+                # Claim counts a scheduled attempt; no transfer was attempted here.
+                payload["auto_attempts"] = max(0, payload.get("auto_attempts", row["attempts"]) - 1)
+                row["attempts"] = max(0, row["attempts"] - 1)
+                self.store.update(key, attempts=row["attempts"], payload=payload)
+                self.defer(row, "waiting", "等待超过设定期限" if expired else "自动重试次数已用完", limit_reached=True)
+                return
             path = Path(task.fileitem.path)
             if not path.is_file():
                 raise PauseTask("源文件不存在，已暂停")
@@ -470,9 +483,9 @@ class InstantWaitEngine:
                     except NotInstant as exc:
                         if not manual:
                             raise
-                        self.log_task(row, "秒传未命中，转普通上传", 触发方式="用户手动")
+                        self.log_task(row, "秒传未命中，转普通上传", 触发方式=origin)
                         self.store.update(key, message="未命中秒传，正在普通上传")
-                        self.history_message(key, "手动处理：未命中秒传，正在普通上传")
+                        self.history_message(key, f"{origin}：未命中秒传，正在普通上传")
                         api.upload(path, stage_dir, payload["hashes"], exc.upload_data, payload,
                                    lambda: self.store.update(key, payload=payload))
                         self.log_task(row, "普通上传已提交", 说明="等待远端校验与整理完成")
@@ -522,32 +535,51 @@ class InstantWaitEngine:
             if api:
                 api.close()
 
-    def defer(self, row, state, reason):
+    def defer(self, row, state, reason, limit_reached=False):
         previous_state = self.store.get(row["id"])["state"]
+        now = time.time()
+        payload = self.store.get(row["id"])["payload"]
+        limit = self.config["max_wait_hours"] * 3600
+        deadline = payload.get("wait_since", row["created"]) + limit if limit else None
         if row["state"] == "uploading":
             state = "paused"
-            reason = f"手动处理未完成：{reason}；可再次点强制上传核对并继续"
-        elif state == "waiting" and row["payload"].get("auto_attempts", row["attempts"]) >= self.config.get("max_retries", 3) + 1:
-            state = "paused"
-            reason = f"自动重试次数已用完，请手动处理。最后结果：{reason}"
+            source = "自动强制上传" if payload.get("upload_origin") == "limit" else "手动处理"
+            reason = f"{source}未完成：{reason}；可再次点强制上传核对并继续"
+        elif state == "waiting":
+            reached = ("等待超过设定期限" if deadline and now >= deadline else
+                       "自动重试次数已用完" if payload.get("auto_attempts", row["attempts"]) >= self.config.get("max_retries", 3) + 1 else None)
+            if reached or limit_reached:
+                state = "upload_queued" if self.config.get("limit_action", "manual") == "upload" else "paused"
+                reason = f"{reached or reason}，{'已安排自动强制上传' if state == 'upload_queued' else '请手动处理'}。最后结果：{reason}"
+                if state == "upload_queued":
+                    payload["upload_origin"] = "limit"
         delays = self.config["retry_delays"]
         base = delays[min(max(0, row["payload"].get("auto_attempts", row["attempts"]) - 1), len(delays) - 1)]
         delay = base * random.uniform(0.9, 1.1)
-        message = f"等待秒传：{reason}" if state == "waiting" else f"秒传等待已暂停：{reason}"
-        self.store.update(row["id"], state=state, next_at=time.time() + delay, message=message)
-        saved = self.store.get(row["id"])
-        self.log_task(saved, "等待下次重试" if state == "waiting" else "任务暂停",
-                      level="info" if state == "waiting" else "warning", 原因=reason,
-                      下次重试=log_time(saved["next_at"]) if state == "waiting" else "无，等待手动处理",
-                      **({"间隔秒": round(delay)} if state == "waiting" else {}))
-        if state == "paused" and previous_state != "paused":
-            self.notify_task(saved)
-        elif state == "waiting" and previous_state != "waiting" and saved["payload"].get("auto_attempts", saved["attempts"]) == 1:
-            self.notify_task(saved, manual=False)
+        next_at = min(now + delay, deadline) if deadline and state == "waiting" else now + delay
+        if state == "upload_queued":
+            next_at = now
+        message = (f"等待秒传：{reason}" if state == "waiting" else
+                   f"等待强制上传：{reason}" if state == "upload_queued" else f"秒传等待已暂停：{reason}")
+        # Finish MP bookkeeping before publishing work to the other worker.
         self.history_message(row["id"], message)
         task = self.live_tasks.get(row["id"])
         if task:
             self.waiting_view(task)
+        self.store.update(row["id"], state=state, next_at=next_at, message=message, payload=payload)
+        # Use the published snapshot: the upload worker may already have claimed it.
+        saved = {**row, "state": state, "next_at": next_at, "message": message, "payload": payload}
+        self.log_task(saved, "等待下次重试" if state == "waiting" else "达到上限，转上传队列" if state == "upload_queued" else "任务暂停",
+                      level="warning" if state == "paused" else "info", 原因=reason,
+                      下次重试=log_time(saved["next_at"]) if state == "waiting" else "无，等待上传调度" if state == "upload_queued" else "无，等待手动处理",
+                      **({"间隔秒": round(next_at - now)} if state == "waiting" else {}))
+        if state == "upload_queued":
+            self.notify_task(saved, manual=False)
+            self.upload_wake.set()
+        elif state == "paused" and previous_state != "paused":
+            self.notify_task(saved)
+        elif state == "waiting" and previous_state != "waiting" and saved["payload"].get("auto_attempts", saved["attempts"]) == 1:
+            self.notify_task(saved, manual=False)
 
     def complete(self, row, task, info):
         key = row["id"]

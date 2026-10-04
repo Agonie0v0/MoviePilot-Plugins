@@ -17,6 +17,8 @@ with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.write(plugin / name, name)
     archive.writestr("package.v2.json", json.dumps({"P115InstantWait": metadata}, ensure_ascii=False, indent=2))
     archive.write(root / "scripts" / "install_local.py", "install_local.py")
+    for name in ("p115instantwait.png", "p115instantwait.svg"):
+        archive.write(root / "icons" / name, "icons/" + name)
 with zipfile.ZipFile(output) as archive:
     assert archive.testzip() is None
     assert "p115instantwait/__init__.py" in archive.namelist()

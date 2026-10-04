@@ -18,6 +18,7 @@ DEFAULTS = {
     "retry_intervals": "60,180,600,1800",
     "max_wait_hours": 24,
     "max_retries": 3,
+    "limit_action": "manual",
     "notify": True,
     "task_id": "",
     "task_ids": [],
@@ -28,9 +29,9 @@ DEFAULTS = {
 
 class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
-    plugin_desc = "内置115整理限次等待秒传，支持手动强制上传并更新原整理记录"
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.2.3"
+    plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
+    plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
+    plugin_version = "0.2.4"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -73,7 +74,9 @@ class P115InstantWait(_PluginBase):
                 raise ValueError("每个重试间隔必须在 30 到 86400 秒之间")
             retries = float(self._config["max_retries"])
             if not retries.is_integer() or not 0 <= retries <= 100:
-                raise ValueError("自动重试次数必须是 0 到 100 的整数；0 表示首次未成功就暂停")
+                raise ValueError("自动重试次数必须是 0 到 100 的整数；0 表示首次未成功就执行上限策略")
+            if self._config["limit_action"] not in ("manual", "upload"):
+                raise ValueError("达到上限后的操作必须为手动处理或强制上传")
             if not self._config["extensions"].strip():
                 raise ValueError("请配置需要接管的文件扩展名")
             runtime = {**self._config, "max_wait_hours": hours, "max_retries": int(retries), "retry_delays": delays}
