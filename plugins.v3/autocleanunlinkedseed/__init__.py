@@ -6,14 +6,14 @@ from typing import Any, List, Dict, Tuple, Optional
 
 from apscheduler.triggers.cron import CronTrigger
 
-from app.core.config import settings
-from app.plugins import _PluginBase
-from app.log import logger
-from app.schemas import NotificationType, ServiceInfo
-from app.schemas.types import EventType
-from app.core.event import eventmanager, Event
-from app.helper.downloader import DownloaderHelper
-from app.utils.string import StringUtils
+from app.sdk.config import settings
+from app.sdk.plugin import _PluginBase
+from app.sdk.logging import logger
+from app.schemas.system import ServiceInfo
+from app.schemas.types import EventType, MessageType as NotificationType
+from app.sdk.events import eventmanager, Event
+from app.sdk.services import DownloaderHelper
+from app.sdk.string import StringUtils
 
 class autocleanunlinkedseed(_PluginBase):
     # 插件名称
@@ -23,7 +23,7 @@ class autocleanunlinkedseed(_PluginBase):
     # 插件图标
     plugin_icon = "clean_a.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "Agonie"
     # 作者主页
@@ -53,6 +53,9 @@ class autocleanunlinkedseed(_PluginBase):
     _cooldown_seconds = 10  # 冷却时间：10秒
 
     def init_plugin(self, config: dict = None):
+        self.stop_service()
+        self._stop_event = threading.Event()
+        self._worker = None
         self.downloader_helper = DownloaderHelper()
 
         if config:
@@ -75,7 +78,9 @@ class autocleanunlinkedseed(_PluginBase):
         if self._onlyonce:
             logger.info(f"{self.LOG_TAG} 收到立即运行指令，将在后台启动一次断链扫描...")
             # 使用独立线程运行，防止阻塞主程序的配置保存
-            threading.Thread(target=self.clean_unlinked_seeds).start()
+            self._worker = threading.Thread(target=self.clean_unlinked_seeds,
+                                            name="autoclean-v3", daemon=True)
+            self._worker.start()
             
             # 运行后立刻将开关复位为 False 并更新配置
             self._onlyonce = False
@@ -159,7 +164,8 @@ class autocleanunlinkedseed(_PluginBase):
             )
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        """当前无 HTTP API。"""
+        return []
         
     # ================= 注册后台定时任务 =================
     def get_service(self) -> List[Dict[str, Any]]:
@@ -179,7 +185,16 @@ class autocleanunlinkedseed(_PluginBase):
         return []
 
     def stop_service(self):
-        pass
+        event = getattr(self, "_stop_event", None)
+        if event:
+            event.set()
+            # The scan lock also covers scheduler and webhook invocations.
+            if not self.__class__._lock.acquire(timeout=35):
+                raise RuntimeError("删种扫描尚未结束，暂不能重新加载插件")
+            self.__class__._lock.release()
+        worker = getattr(self, "_worker", None)
+        if worker and worker is not threading.current_thread():
+            worker.join(timeout=1)
 
     # ================= 核心处理逻辑 =================
 
@@ -279,11 +294,15 @@ class autocleanunlinkedseed(_PluginBase):
         return True
 
     def clean_unlinked_seeds(self):
+        if not hasattr(self, "_stop_event") or self._stop_event.is_set():
+            return
         # 2. 并发锁拦截：尝试获取非阻塞锁，如果获取失败说明正有其他线程在扫描，直接安全退出
         if not self.__class__._lock.acquire(blocking=False):
             return
 
         try:
+            if self._stop_event.is_set():
+                return
             services = self.service_info
             if not services:
                 return
@@ -292,6 +311,8 @@ class autocleanunlinkedseed(_PluginBase):
             deleted_msgs = []
 
             for service in services.values():
+                if self._stop_event.is_set():
+                    break
                 downloader_name = service.name
                 downloader_obj = service.instance
                 downloader_type = self.get_downloader_type(service)
@@ -305,6 +326,8 @@ class autocleanunlinkedseed(_PluginBase):
                         continue
 
                     for torrent in torrents:
+                        if self._stop_event.is_set():
+                            break
                         # 1. 检查是否下载完成
                         if not self.is_torrent_completed(torrent, downloader_type):
                             continue
@@ -337,10 +360,12 @@ class autocleanunlinkedseed(_PluginBase):
                             logger.info(f"{self.LOG_TAG} 检测到断链文件，准备删除: {t_name}")
                             
                             # 5. 触发删除
-                            if t_hash:
-                                downloader_obj.delete_torrents(delete_file=True, ids=t_hash)
-                                total_deleted += 1
-                                deleted_msgs.append(f"📁 {t_name} (释放: {StringUtils.str_filesize(t_size)})")
+                            if t_hash and not self._stop_event.is_set():
+                                if downloader_obj.delete_torrents(delete_file=True, ids=t_hash):
+                                    total_deleted += 1
+                                    deleted_msgs.append(f"📁 {t_name} (释放: {StringUtils.str_filesize(t_size)})")
+                                else:
+                                    logger.warning(f"{self.LOG_TAG} 下载器未确认删除：{t_name}")
 
                 except Exception as e:
                     logger.error(f"{self.LOG_TAG} 处理下载器 {downloader_name} 失败: {e}")
@@ -520,4 +545,4 @@ class autocleanunlinkedseed(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        return []

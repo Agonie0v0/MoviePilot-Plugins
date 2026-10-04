@@ -1,8 +1,9 @@
 """
 阡陌居签到插件 (QmjSign)
-版本: 1.2.7
+版本: 2.0.0 (MoviePilot V3)
 源自: 基于 QD 签到模板实现
 更新历史:
+- v2.0.0: 使用 V3 插件 SDK、MessageType 通知和显式 API 输出合同，保留原配置及签到历史。
 - v1.2.7: 规范插件源自于 QD 签到模板，移除历史无关依赖与表述；优化五大核心财产指标与自适应排版。
 - v1.2.6: 修正 Discuz! 积分体系认知偏差，移除虚构且恒为空的“总积分”卡片，统一为真实的五项财产指标（铜币、威望、贡献、发书数、综合积分），优化五列自适应均分排版与通知模板。
 - v1.2.5: 恢复并规范插件图标为完整的 HTTPS 原始链接，修复因相对文件名导致 MoviePilot 回退显示默认拼图占位符的问题。
@@ -31,14 +32,15 @@ from requests.adapters import HTTPAdapter, Retry
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.core.config import settings
-from app.plugins import _PluginBase
-from app.log import logger
-from app.schemas import NotificationType
+from app.sdk.config import settings
+from app.sdk.plugin import _PluginBase
+from app.sdk.logging import logger
+from app.schemas.types import MessageType as NotificationType
+from pydantic import BaseModel
 
 try:
     from app.schemas.types import EventType
-    from app.core.event import eventmanager, Event
+    from app.sdk.events import eventmanager, Event
 except ImportError:
     try:
         from app.sdk.events import eventmanager, Event
@@ -136,6 +138,12 @@ _SECURITY_QUESTIONS = [
 ]
 
 
+class ClearHistoryResponse(BaseModel):
+    """保持历史清理 API 的裸 JSON 合同，供 V3 注册输出模型。"""
+    code: int
+    message: str
+
+
 class qmjsign(_PluginBase):
     # 插件名称
     plugin_name = "阡陌居签到"
@@ -144,7 +152,7 @@ class qmjsign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/qmj.png"
     # 插件版本
-    plugin_version = "1.2.7"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "Agonie"
     # 作者主页
@@ -1722,15 +1730,16 @@ class qmjsign(_PluginBase):
                 "methods": ["GET", "POST"],
                 "auth": "bear",
                 "summary": "清空阡陌居签到历史记录",
+                "response_model": ClearHistoryResponse,
             }
         ]
 
-    def clear_history_api(self):
+    def clear_history_api(self) -> "ClearHistoryResponse":
         """清空历史记录 API 端点"""
         self.save_data('sign_history', [])
         self.save_data('last_credits_overview', {})
         logger.info("已通过 API 清空阡陌居签到历史记录")
-        return {"code": 0, "message": "历史记录已成功清空"}
+        return ClearHistoryResponse(code=0, message="历史记录已成功清空")
 
     def _is_manual_trigger(self) -> bool:
         """检查是否手动触发"""

@@ -3,29 +3,33 @@
     "name": "Emby智能入库删种",
     "description": "Emby入库之后自动清理断链做种，支持精准过滤",
     "labels": "Qbittorrent",
-    "version": "1.0",
+    "version": "2.0.0",
     "icon": "clean_a.png",
     "author": "Agonie",
     "github": "Agonie0v0/MoviePilot-Plugins",
     "repo": "Agonie0v0/MoviePilot-Plugins",
     "level": 1,
-    "v2": true,
+    "v2": false,
     "history": {
+      "v2.0.0": "适配 MoviePilot V3 下载器 SDK，增加扫描停止保护，只有下载器确认删除才计入成功",
       "v1.0": "Emby入库之后自动删种"
-    }
+    },
+    "v3": true,
+    "system_version": ">=3.1.0,<4.0.0"
   },
   "qmjsign": {
     "name": "阡陌居签到",
     "description": "自动完成阡陌居每日签到与威望红包，支持账号密码自动登录更新Cookie、失败重试与历史记录",
     "labels": "签到,阡陌居,论坛,PT",
-    "version": "1.2.7",
+    "version": "2.0.0",
     "icon": "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/qmj.png",
     "author": "Agonie",
     "github": "Agonie0v0/MoviePilot-Plugins",
     "repo": "Agonie0v0/MoviePilot-Plugins",
     "level": 1,
-    "v2": true,
+    "v2": false,
     "history": {
+      "v2.0.0": "适配 MoviePilot V3 SDK、MessageType 通知和显式 API 返回合同，保留原配置和签到历史",
       "v1.2.7": "规范插件溯源说明（源自 QD 签到模板），移除历史无关依赖与表述；完善五大核心财产指标与自适应排版。",
       "v1.2.6": "修正 Discuz! 积分体系认知偏差，移除虚构且恒为空的“总积分”卡片，统一为真实的五项核心财产指标（铜币、威望、贡献、发书数、综合积分），优化五列自适应均分排版与通知模板。",
       "v1.2.5": "恢复并规范使用标准高清图标 URL 绝对路径，修复因相对文件名导致 MoviePilot 回退显示默认拼图占位图标的问题。",
@@ -39,6 +43,26 @@
       "v1.1.1": "威望红包流程补充先申请再领取；重复签到通知回填铜币；修正文案",
       "v1.1.0": "新增每日威望红包领取开关；解析并汇总财富六项；通知与详情页展示优化；精简日志",
       "v1.0.0": "首次发布，支持每日定时自动签到、失败重试、历史记录和通知"
+    },
+    "v3": true,
+    "system_version": ">=3.1.0,<4.0.0"
+  },
+  "P115InstantWait": {
+    "v3": true,
+    "v2": false,
+    "name": "115秒传等待",
+    "description": "V3 内置115等待秒传，独立上传队列，成功回写原整理记录",
+    "labels": "云盘,整理",
+    "version": "1.0.0",
+    "release": false,
+    "icon": "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png",
+    "author": "Agonie",
+    "github": "Agonie0v0/MoviePilot-Plugins",
+    "repo": "Agonie0v0/MoviePilot-Plugins",
+    "system_version": ">=3.1.0,<3.2.0",
+    "level": 1,
+    "history": {
+      "v1.0.0": "V3.1 专用持久计划适配：后台秒传/强制上传、原历史 ID 回写、原生步骤重放与备份、上限策略和批量操作；V2 遗留等待任务保留暂停"
     }
   }
 }
