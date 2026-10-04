@@ -27,7 +27,8 @@ def paragraph(text, **props):
 
 
 def col(content, sm=6):
-    return node("VCol", content=content, cols=12, sm=sm)
+    return node("VCol", content=content, cols=12, sm=sm,
+                **{"style": "box-sizing:border-box;min-width:0"})
 
 
 def field(component, model, label, hint, **props):
@@ -53,7 +54,7 @@ def filename(path):
     return PurePosixPath(str(path).replace("\\", "/")).name
 
 
-def config_form(tasks, error=""):
+def config_form(tasks, error="", batch_result=None):
     choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}"
                          f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
                 "props": {"disabled": t["state"] in ("running", "uploading")}}
@@ -75,16 +76,17 @@ def config_form(tasks, error=""):
     ])], **{"class": "pa-4 rounded-lg mb-5", "style": "background:rgba(var(--v-theme-primary),.06);" + INK})
     strategy = node("div", content=[
         node("div", "自动重试", **{"class": "text-subtitle-1 font-weight-bold mb-4", "style": INK}),
-        node("VRow", content=[
-            col([field("VTextField", "max_retries", "最多重试", "不含首次；填 3 即最多尝试 4 次。",
-                       type="number", suffix="次", min=0, max=100, step=1)]),
-            col([field("VTextField", "max_wait_hours", "最长等待", "填 0 不限时，仍受次数限制。",
-                       type="number", suffix="小时", min=0, max=8760, step=1)]),
-        ]),
-        node("VRow", content=[
-            col([field("VTextField", "retry_intervals", "每次重试间隔", "单位为秒，英文逗号分隔；用完后沿用最后一项。",
-                       placeholder="60,180,600,1800", suffix="秒", **{"spellcheck": False})], sm=12),
-        ], **{"class": "mt-1"}),
+        node("div", content=[
+            node("div", content=[field("VTextField", "max_retries", "最多重试", "不含首次尝试。",
+                 type="number", suffix="次", min=0, max=100, step=1)],
+                 **{"style": "flex:0 1 160px;min-width:0;max-width:100%"}),
+            node("div", content=[field("VTextField", "max_wait_hours", "最长等待", "0 表示不限时。",
+                 type="number", suffix="小时", min=0, max=8760, step=1)],
+                 **{"style": "flex:0 1 160px;min-width:0;max-width:100%"}),
+            node("div", content=[field("VTextField", "retry_intervals", "每次重试间隔", "英文逗号分隔，依次使用。",
+                 placeholder="60,180,600,1800", suffix="秒", **{"spellcheck": False})],
+                 **{"style": "flex:0 1 320px;min-width:0;max-width:100%"}),
+        ], **{"class": "d-flex flex-wrap ga-4"}),
         node("div", content=[node("VIcon", "mdi-pause-circle-outline", size=20),
             node("span", "达到次数或时限就暂停，普通上传需手动触发。")],
             **{"class": "d-flex align-center ga-2 mt-4", "style": tone_style("warning") + "font-size:14px;font-weight:600"}),
@@ -93,11 +95,11 @@ def config_form(tasks, error=""):
         return node("details", content=[
             node("summary", title, **{"style": INK + "cursor:pointer;box-sizing:border-box;min-height:48px;padding:12px 0;font-weight:600;line-height:24px"}),
             node("div", content=children, **{"class": "pt-2 pb-4"}),
-        ], **{"style": "border-top:1px solid rgba(var(--v-theme-on-surface),.15)"})
+        ], **{"style": "box-sizing:border-box;border-top:1px solid rgba(var(--v-theme-on-surface),.15)"})
 
     help_section = disclosure("规则与通知说明", [
         paragraph("整理记录：等待时显示失败，完成后原记录更新成功；本地文件保留到整理完成。"),
-        paragraph("重试：次数填 0 时只试首次。间隔每项 30～86400 秒，从每轮结束后计时，实际有 ±10% 浮动。",
+        paragraph("重试：次数不含首次，填 3 即最多尝试 4 次，填 0 只试首次。时限填 0 仍受次数限制。间隔每项 30～86400 秒，用完后沿用最后一项，从每轮结束后计时，实际有 ±10% 浮动。",
                   **{"class": "text-body-2 mt-3"}),
         paragraph("通知：请在 MP 通知渠道中开启「整理入库」和「手动处理」。首次等待走整理入库，暂停走手动处理；中间重试不重复推送。成功及最终整理失败沿用 MP 原生通知。",
                   **{"class": "text-body-2 mt-3"}),
@@ -110,26 +112,38 @@ def config_form(tasks, error=""):
         field("VTextarea", "extensions", "接管的视频后缀", "例如 mkv,mp4,iso，不加点号；未列出的格式走 MP 原流程。",
               rows=2, **{"auto-grow": True, "spellcheck": False}),
     ])
-    operations = disclosure("单个任务操作", [
-            paragraph("可直接在「查看数据」中操作；也可在这里选择，保存时执行。",
+    operations = disclosure("批量任务操作", [
+            paragraph("选择多个任务，统一执行操作；强制上传会依次排队。",
                       **{"class": "text-body-2 mb-4"}),
             node("VRow", content=[
-                col([field("VSelect", "task_id", "选择需要操作的文件",
-                           "正在执行的任务暂不能操作，请等本轮结束。" if choices else "暂无可操作任务。启用插件后照常发起整理即可。",
+                col([field("VAutocomplete", "task_ids", "选择任务（可多选、可搜索）",
+                           "执行中的任务不可选；状态不支持的任务会跳过。" if choices else "暂无可操作任务。启用插件后照常发起整理即可。",
                            items=choices, **{"item-title": "title", "item-value": "value",
+                                            "multiple": True, "chips": True, "closable-chips": True,
                                             "clearable": True, "disabled": not choices})], sm=8),
-                col([field("VSelect", "action", "对这个任务做什么", ACTION_HINT,
+                col([field("VSelect", "action", "统一执行", "继续等待仅适用于已暂停任务。",
                            items=[{"title": "强制上传（未秒传就上传）", "value": "upload"},
                                   {"title": "暂停自动重试", "value": "pause"},
                                   {"title": "继续等待秒传", "value": "resume"},
                                   {"title": "取消等待", "value": "cancel"}],
-                           **{"disabled": "{{ !task_id }}"})], sm=4),
+                           **{"disabled": "{{ !task_ids || !task_ids.length }}"})], sm=4),
             ]),
-            node("VCheckbox", model="apply_action", label="保存时执行所选操作（仅一次）",
+            paragraph(ACTION_HINT, **{"class": "text-body-2 mt-3"}),
+            node("VCheckbox", model="apply_action", label="保存时对所选任务执行一次",
                  **{"color": "primary", "class": "mt-3", "hide-details": True,
-                    "disabled": "{{ !enabled || !task_id }}"}),
-            paragraph("需启用插件并勾选才会执行，执行后自动取消勾选。"),
+                    "disabled": "{{ !enabled || !task_ids || !task_ids.length }}"}),
+            paragraph("执行后清空选择；重新打开配置可查看结果。"),
     ])
+    if batch_result:
+        actions = {"upload": "强制上传", "resume": "继续等待秒传", "pause": "暂停重试", "cancel": "取消等待"}
+        summary = (f"上次{actions.get(batch_result['action'], '批量操作')}：已接受 {batch_result['accepted']} · "
+                   f"跳过 {batch_result['skipped']} · 异常 {batch_result['failed']}")
+        result_details = [paragraph(batch_result["at"] + " · 已接受表示操作已提交，不代表文件已上传完成。",
+                                    **{"class": "text-body-2 mb-3"})]
+        for item in batch_result["items"]:
+            result_details.append(paragraph(f"{item['name']}：{item['message']}",
+                **{"class": "text-body-2 mb-2", "style": "overflow-wrap:anywhere;line-height:1.65"}))
+        operations["content"][1]["content"].insert(0, disclosure(summary, result_details))
     content = [intro]
     if error:
         content.append(node("VAlert", error, type="error", variant="tonal", **{"class": "mb-4"}))

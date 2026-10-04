@@ -179,6 +179,113 @@ class MoviePilotTests(unittest.TestCase):
         self.engine.restore()
         self.assertEqual(plugin.chain.post_message.call_count, 2)
 
+    def test_batch_upload_deduplicates_and_skips_running_missing_and_finished_tasks(self):
+        tasks = [self.enroll(name=f"Batch{i}.mkv") for i in range(4)]
+        rows = [self.engine.store.active_for(self.h.bridge.source_key(t.fileitem)) for t in tasks]
+        self.engine.store.update(rows[1]["id"], state="running")
+        self.engine.store.update(rows[2]["id"], state="completed")
+        self.engine.control(rows[3]["id"], "pause")
+        keys = [r["id"] for r in rows] + [rows[0]["id"], "missing"]
+        result = self.engine.control_many(keys, "upload")
+        self.assertEqual((result["accepted"], result["skipped"], result["failed"]), (2, 3, 0))
+        self.assertEqual(len(result["items"]), 5)
+        self.assertEqual(self.engine.store.get(rows[1]["id"])["state"], "running")
+        self.assertEqual(self.engine.store.get(rows[2]["id"])["state"], "completed")
+        self.assertEqual(self.api.uploads, 0)
+        self.assertEqual(self.engine.store.claim(manual=True)["id"], rows[0]["id"])
+        self.assertEqual(self.engine.store.claim(manual=True)["id"], rows[3]["id"])
+        self.assertIsNone(self.engine.store.claim(manual=True))
+
+    def test_batch_resume_only_resets_paused_tasks_and_keeps_original_history(self):
+        tasks = [self.enroll(name=f"Resume{i}.mkv") for i in range(2)]
+        rows = [self.engine.store.active_for(self.h.bridge.source_key(t.fileitem)) for t in tasks]
+        self.engine.control(rows[0]["id"], "pause")
+        result = self.engine.control_many([r["id"] for r in rows], "resume")
+        self.assertEqual((result["accepted"], result["skipped"]), (1, 1))
+        current = self.engine.store.get(rows[0]["id"])
+        self.assertEqual(current["payload"]["auto_attempts"], 0)
+        self.assertEqual(current["history_id"], rows[0]["history_id"])
+        self.assertFalse(self.h.Oper().get(current["history_id"]).status)
+
+    def test_batch_isolates_unexpected_failure_and_validates_before_any_mutation(self):
+        self.enroll()
+        key = self.engine.store.all()[0]["id"]
+        with patch.object(self.engine, "control", wraps=self.engine.control) as control:
+            for keys, action in (([], "upload"), ("not-a-list", "upload"), ([key, None], "upload"),
+                                 ([key] * 201, "upload"), ([key], "invalid")):
+                with self.assertRaises(ValueError):
+                    self.engine.control_many(keys, action)
+            control.assert_not_called()
+        original_get = self.engine.store.get
+        def broken_get(task_id):
+            if task_id == "broken":
+                raise RuntimeError("private data")
+            return original_get(task_id)
+        with patch.object(self.engine.store, "get", side_effect=broken_get):
+            result = self.engine.control_many(["broken", key], "pause")
+        self.assertEqual((result["accepted"], result["failed"]), (1, 1))
+        self.assertNotIn("private data", str(result))
+        self.assertEqual(self.engine.store.get(key)["state"], "paused")
+
+    def test_batch_cancel_preserves_sources_and_failed_history(self):
+        tasks = [self.enroll(name=f"Cancel{i}.mkv") for i in range(2)]
+        rows = [self.engine.store.active_for(self.h.bridge.source_key(t.fileitem)) for t in tasks]
+        result = self.engine.control_many([r["id"] for r in rows], "cancel")
+        self.assertEqual(result["accepted"], 2)
+        for task, row in zip(tasks, rows):
+            self.assertTrue(Path(task.fileitem.path).exists())
+            self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+            self.assertEqual(self.engine.store.get(row["id"])["state"], "cancelled")
+
+    def test_install_applies_batch_before_worker_start(self):
+        self.enroll()
+        key = self.engine.store.all()[0]["id"]
+        self.engine.stop()
+        engine = self.h.bridge.InstantWaitEngine(self.root / "plugin", self.engine.config)
+        observed = []
+        with patch.object(threading.Thread, "start", lambda _: observed.append(engine.store.get(key)["state"])):
+            engine.install(before_start=lambda: engine.control_many([key], "upload"))
+        self.engine = engine
+        self.assertEqual(observed, ["upload_queued", "upload_queued"])
+
+    def test_saved_batch_is_consumed_once_and_old_single_selection_still_works(self):
+        import sys
+        import types
+        self.enroll()
+        key = self.engine.store.all()[0]["id"]
+        plugin = self.attach_plugin_notifier()
+        plugin.get_data_path = Mock(return_value=self.root / "plugin")
+        plugin.update_config = Mock(return_value=True)
+        plugin.save_data = Mock()
+        fake = Mock()
+        fake.control_many.side_effect = self.engine.control_many
+        fake.install.side_effect = lambda before_start=None: before_start() if before_start else None
+        version = types.ModuleType("version")
+        version.APP_VERSION = "v2.15.6"
+        with patch.dict(sys.modules, {"version": version}), \
+                patch.dict(plugin.init_plugin.__globals__, {"InstantWaitEngine": Mock(return_value=fake)}):
+            plugin.init_plugin({"enabled": True, "task_ids": [key, key], "action": "upload", "apply_action": True})
+            saved = dict(plugin.update_config.call_args.args[0])
+            self.assertFalse(saved["apply_action"])
+            self.assertEqual(saved["task_ids"], [])
+            self.assertEqual(saved["task_id"], "")
+            self.assertEqual(self.engine.store.get(key)["state"], "upload_queued")
+            plugin.init_plugin(saved)
+            self.assertEqual(fake.control_many.call_count, 1)
+            plugin.init_plugin({"enabled": True, "task_id": key, "action": "pause", "apply_action": True})
+            self.assertEqual(self.engine.store.get(key)["state"], "paused")
+            plugin.init_plugin({"enabled": True, "task_ids": [], "task_id": key, "action": "upload", "apply_action": True})
+            self.assertEqual(self.engine.store.get(key)["state"], "paused")
+            self.assertIn("请选择", plugin._error)
+
+    def test_batch_not_run_if_one_shot_marker_cannot_be_saved(self):
+        plugin = self.attach_plugin_notifier()
+        plugin.update_config = Mock(return_value=False)
+        with patch.dict(plugin.init_plugin.__globals__, {"InstantWaitEngine": Mock()}) as namespace:
+            plugin.init_plugin({"enabled": True, "task_ids": ["some-task"], "action": "upload", "apply_action": True})
+            namespace["InstantWaitEngine"].assert_not_called()
+        self.assertIn("本次未执行", plugin._error)
+
     def test_notification_toggle_suppresses_both_local_and_push_messages(self):
         plugin = self.attach_plugin_notifier()
         plugin._config["notify"] = False

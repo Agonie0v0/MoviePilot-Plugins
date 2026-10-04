@@ -20,6 +20,7 @@ DEFAULTS = {
     "max_retries": 3,
     "notify": True,
     "task_id": "",
+    "task_ids": [],
     "action": "pause",
     "apply_action": False,
 }
@@ -29,7 +30,7 @@ class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理限次等待秒传，支持手动强制上传并更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.2.2"
+    plugin_version = "0.2.3"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -46,9 +47,21 @@ class P115InstantWait(_PluginBase):
         self.stop_service()
         self._config = {**DEFAULTS, **(config or {})}
         self._error = ""
-        if not self._config["enabled"]:
-            return
+        apply_action = self._config["apply_action"]
+        # Accept an old single-task form, but an explicitly empty new selection
+        # must not fall back to a stale task_id from a previous version.
+        selected = self._config["task_ids"] if "task_ids" in (config or {}) else ([self._config["task_id"]] if self._config["task_id"] else [])
         try:
+            if apply_action:
+                # Consume the one-shot request before mutating any task. A
+                # restart must never repeat uploads/cancels from saved config.
+                self._config.update(apply_action=False, task_ids=[], task_id="")
+                if not self.update_config(self._config):
+                    raise ValueError("无法保存一次性操作标记，本次未执行，请重试保存")
+            if not self._config["enabled"]:
+                if apply_action:
+                    raise ValueError("请先启用插件，再执行批量操作")
+                return
             from version import APP_VERSION
             if APP_VERSION != "v2.15.6":
                 raise ValueError(f"当前支持 V2.15.6，检测到 {APP_VERSION}；需先验证版本兼容性")
@@ -65,18 +78,26 @@ class P115InstantWait(_PluginBase):
                 raise ValueError("请配置需要接管的文件扩展名")
             runtime = {**self._config, "max_wait_hours": hours, "max_retries": int(retries), "retry_delays": delays}
             engine = InstantWaitEngine(self.get_data_path(), runtime, self._notify)
-            engine.install()
+            engine.install(before_start=(lambda: self._apply_actions(engine, selected, self._config["action"])) if apply_action else None)
             self._engine = engine
-            if self._config["apply_action"]:
-                engine.control(self._config["task_id"], self._config["action"])
         except Exception as exc:
             self._error = str(exc)
             logger.error(f"【115秒传等待】{self._error}")
             self.systemmessage.put(f"115秒传等待：{self._error}")
-        finally:
-            if self._config["apply_action"]:
-                self._config["apply_action"] = False
-                self.update_config(self._config)
+
+    def _apply_actions(self, engine, selected, action):
+        try:
+            result = engine.control_many(selected, action)
+        except ValueError as exc:
+            self._error = str(exc)
+            logger.warning(f"【115秒传等待】批量操作未执行：{self._error}")
+            return
+        try:
+            self.save_data("last_batch_result", result)
+            self.systemmessage.put(f"115秒传等待批量操作：已接受 {result['accepted']}，跳过 {result['skipped']}，异常 {result['failed']}。详情见配置页「批量任务操作」。")
+        except Exception:
+            self._error = "批量操作已处理，但结果提示保存失败，请查看任务状态与日志"
+            logger.warning(f"【115秒传等待】{self._error}")
 
     def _notify(self, title, text, manual=True):
         if not self._config["notify"]:
@@ -134,7 +155,7 @@ class P115InstantWait(_PluginBase):
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
     def get_form(self):
-        return config_form(self.list_tasks(), self._error), dict(DEFAULTS)
+        return config_form(self.list_tasks(), self._error, self.get_data("last_batch_result")), {**DEFAULTS, "task_ids": []}
 
     def get_page(self):
         return task_page(self.list_tasks(), self.get_state(), self._error,

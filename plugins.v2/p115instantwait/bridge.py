@@ -147,7 +147,7 @@ class InstantWaitEngine:
         setattr(cls, name, method)
         return original
 
-    def install(self):
+    def install(self, before_start=None):
         required = ("_TransferChain__handle_transfer", "_TransferChain__default_callback",
                     "_TransferChain__finish_scrape_batch_task", "_TransferChain__register_scrape_batch_task",
                     "_TransferChain__close_scrape_batch", "_TransferChain__record_scrape_target", "transfer")
@@ -281,6 +281,9 @@ class InstantWaitEngine:
             self.patch(TransferChain, "_TransferChain__finish_scrape_batch_task", wrapped_finish)
             self.patch(TransferHistoryOper, "add_force", wrapped_add_force)
             self.restore()
+            # Apply explicitly selected commands before workers can claim them.
+            if before_start:
+                before_start()
             self.worker = threading.Thread(target=self.run, name="p115-instant-wait", daemon=True)
             self.worker.start()
             self.upload_worker = threading.Thread(target=self.run, kwargs={"manual": True},
@@ -593,6 +596,34 @@ class InstantWaitEngine:
         self.original_finish_batch(self.chain, task)
         self.chain.jobview.try_remove_job(task)
         self.live_tasks.pop(row["id"], None)
+
+    def control_many(self, keys, action):
+        if action not in ("pause", "resume", "cancel", "upload"):
+            raise ValueError("不支持此操作")
+        if not isinstance(keys, list) or not keys or len(keys) > 200 or any(not isinstance(k, str) or not k for k in keys):
+            raise ValueError("请选择 1～200 个任务")
+        keys = list(dict.fromkeys(keys))
+        result = {"action": action, "at": log_time(time.time()), "accepted": 0, "skipped": 0, "failed": 0, "items": []}
+        for key in keys:
+            item = {"id": key, "name": key}
+            try:
+                row = self.store.get(key)
+                source = row["payload"].get("task", {}).get("fileitem", {}).get("path", "") if row else ""
+                item["name"] = PurePosixPath(str(source).replace("\\", "/")).name or key
+                updated = self.control(key, action)
+                item.update(status="accepted", message=updated["message"])
+            except (KeyError, ValueError) as exc:
+                item.update(status="skipped", message="任务不存在" if isinstance(exc, KeyError) else str(exc))
+            except Exception:
+                # A command may already have reached SQLite before an MP side
+                # effect failed. Do not replay it or claim it was rolled back.
+                item.update(status="failed", message="处理异常，请查看任务当前状态与日志")
+            result[item["status"]] += 1
+            result["items"].append(item)
+            if item["status"] != "accepted":
+                logger.warning(f"【115秒传等待】批量操作未完成 | 任务={log_text(key)} | 原因={log_text(item['message'])}")
+        logger.info(f"【115秒传等待】批量操作完成 | 操作={action} | 已接受={result['accepted']} | 跳过={result['skipped']} | 异常={result['failed']}")
+        return result
 
     def control(self, key, action):
         row = self.store.command(key, action)
