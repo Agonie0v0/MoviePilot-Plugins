@@ -53,7 +53,7 @@
     "name": "115秒传等待",
     "description": "V3 内置115等待秒传，独立上传队列，成功回写原整理记录",
     "labels": "云盘,整理",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "release": false,
     "icon": "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png",
     "author": "Agonie",
@@ -62,6 +62,7 @@
     "system_version": ">=3.1.0,<3.2.0",
     "level": 1,
     "history": {
+      "v1.0.1": "记录页增加入队与完成/更新时间，最新结果显示失败原因并区分强制上传成功和触发秒传成功",
       "v1.0.0": "V3.1 专用持久计划适配：后台秒传/强制上传、原历史 ID 回写、原生步骤重放与备份、上限策略和批量操作；V2 遗留等待任务保留暂停"
     }
   }

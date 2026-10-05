@@ -223,7 +223,15 @@ def test_api_response_models_preserve_bare_json(h, task):
     for route in plugin.get_api():
         app.add_api_route(route["path"], route["endpoint"], methods=route["methods"], response_model=route["response_model"])
     client = TestClient(app)
-    assert client.get("/tasks").json()[0]["history_id"] == row["history_id"]
+    record = client.get("/tasks").json()[0]
+    assert record["history_id"] == row["history_id"]
+    assert record["created"] == row["created"] and record["updated"] == row["updated"]
+    assert record["transfer_method"] == "unknown" and record["result_message"]
+    data = row["payload"]
+    data["instant_confirmed"] = True
+    h.engine.store.update(row["id"], state="completed", payload=data)
+    assert "触发秒传成功" in client.get("/tasks").json()[0]["result_message"]
+    h.engine.store.update(row["id"], state="waiting")
     assert client.post(f"/tasks/{row['id']}/upload").json() == {"success": True, "state": "upload_queued"}
 
 

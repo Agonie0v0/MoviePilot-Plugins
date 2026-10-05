@@ -9,6 +9,7 @@ from app.schemas import NotificationType
 
 from .bridge import InstantWaitEngine
 from .store import QueueStore
+from .records import task_record
 from .ui import config_form, task_page
 
 
@@ -31,7 +32,7 @@ class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "0.2.4"
+    plugin_version = "0.2.5"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -134,15 +135,7 @@ class P115InstantWait(_PluginBase):
         return self._engine.store if self._engine else QueueStore(Path(self.get_data_path()) / "queue.db")
 
     def list_tasks(self):
-        result = []
-        for row in self.queue().all():
-            task = row["payload"]["task"]
-            result.append({"id": row["id"], "history_id": row["history_id"],
-                "source": task["fileitem"]["path"], "target": row["payload"]["final_path"],
-                "state": row["state"], "attempts": row["attempts"], "next_at": row["next_at"],
-                "auto_attempts": row["payload"].get("auto_attempts", row["attempts"]),
-                "message": row["message"], "backup_files": row["payload"].get("backups", [])})
-        return result
+        return [task_record(row) for row in self.queue().all()]
 
     def control_task(self, task_id: str, action: str):
         if not self.get_state():

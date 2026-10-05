@@ -3,6 +3,8 @@ from datetime import datetime
 from pathlib import PurePosixPath
 import time
 
+from .records import latest_result
+
 
 LABELS = {"queued": "等待首次秒传", "waiting": "等待重试", "running": "正在执行",
           "paused": "已暂停 · 待处理", "completed": "整理成功", "failed": "整理失败", "cancelled": "已取消",
@@ -202,6 +204,15 @@ def schedule_summary(task, enabled, now):
     return "下次重试 · MP 时间", datetime.fromtimestamp(next_at).strftime("%m-%d %H:%M:%S"), "primary"
 
 
+def record_time(value):
+    if value is None:
+        return "未记录"
+    try:
+        return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "未记录"
+
+
 def task_button(task, action, label):
     button = node("VBtn", label, variant="tonal" if action == "upload" else "outlined",
                   **{"size": "small", "style": "min-height:40px"})
@@ -216,7 +227,7 @@ def task_page(tasks, enabled, error="", max_retries=None):
         node("div", "整理任务", **{"class": "text-h6 font-weight-bold"}),
         node("VChip", "运行中" if enabled else "插件已关闭", size="small", variant="tonal"),
     ], **{"class": "d-flex align-center justify-space-between ga-2 mb-2"}),
-        paragraph(f"最近 {len(tasks)} 条 · {active} 条未结束。展开任务可操作，路径默认收起。" if tasks else
+        paragraph(f"最近 {len(tasks)} 条 · {active} 条未结束。展开任务可操作，路径默认收起。时间按 MP 所在时区显示。" if tasks else
                   "启用插件后，在 MP 发起本地 → 内置 115 的视频整理，任务会出现在这里。",
                   **{"class": "text-body-2 mb-4"})]
     if tasks:
@@ -250,10 +261,15 @@ def task_page(tasks, enabled, error="", max_retries=None):
                     node("VCol", content=[paragraph(next_label, **{"class": "text-caption mb-1"}),
                         node("div", next_value, **{"style": tone_style(next_tone) + "font-size:20px;font-weight:700;line-height:1.4;font-variant-numeric:tabular-nums;overflow-wrap:anywhere"})], cols=12, sm=6),
                 ], **{"class": "mt-1"}),
+                node("div", content=[
+                    paragraph("入队时间：" + record_time(task.get("created")), **{"class": "text-caption"}),
+                    paragraph(("完成时间：" if status == "completed" else "结束时间：" if status in ("failed", "cancelled") else "更新时间：") +
+                              record_time(task.get("updated")), **{"class": "text-caption"}),
+                ], **{"class": "d-flex flex-wrap mt-3", "style": "gap:4px 24px;font-variant-numeric:tabular-nums"}),
             ], **{"style": "min-width:0;flex:1"}),
         ], **{"class": "ga-3 align-start py-4"})
         details = [node("div", content=[paragraph("最新结果", **{"class": "text-caption mb-1"}),
-            paragraph(task["message"] or ("等待首次执行" if status == "queued" else LABELS.get(status, status)),
+            paragraph(latest_result(task),
                       **{"style": INK + "line-height:1.65;overflow-wrap:anywhere"})],
             **{"class": "pa-3 rounded mb-3", "style": f"background:rgba(var(--v-theme-{TONES.get(status, ('secondary', ''))[0]}),.08)"})]
         if status in ("queued", "waiting", "paused", "upload_queued") and enabled:

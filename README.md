@@ -14,7 +14,7 @@ MoviePilot 会按系统版本读取 `package.v2.json` 或 `package.v3.json`，�
 
 | 插件 | V2 版本 | V3 版本 | V3 支持范围 |
 | --- | --- | --- | --- |
-| 115秒传等待 | 0.2.4 | 1.0.0 测试版 | 3.1.x |
+| 115秒传等待 | 0.2.5 | 1.0.1 测试版 | 3.1.x |
 | 阡陌居签到 | 1.2.7 | 2.0.0 | >=3.1.0,<4.0.0 |
 | Emby智能入库删种 | 原版本保留 | 2.0.0 | >=3.1.0,<4.0.0 |
 
@@ -35,7 +35,7 @@ icons/                 # 插件图标资源
 
 各插件的功能、配置项和使用限制请查看对应插件目录中的 README。仓库版本以对应的 `package*.json` 索引为准。
 
-[115秒传等待](plugins.v2/p115instantwait/README.md)：适配 MoviePilot V2.15.6 内置 115，限次等待秒传，达到次数或时间上限后可自动强制上传或待人工处理，成功后更新原整理记录。当前为 0.2.4 测试版。
+[115秒传等待](plugins.v2/p115instantwait/README.md)：适配 MoviePilot V2.15.6 内置 115，限次等待秒传，达到次数或时间上限后可自动强制上传或待人工处理，成功后更新原整理记录。当前为 0.2.5 测试版。
 
 V3 使用说明：[115秒传等待](plugins.v3/p115instantwait/README.md)、[阡陌居签到](plugins.v3/qmjsign/README.md)、[Emby智能入库删种](plugins.v3/autocleanunlinkedseed/README.md)。
 
