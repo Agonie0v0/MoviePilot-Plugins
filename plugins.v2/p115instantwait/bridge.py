@@ -22,6 +22,7 @@ from app.schemas.types import MediaType
 from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, PreparedStorage,
                      RetryLater, fingerprint, hash_file)
 from .store import QueueStore
+from .maintenance import StagingMaintenance
 
 
 WAIT_MESSAGE = "等待秒传，将自动重试（115 秒传等待插件）"
@@ -97,6 +98,8 @@ class InstantWaitEngine:
         self.worker = None
         self.upload_worker = None
         self.upload_wake = threading.Event()
+        self.maintenance = StagingMaintenance(self.store, lambda: OpenAPI(U115Pan(), FileItem, self.stop_event),
+                                              self.stop_event, logger)
         self.extensions = {ext.strip().lower().lstrip(".") for ext in config["extensions"].split(",") if ext.strip()}
 
     def log_task(self, row, event, level="info", **details):
@@ -316,7 +319,7 @@ class InstantWaitEngine:
         self.wake.set()
         self.upload_wake.set()
         deadline = time.monotonic() + 35
-        for worker in (self.worker, self.upload_worker):
+        for worker in (self.worker, self.upload_worker, self.maintenance.worker):
             if worker and worker.ident is not None:
                 worker.join(timeout=max(0, deadline - time.monotonic()))
             if worker and worker.is_alive():
@@ -434,7 +437,7 @@ class InstantWaitEngine:
                 if not visible or str(visible.get("file_id")) != str(payload["remote_id"]):
                     raise PauseTask("已上传的目标文件被删除或替换，请人工核对")
                 api.verify(payload["remote_id"], info.target_item.path, payload["hashes"])
-                self.complete(row, task, info)
+                self.complete(row, task, info, api)
                 return
             limit = self.config["max_wait_hours"] * 3600
             expired = limit and time.time() >= payload.get("wait_since", row["created"]) + limit
@@ -460,7 +463,8 @@ class InstantWaitEngine:
             api = OpenAPI(U115Pan(), FileItem, self.stop_event)
             final = PurePosixPath(payload["final_path"])
             stage_path = final.parent / ".mp115-staging" / key / final.name
-            stage_dir = api.get_folder(stage_path.parent)
+            with self.maintenance.lock:
+                stage_dir = api.get_folder(stage_path.parent)
             file_id = payload.get("remote_id")
             if not file_id:
                 # Reconcile an init response lost after a successful server-side commit.
@@ -521,7 +525,7 @@ class InstantWaitEngine:
             payload = self.store.get(key)["payload"]
             payload["result"] = info.model_dump(mode="json")
             self.store.update(key, payload=payload)
-            self.complete(self.store.get(key), task, info)
+            self.complete(self.store.get(key), task, info, api)
         except PauseTask as exc:
             self.defer(row, "paused", str(exc))
         except NotInstant as exc:
@@ -581,7 +585,7 @@ class InstantWaitEngine:
         elif state == "waiting" and previous_state != "waiting" and saved["payload"].get("auto_attempts", saved["attempts"]) == 1:
             self.notify_task(saved, manual=False)
 
-    def complete(self, row, task, info):
+    def complete(self, row, task, info, api):
         key = row["id"]
         # The native callback can delete torrents and their data in move mode.
         # Check before entering it, including when recovering a saved result.
@@ -616,6 +620,7 @@ class InstantWaitEngine:
         self.chain.jobview.try_remove_job(task)
         self.live_tasks.pop(key, None)
         self.log_task(self.store.get(key), "整理成功", 结果="原整理记录已更新成功")
+        self.maintenance.cleanup_completed(row, api)
 
     def finish_failure(self, row, task, info):
         self.context.history_job = row["id"]

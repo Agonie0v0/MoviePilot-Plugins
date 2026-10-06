@@ -56,7 +56,7 @@ def filename(path):
     return PurePosixPath(str(path).replace("\\", "/")).name
 
 
-def config_form(tasks, error="", batch_result=None):
+def config_form(tasks, error="", batch_result=None, history_result=None, staging_result=None):
     choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}"
                          f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
                 "props": {"disabled": t["state"] in ("running", "uploading", "finalizing")}}
@@ -152,10 +152,59 @@ def config_form(tasks, error="", batch_result=None):
             result_details.append(paragraph(f"{item['name']}：{item['message']}",
                 **{"class": "text-body-2 mb-2", "style": "overflow-wrap:anywhere;line-height:1.65"}))
         operations["content"][1]["content"].insert(0, disclosure(summary, result_details))
+    history_choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])} · {record_time(t.get('updated'))}",
+                        "value": t["id"]} for t in tasks if t["state"] in ("completed", "failed", "cancelled")]
+    maintenance = disclosure("历史清理", [
+        node("div", "115 空暂存目录", **{"class": "text-subtitle-1 font-weight-bold mb-2"}),
+        paragraph("成功任务会自动清理空暂存目录。补清理历史残留时，只检查插件记录过的位置和下方补充的路径。"),
+        field("VTextarea", "staging_extra_paths", "补充旧暂存目录（可选）",
+              "每行一个完整路径，例如 /电影/.mp115-staging。无需填写仍有记录的目录，不会扫描整个网盘。",
+              rows=2, **{"auto-grow": True, "spellcheck": False, "class": "mt-3"}),
+        node("VCheckbox", model="cleanup_staging", label="保存时清理一次历史空暂存目录",
+             **{"color": "primary", "hide-details": True, "disabled": "{{ !enabled }}", "class": "mt-2"}),
+        paragraph("需启用插件；后台执行，重新打开配置查看结果。有内容、正在使用的目录和 .mp115-backups 均保留。"),
+        node("VDivider", **{"class": "my-5"}),
+        node("div", "插件已结束记录", **{"class": "text-subtitle-1 font-weight-bold mb-2"}),
+        paragraph("仅移除插件列表中的记录，保留 MoviePilot 整理历史、本地文件及网盘文件。未完成任务，以及同批次恢复仍需要的成功记录会跳过。"),
+        node("div", content=[field("VSelect", "history_mode", "选择方式", "仅按当前选择方式清理。",
+            items=[{"title": "指定记录", "value": "selected"}, {"title": "按状态和保留天数", "value": "filtered"}])],
+            **{"class": "mt-4", "style": "width:280px;max-width:100%"}),
+        field("VAutocomplete", "history_ids", "选择已结束记录（可搜索、多选）",
+              "列出最近 200 条任务中的已结束记录；更早记录可按条件清理。" if history_choices else "最近任务中暂无已结束记录。",
+              items=history_choices, **{"item-title": "title", "item-value": "value", "multiple": True,
+                  "chips": True, "closable-chips": True, "clearable": True, "class": "mt-4",
+                  "disabled": "{{ history_mode !== 'selected' }}" if history_choices else True}),
+        node("div", content=[
+            node("div", content=[field("VSelect", "history_states", "清理状态", "只匹配勾选的结束状态。",
+                items=[{"title": "整理成功", "value": "completed"}, {"title": "整理失败", "value": "failed"},
+                       {"title": "已取消", "value": "cancelled"}], multiple=True, chips=True,
+                **{"disabled": "{{ history_mode !== 'filtered' }}"})],
+                **{"style": "flex:0 1 320px;min-width:0;max-width:100%"}),
+            node("div", content=[field("VTextField", "history_days", "保留最近", "按结束时间计算；0 清理全部匹配记录。",
+                type="number", suffix="天", min=0, max=36500, step=1,
+                **{"disabled": "{{ history_mode !== 'filtered' }}"})],
+                **{"style": "flex:0 1 180px;min-width:0;max-width:100%"}),
+        ], **{"class": "d-flex flex-wrap ga-4 mt-4"}),
+        node("VCheckbox", model="cleanup_history", label="保存时删除一次所选插件记录（不可撤销）",
+             **{"color": "warning", "hide-details": True, "class": "mt-3",
+                "disabled": "{{ history_mode === 'selected' ? (!history_ids || !history_ids.length) : (!history_states || !history_states.length) }}"}),
+        paragraph("插件关闭时也可清理记录。两个清理选项执行一次后自动取消勾选；目录位置会继续保留，便于日后补清理。"),
+    ])
+    for result in (staging_result, history_result):
+        if not result:
+            continue
+        if result.get("kind") == "history":
+            summary = f"上次记录清理（{'未完成' if result.get('status') == 'failed' else '已结束'}）：已删除 {result.get('deleted', 0)} · 跳过 {result.get('skipped', 0)}"
+        else:
+            status = {"running": "执行中", "completed": "已结束", "stopped": "已停止", "failed": "异常中断"}.get(result.get("status"), "待核对")
+            summary = (f"上次空目录清理（{status}）：已删除 {result.get('deleted', 0)} · 保留 {result.get('retained', 0)}"
+                       f" · 已不存在 {result.get('missing', 0)} · 异常 {result.get('failed', 0)}")
+        details = [paragraph(result.get("at", ""))] + [paragraph(item, **{"style": "overflow-wrap:anywhere;line-height:1.65"}) for item in result.get("items", [])]
+        maintenance["content"][1]["content"].insert(0, disclosure(summary, details))
     content = [intro]
     if error:
         content.append(node("VAlert", error, type="error", variant="tonal", **{"class": "mb-4"}))
-    content.extend([strategy, help_section, scope, operations])
+    content.extend([strategy, help_section, scope, operations, maintenance])
     return [node("VForm", content=content, **{"style": INK})]
 
 

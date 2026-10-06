@@ -20,6 +20,7 @@ from app.sdk.logging import logger
 
 from .remote import NotInstant, OpenAPI, PauseTask, PreparedStorage, RetryLater, fingerprint, hash_file
 from .store import QueueStore
+from .maintenance import StagingMaintenance
 
 
 WAIT_MESSAGE = "等待秒传，由115秒传等待插件后台处理"
@@ -54,6 +55,8 @@ class InstantWaitEngine:
         self.context = threading.local()
         self.native_lock = threading.Condition()
         self.native_active = 0
+        self.maintenance = StagingMaintenance(self.store, lambda: OpenAPI(U115Pan(), FileItem, self.stop_event),
+                                              self.stop_event, logger)
         self.extensions = {e.strip().lower().lstrip(".") for e in config["extensions"].split(",") if e.strip()}
 
     def log_task(self, row, event, level="info", **details):
@@ -148,6 +151,7 @@ class InstantWaitEngine:
                     engine.log_task(engine.store.get(row["id"]), "整理成功")
                     engine.original_finish(chain, task)
                     engine.live_tasks.pop(row["id"], None)
+                    engine.maintenance.cleanup_completed(row)
                 elif row["payload"].get("prepared"):
                     engine.defer(row, "paused", info.message or "V3 完成整理失败，请人工核对")
             return result
@@ -302,6 +306,7 @@ class InstantWaitEngine:
                        else self.chain.transfer_history_repository.get_by_transfer_task_id(task_id=data["native_task_id"]))
             if history and history.status and row["history_id"] == history.id:
                 self.store.update(row["id"], state="completed", history_id=history.id, message="已恢复 V3 成功整理记录")
+                self.maintenance.cleanup_completed(row)
             elif history and history.transfer_task_id == data["native_task_id"]:
                 next_at = row["next_at"]
                 if self.config["max_wait_hours"] and row["state"] in ("queued", "waiting"):
@@ -353,7 +358,8 @@ class InstantWaitEngine:
             final = PurePosixPath(data["final_path"])
             stage = final.parent / ".mp115-staging" / key / final.name
             data["stage_path"] = str(stage)
-            folder = api.get_folder(stage.parent)
+            with self.maintenance.lock:
+                folder = api.get_folder(stage.parent)
             existing = api.raw_path(stage)
             file_id = data.get("remote_id") or (existing.get("file_id") if existing else None)
             if not file_id:
@@ -412,6 +418,7 @@ class InstantWaitEngine:
                 task = self.live_tasks.pop(row["id"], None)
                 if task:
                     self.original_finish(self.chain, task)
+                self.maintenance.cleanup_completed(row)
             elif not history or history.transfer_task_id != row["payload"]["native_task_id"]:
                 self.defer(row, "paused", "原 V3 持久任务或历史关联已变化")
             else:
@@ -496,8 +503,8 @@ class InstantWaitEngine:
         self.wake.set()
         self.upload_wake.set()
         deadline = time.monotonic() + 35
-        for worker in (self.worker, self.upload_worker):
-            if worker:
+        for worker in (self.worker, self.upload_worker, self.maintenance.worker):
+            if worker and worker.ident is not None:
                 worker.join(max(0, deadline - time.monotonic()))
                 if worker.is_alive():
                     raise RuntimeError("后台上传仍在结束，暂不能重新初始化插件")

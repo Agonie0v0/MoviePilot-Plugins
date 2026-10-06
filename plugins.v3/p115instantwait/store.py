@@ -6,6 +6,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .maintenance import staging_root
+
 
 TERMINAL = ("completed", "cancelled", "failed")
 
@@ -22,6 +24,7 @@ class QueueStore:
                 next_at REAL NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
                 history_id INTEGER, message TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL
             )""")
+            db.execute("CREATE TABLE IF NOT EXISTS staging_roots (path TEXT PRIMARY KEY)")
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS active_source ON jobs(source)
                 WHERE state NOT IN ('completed', 'cancelled', 'failed')""")
 
@@ -72,6 +75,75 @@ class QueueStore:
             where = "WHERE state NOT IN ('completed','cancelled','failed')" if active else ""
             return [self.decode(row) for row in db.execute(
                 f"SELECT * FROM jobs {where} ORDER BY created DESC LIMIT ?", (limit,))]
+
+    def staging_roots(self, extra=()):
+        """Keep locations after history removal; never crawl arbitrary library trees."""
+        with self.connect() as db:
+            roots = set(extra)
+            for row in db.execute("SELECT payload FROM jobs"):
+                payload = json.loads(row["payload"])
+                if payload.get("final_path"):
+                    roots.add(staging_root(payload["final_path"]))
+            db.executemany("INSERT OR IGNORE INTO staging_roots(path) VALUES(?)", ((p,) for p in roots))
+            return [row["path"] for row in db.execute("SELECT path FROM staging_roots ORDER BY path")]
+
+    def staging_in_use(self, root, key=None):
+        with self.connect() as db:
+            for row in db.execute("SELECT id,payload FROM jobs WHERE state NOT IN ('completed','cancelled','failed')"):
+                if key is not None and row["id"] != key:
+                    continue
+                payload = json.loads(row["payload"])
+                if staging_root(payload["final_path"]) == str(root):
+                    return True
+        return False
+
+    def clear_history(self, *, mode="selected", keys=None, states=None, days=30, now=None):
+        """Call while the engine is stopped. Leave active batch recovery peers intact."""
+        if mode not in ("selected", "filtered"):
+            raise ValueError("请选择指定记录或按条件清理")
+        if mode == "selected":
+            if not isinstance(keys, list) or not keys or len(keys) > 200 or any(not isinstance(k, str) or not k for k in keys):
+                raise ValueError("请选择 1～200 条已结束记录")
+            keys = set(keys)
+        else:
+            if not isinstance(states, list) or not states or any(s not in TERMINAL for s in states):
+                raise ValueError("请选择成功、失败或已取消的记录状态")
+            try:
+                number = float(days)
+            except (TypeError, ValueError):
+                raise ValueError("保留天数必须是 0～36500 的整数") from None
+            if not number.is_integer() or not 0 <= number <= 36500:
+                raise ValueError("保留天数必须是 0～36500 的整数")
+            cutoff = (time.time() if now is None else now) - int(number) * 86400
+        result = dict(kind="history", status="completed", deleted=0, skipped=0, items=[])
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = [self.decode(row) for row in db.execute("SELECT * FROM jobs")]
+            batches = {row["payload"].get("task", {}).get("transfer_batch_id") for row in rows if row["state"] not in TERMINAL}
+            batches.discard(None)
+            batches.discard("")
+            found = set()
+            for row in rows:
+                if mode == "selected":
+                    if row["id"] not in keys:
+                        continue
+                    found.add(row["id"])
+                elif row["state"] not in states or row["updated"] > cutoff:
+                    continue
+                batch = row["payload"].get("task", {}).get("transfer_batch_id")
+                if row["state"] not in TERMINAL or (row["state"] == "completed" and batch in batches):
+                    result["skipped"] += 1
+                    if len(result["items"]) < 50:
+                        result["items"].append(f"{row['id']}：任务未结束，或同批次仍需此记录恢复")
+                    continue
+                path = row["payload"].get("final_path")
+                if path:
+                    db.execute("INSERT OR IGNORE INTO staging_roots(path) VALUES(?)", (staging_root(path),))
+                db.execute("DELETE FROM jobs WHERE id=? AND state IN ('completed','cancelled','failed')", (row["id"],))
+                result["deleted"] += 1
+            if mode == "selected":
+                result["skipped"] += len(keys - found)
+        return result
 
     def update(self, key, **changes):
         allowed = {"state", "ready", "attempts", "next_at", "history_id", "message", "payload"}

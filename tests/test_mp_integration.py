@@ -150,6 +150,7 @@ class MoviePilotTests(unittest.TestCase):
         plugin = entry.P115InstantWait()
         plugin.systemmessage, plugin.chain = Mock(), Mock()
         self.engine.notify = plugin._notify
+        plugin.get_data = Mock(return_value=None)
         return plugin
 
     def test_notifications_reach_mp_channels_on_first_wait_and_retry_exhaustion(self):
@@ -285,6 +286,95 @@ class MoviePilotTests(unittest.TestCase):
             plugin.init_plugin({"enabled": True, "task_ids": ["some-task"], "action": "upload", "apply_action": True})
             namespace["InstantWaitEngine"].assert_not_called()
         self.assertIn("本次未执行", plugin._error)
+
+    def test_history_cleanup_is_local_consumed_once_and_preserves_mp_history(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        self.attempt(row["id"])
+        plugin = self.attach_plugin_notifier()
+        plugin.get_data_path = Mock(return_value=self.root / "plugin")
+        plugin.update_config = Mock(return_value=True)
+        plugin.save_data = Mock()
+        with patch.object(store.QueueStore, "clear_history", autospec=True,
+                          side_effect=store.QueueStore.clear_history) as cleanup:
+            plugin.init_plugin({"enabled": False, "cleanup_history": True, "history_ids": [row["id"]]})
+            saved = dict(plugin.update_config.call_args.args[0])
+            self.assertFalse(saved["cleanup_history"])
+            self.assertEqual(saved["history_ids"], [])
+            plugin.init_plugin(saved)
+            self.assertEqual(cleanup.call_count, 1)
+        self.assertIsNone(self.engine.store.get(row["id"]))
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertTrue(self.api.files)
+
+    def test_no_cleanup_when_one_shot_config_cannot_be_saved(self):
+        plugin = self.attach_plugin_notifier()
+        plugin.update_config = Mock(return_value=False)
+        with patch.object(store.QueueStore, "clear_history") as cleanup:
+            plugin.init_plugin({"enabled": False, "cleanup_history": True, "history_ids": ["old"]})
+        cleanup.assert_not_called()
+        self.assertIn("本次未执行", plugin._error)
+
+    def test_staging_cleanup_is_consumed_once_and_not_restarted_by_saved_config(self):
+        import sys
+        import types
+        plugin = self.attach_plugin_notifier()
+        plugin.get_data_path = Mock(return_value=self.root / "plugin")
+        plugin.update_config = Mock(return_value=True)
+        fake = Mock()
+        version = types.ModuleType("version")
+        version.APP_VERSION = "v2.15.6"
+        with patch.dict(sys.modules, {"version": version}), \
+                patch.dict(plugin.init_plugin.__globals__, {"InstantWaitEngine": Mock(return_value=fake)}):
+            plugin.init_plugin({"enabled": True, "cleanup_staging": True,
+                                "staging_extra_paths": "/old/.mp115-staging"})
+            fake.maintenance.start.assert_called_once()
+            self.assertEqual(fake.maintenance.start.call_args.args[0], ["/old/.mp115-staging"])
+            saved = dict(plugin.update_config.call_args.args[0])
+            self.assertFalse(saved["cleanup_staging"])
+            plugin.init_plugin(saved)
+            self.assertEqual(fake.maintenance.start.call_count, 1)
+
+    def test_invalid_history_filter_does_not_disable_engine_or_delete_records(self):
+        import sys
+        import types
+        self.enroll()
+        row = self.engine.store.all()[0]
+        plugin = self.attach_plugin_notifier()
+        plugin.get_data_path = Mock(return_value=self.root / "plugin")
+        plugin.update_config = Mock(return_value=True)
+        plugin.save_data = Mock()
+        fake = Mock()
+        version = types.ModuleType("version")
+        version.APP_VERSION = "v2.15.6"
+        with patch.dict(sys.modules, {"version": version}), \
+                patch.dict(plugin.init_plugin.__globals__, {"InstantWaitEngine": Mock(return_value=fake)}):
+            plugin.init_plugin({"enabled": True, "cleanup_history": True, "history_mode": "filtered",
+                                "history_states": ["paused"], "history_days": 0})
+            fake.install.assert_called_once()
+        self.assertIsNotNone(self.engine.store.get(row["id"]))
+        self.assertIn("记录状态", plugin._error)
+        self.assertEqual(plugin.save_data.call_args.args[1]["status"], "failed")
+
+    def test_auto_cleanup_runs_only_after_success_and_does_not_replay_on_error(self):
+        task = self.enroll(mode="move")
+        row = self.engine.store.all()[0]
+        self.api.remove_empty_staging_dir = Mock(return_value="deleted")
+        self.attempt(row["id"])
+        self.api.remove_empty_staging_dir.assert_not_called()
+        self.api.hit = True
+        def cleaned(path):
+            self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+            self.assertFalse(Path(task.fileitem.path).exists())
+            self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+            raise remote.RetryLater("限流")
+        self.api.remove_empty_staging_dir.side_effect = cleaned
+        self.attempt(row["id"])
+        self.assertEqual(self.api.remove_empty_staging_dir.call_count, 1)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertIsNone(self.engine.store.claim())
+        self.assertEqual(sum(kind == "TransferComplete" for kind, _ in self.h.events), 1)
 
     def test_notification_toggle_suppresses_both_local_and_push_messages(self):
         plugin = self.attach_plugin_notifier()

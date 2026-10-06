@@ -1,5 +1,6 @@
 """115 秒传等待 — MoviePilot V2 plugin entry point."""
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import HTTPException
 
@@ -9,6 +10,7 @@ from app.schemas import NotificationType
 
 from .bridge import InstantWaitEngine
 from .store import QueueStore
+from .maintenance import parse_roots
 from .records import task_record
 from .ui import config_form, task_page
 
@@ -25,6 +27,13 @@ DEFAULTS = {
     "task_ids": [],
     "action": "pause",
     "apply_action": False,
+    "cleanup_staging": False,
+    "staging_extra_paths": "",
+    "cleanup_history": False,
+    "history_mode": "selected",
+    "history_ids": [],
+    "history_states": ["completed"],
+    "history_days": 30,
 }
 
 
@@ -32,7 +41,7 @@ class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "0.2.5"
+    plugin_version = "0.2.6"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -50,16 +59,42 @@ class P115InstantWait(_PluginBase):
         self._config = {**DEFAULTS, **(config or {})}
         self._error = ""
         apply_action = self._config["apply_action"]
+        cleanup_staging = self._config["cleanup_staging"]
+        cleanup_history = self._config["cleanup_history"]
+        history_ids = self._config["history_ids"]
         # Accept an old single-task form, but an explicitly empty new selection
         # must not fall back to a stale task_id from a previous version.
         selected = self._config["task_ids"] if "task_ids" in (config or {}) else ([self._config["task_id"]] if self._config["task_id"] else [])
         try:
-            if apply_action:
+            if apply_action or cleanup_staging or cleanup_history:
                 # Consume the one-shot request before mutating any task. A
                 # restart must never repeat uploads/cancels from saved config.
-                self._config.update(apply_action=False, task_ids=[], task_id="")
+                self._config.update(apply_action=False, task_ids=[], task_id="",
+                                    cleanup_staging=False, cleanup_history=False, history_ids=[])
                 if not self.update_config(self._config):
                     raise ValueError("无法保存一次性操作标记，本次未执行，请重试保存")
+            previous = self.get_data("last_staging_cleanup")
+            if isinstance(previous, dict) and previous.get("status") == "running":
+                self._save_maintenance("last_staging_cleanup", {**previous, "status": "stopped"})
+            extra_roots = []
+            if cleanup_staging:
+                try:
+                    if not self._config["enabled"]:
+                        raise ValueError("请先启用插件，再清理 115 历史暂存目录")
+                    extra_roots = parse_roots(self._config["staging_extra_paths"])
+                except ValueError as exc:
+                    cleanup_staging = False
+                    self._error = str(exc)
+                    logger.warning(f"【115秒传等待】暂存目录清理未执行：{self._error}")
+            if cleanup_history:
+                try:
+                    result = self.queue().clear_history(mode=self._config["history_mode"], keys=history_ids,
+                        states=self._config["history_states"], days=self._config["history_days"])
+                except Exception as exc:
+                    self._error = str(exc) if isinstance(exc, ValueError) else "记录清理异常，已回滚本次删除，请查看日志"
+                    result = dict(kind="history", status="failed", deleted=0, skipped=0, items=[self._error])
+                    logger.warning(f"【115秒传等待】{self._error}")
+                self._save_maintenance("last_history_cleanup", result)
             if not self._config["enabled"]:
                 if apply_action:
                     raise ValueError("请先启用插件，再执行批量操作")
@@ -84,10 +119,21 @@ class P115InstantWait(_PluginBase):
             engine = InstantWaitEngine(self.get_data_path(), runtime, self._notify)
             engine.install(before_start=(lambda: self._apply_actions(engine, selected, self._config["action"])) if apply_action else None)
             self._engine = engine
+            if cleanup_staging:
+                engine.maintenance.start(extra_roots, lambda result: self._save_maintenance("last_staging_cleanup", result))
         except Exception as exc:
             self._error = str(exc)
             logger.error(f"【115秒传等待】{self._error}")
             self.systemmessage.put(f"115秒传等待：{self._error}")
+
+    def _save_maintenance(self, key, result):
+        result = {**result, "at": datetime.now().astimezone().isoformat(timespec="seconds")}
+        try:
+            self.save_data(key, result)
+        except Exception:
+            logger.warning("【115秒传等待】清理结果保存失败，请查看日志")
+        if result["status"] != "running":
+            logger.info(f"【115秒传等待】清理结果 | 类型={result['kind']} | 状态={result['status']} | 删除={result['deleted']} | 跳过={result.get('skipped', result.get('retained', 0))} | 异常={result.get('failed', 0)}")
 
     def _apply_actions(self, engine, selected, action):
         try:
@@ -151,7 +197,9 @@ class P115InstantWait(_PluginBase):
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
     def get_form(self):
-        return config_form(self.list_tasks(), self._error, self.get_data("last_batch_result")), {**DEFAULTS, "task_ids": []}
+        return config_form(self.list_tasks(), self._error, self.get_data("last_batch_result"),
+                           history_result=self.get_data("last_history_cleanup"),
+                           staging_result=self.get_data("last_staging_cleanup")), {**DEFAULTS, "task_ids": [], "history_ids": []}
 
     def get_page(self):
         return task_page(self.list_tasks(), self.get_state(), self._error,

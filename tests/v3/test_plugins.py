@@ -63,6 +63,27 @@ def test_wait_failure_then_same_history_success(h, task):
     assert h.api.get_item("/library/Film.mkv").fileid == "123"
 
 
+def test_cleanup_only_runs_after_native_success_and_never_retries_completed_job(h, task):
+    h.api.remove_empty_staging_dir = Mock(side_effect=RuntimeError("cleanup unavailable"))
+    row = stage(h, task)
+    h.api.remove_empty_staging_dir.assert_not_called()
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.history.get(row["history_id"]).status
+    assert h.api.remove_empty_staging_dir.call_count == 1
+    assert h.engine.store.claim() is None
+
+
+def test_history_cleanup_keeps_v3_native_history_and_remote_file(h, task):
+    row = stage(h, task)
+    h.Chain()._TransferChain__handle_transfer(task)
+    result = h.engine.store.clear_history(keys=[row["id"]])
+    assert result["deleted"] == 1
+    assert h.engine.store.get(row["id"]) is None
+    assert h.history.get(row["history_id"]).status
+    assert h.api.get_item("/library/Film.mkv").fileid == "123"
+
+
 @pytest.mark.parametrize("mode", ["copy", "move"])
 def test_native_finalization_and_replay_receipts(h, task, mode):
     task.plan_checkpoint.resolved_transfer_type = mode

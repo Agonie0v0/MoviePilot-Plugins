@@ -3,6 +3,8 @@ import hashlib
 import time
 from pathlib import Path, PurePosixPath
 
+from .maintenance import TASK_ID, parse_roots
+
 
 class RetryLater(Exception):
     pass
@@ -184,6 +186,49 @@ class OpenAPI:
             if len(rows) < 1000:
                 return result
             offset += len(rows)
+
+    def staging_children(self, root):
+        root = parse_roots(str(root))[0]
+        info = self.raw_path(root)
+        if info is None:
+            return []
+        if str(info.get("file_category")) != "0" or not info.get("file_id") or int(info["file_id"]) <= 0:
+            raise RetryLater("暂存目录信息异常")
+        children, offset = [], 0
+        while True:
+            rows = self.request("GET", "/open/ufile/files", params={
+                "cid": int(info["file_id"]), "limit": 1000, "offset": offset,
+                "cur": 1, "show_dir": 1, "stdir": 1, "star": 0})
+            if not isinstance(rows, list):
+                raise RetryLater("暂存目录列表不完整")
+            for row in rows:
+                if str(row.get("fc")) == "0" and TASK_ID.fullmatch(str(row.get("fn", ""))):
+                    children.append(str(PurePosixPath(root) / row["fn"]))
+            if len(rows) < 1000:
+                return children
+            offset += len(rows)
+
+    def remove_empty_staging_dir(self, path):
+        path = PurePosixPath(str(path))
+        if (not path.is_absolute() or ".." in path.parts or not (
+                path.name == ".mp115-staging" or
+                (path.parent.name == ".mp115-staging" and TASK_ID.fullmatch(path.name)))):
+            raise ValueError("拒绝清理非暂存目录")
+        info = self.raw_path(path)
+        if info is None:
+            return "missing"
+        if str(info.get("file_category")) != "0" or not info.get("file_id") or int(info["file_id"]) <= 0:
+            raise RetryLater("暂存目录信息异常，保留目录")
+        folder_id = int(info["file_id"])
+        rows = self.request("GET", "/open/ufile/files", params={
+            "cid": folder_id, "limit": 1, "offset": 0,
+            "cur": 1, "show_dir": 1, "stdir": 1, "star": 0})
+        if not isinstance(rows, list):
+            raise RetryLater("暂存目录列表不完整，保留目录")
+        if rows:
+            return "retained"
+        self.request("POST", "/open/ufile/delete", data={"file_ids": folder_id})
+        return "deleted"
 
     def move_id(self, file_id, folder, name):
         # Query first: replaying a committed move is harmless after response loss/restart.
