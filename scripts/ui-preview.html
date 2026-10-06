@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>115 秒传等待 · UI 预览</title>
+  <link rel="stylesheet" href="vuetify.css"><link rel="stylesheet" href="mdi.css">
+  <style>
+    body{margin:0;font-family:system-ui,"Microsoft YaHei",sans-serif}
+    .preview-tools{max-width:960px;margin:24px auto 16px;padding:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .preview-shell{width:calc(100% - 48px);max-width:960px;margin:0 auto 32px;border:1px solid rgba(var(--v-theme-on-surface),.12);border-radius:12px;overflow:hidden;background:rgb(var(--v-theme-surface))}
+    .preview-title{padding:18px 24px;border-bottom:1px solid rgba(var(--v-theme-on-surface),.12);font-weight:650}
+    .preview-content{padding:24px 28px}.preview-footer{padding:16px 24px;border-top:1px solid rgba(var(--v-theme-on-surface),.12);display:flex;justify-content:flex-end;gap:12px}
+    .preview-caption{max-width:960px;margin:0 auto 20px;padding:0 24px;font-size:13px}
+    @media(max-width:600px){.preview-tools{padding:0 16px;margin-top:16px}.preview-shell{width:100%;border-radius:0;border-inline:0}.preview-content{padding:20px 16px}.preview-title{padding:16px}.preview-footer{padding:16px}.preview-caption{padding:0 16px}}
+  </style>
+</head>
+<body><div id="app"></div><script src="vue.js"></script><script src="vuetify.js"></script>
+<script>
+// Match MoviePilot's native render contracts: props.model/show/expressions in
+// FormRender; authenticated events -> API -> page reload in PageRender.
+// Only the API transport is replaced with the local fixture server.
+const {createApp,h,ref,reactive,resolveComponent,computed}=Vue;
+const App={setup(){
+  const view=ref('page'),dark=ref(false),scenario=ref('normal'),schemas=ref(null),model=reactive({}),busy=ref(false),feedback=ref('');
+  const config=ref(null);
+  async function load(reset=false){const data=await fetch('/schema?scenario='+scenario.value).then(r=>r.json());schemas.value=data;if(reset)Object.assign(model,data.defaults);}
+  async function action(event){busy.value=true;try{const res=await fetch('/'+event.api,{method:event.method});if(!res.ok)throw new Error('操作失败');await load();feedback.value='队列已更新（预览数据）';}catch(e){feedback.value=e.message;}finally{busy.value=false;}}
+  function parseProps(raw){const out={};for(const [key,value]of Object.entries(raw)){
+    const expression=typeof value==='string'&&value.startsWith('{{')&&value.endsWith('}}');
+    if(key==='model'||key==='v-model'){out.modelValue=model[value];out['onUpdate:modelValue']=v=>model[value]=v;}
+    else if(key==='show'||key==='v-show'){out.style={display:new Function('model','with(model){return '+(expression?value.slice(2,-2).trim():value)+'}')(model)?'':'none'};}
+    else if(expression){out[key]=new Function('model','with(model){return '+value.slice(2,-2).trim()+'}')(model);}
+    else if(typeof value==='string'&&value in model){out[key]=model[value];}else{out[key]=value;}
+  }return out;}
+  function render(node,form){const component=/^[A-Z]/.test(node.component)?resolveComponent(node.component):node.component;
+    const props=form?parseProps(node.props||{}):{...node.props};
+    for(const [key,event]of Object.entries(node.events||{}))props['on'+key[0].toUpperCase()+key.slice(1)]=()=>action(event);
+    const children=()=>node.text!==undefined?node.text:(node.content||[]).map(n=>render(n,form));
+    return typeof component==='string'?h(component,props,children()):h(component,props,{default:children});}
+  load(true);
+  return()=>h(resolveComponent('VApp'),{theme:dark.value?'dark':'light'},()=>[
+    h('div',{class:'preview-tools'},[
+      h(resolveComponent('VBtn'),{variant:view.value==='page'?'flat':'text',color:'primary',onClick:()=>view.value='page'},()=> '任务队列'),
+      h(resolveComponent('VBtn'),{variant:view.value==='form'?'flat':'text',color:'primary',onClick:()=>view.value='form'},()=> '插件配置'),
+      h(resolveComponent('VBtn'),{variant:'text',onClick:()=>dark.value=!dark.value},()=>dark.value?'浅色模式':'深色模式'),
+      h(resolveComponent('VSelect'),{modelValue:scenario.value,'onUpdate:modelValue':async v=>{scenario.value=v;await load(true)},items:[{title:'正常队列',value:'normal'},{title:'空队列',value:'empty'},{title:'插件关闭',value:'disabled'},{title:'授权异常',value:'error'},{title:'超长文件名',value:'long'}],density:'compact',hideDetails:true,style:'max-width:190px',label:'预览场景'}),
+    ]),
+    h('div',{class:'preview-caption'},'独立预览 · 使用插件真实界面代码和示例任务，不连接 MoviePilot 或 115。'),
+    h('main',{class:'preview-shell'},[
+      h('div',{class:'preview-title'},'115秒传等待'+(view.value==='form'?' · 配置':' · 任务详情')),
+      h('div',{class:'preview-content'},schemas.value?(view.value==='form'?schemas.value.form:schemas.value.page).map(n=>render(n,view.value==='form')):'正在加载…'),
+      view.value==='form'?h('div',{class:'preview-footer'},[
+        h(resolveComponent('VBtn'),{variant:'text',onClick:()=>view.value='page'},()=>'查看队列'),
+        h(resolveComponent('VBtn'),{variant:'flat',color:'primary',onClick:()=>{config.value=JSON.stringify(model);feedback.value='预览配置已记录（未修改真实插件）'}},()=>'保存'),
+      ]):null,
+    ]),
+    h(resolveComponent('VSnackbar'),{modelValue:!!feedback.value,'onUpdate:modelValue':v=>{if(!v)feedback.value=''},timeout:2500},()=>feedback.value),
+    busy.value?h(resolveComponent('VProgressLinear'),{indeterminate:true,style:'position:fixed;top:0',color:'primary'}):null,
+  ]);
+}};
+const colors={primary:'#5595df',info:'#2780a8',success:'#26976f',warning:'#bd7c15',error:'#cb4b54',secondary:'#687385'};
+createApp(App).use(Vuetify.createVuetify({themes:undefined,theme:{defaultTheme:'light',themes:{light:{dark:false,colors:{...colors,background:'#f4f5f7',surface:'#ffffff','on-surface':'#202b3b'}},dark:{dark:true,colors:{...colors,background:'#161b24',surface:'#202735','on-surface':'#e5eaf1'}}}}})).mount('#app');
+</script></body></html>

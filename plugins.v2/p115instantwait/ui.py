@@ -1,4 +1,4 @@
-"""Native MoviePilot/Vuetify views, with no upload or queue mutations."""
+"""Theme-aware native MoviePilot views. Rendering never mutates the queue."""
 from datetime import datetime
 from pathlib import PurePosixPath
 import time
@@ -7,10 +7,104 @@ from .records import latest_result
 
 
 LABELS = {"queued": "等待首次秒传", "waiting": "等待重试", "running": "正在执行",
-          "paused": "已暂停 · 待处理", "completed": "整理成功", "failed": "整理失败", "cancelled": "已取消",
-          "upload_queued": "强制上传排队", "uploading": "强制上传中"}
+          "paused": "已暂停 · 待处理", "completed": "整理成功", "failed": "整理失败",
+          "cancelled": "已取消", "upload_queued": "强制上传排队", "uploading": "强制上传中"}
 ACTIVE = {"queued", "waiting", "running", "paused", "upload_queued", "uploading"}
-ACTION_HINT = "强制上传：先试秒传，未命中就上传文件。继续等待：只试秒传，重置次数和时限。取消：停止任务，保留文件。"
+TONES = {"waiting": ("info", "mdi-clock-outline"), "queued": ("info", "mdi-clock-outline"),
+         "paused": ("warning", "mdi-pause-circle-outline"), "running": ("primary", "mdi-sync"),
+         "uploading": ("primary", "mdi-cloud-upload-outline"),
+         "upload_queued": ("info", "mdi-cloud-clock-outline"),
+         "completed": ("success", "mdi-check-circle-outline"),
+         "failed": ("error", "mdi-alert-circle-outline"),
+         "cancelled": ("secondary", "mdi-close-circle-outline")}
+INK = "color:rgb(var(--v-theme-on-surface));opacity:1;"
+ACTION_HINT = "继续等待会重置自动尝试次数和时限；强制上传先试秒传，未命中就上传文件；取消任务保留文件。"
+
+# Scope all rules to this plugin; let Vuetify own controls, icons and theme colors.
+# Native details work in both FormRender and PageRender without a custom bundle.
+STYLES = """
+.p115-ui{--p115-line:rgba(var(--v-theme-on-surface),.14);--p115-muted:rgba(var(--v-theme-on-surface),.78);color:rgb(var(--v-theme-on-surface));font-size:14px;line-height:1.6;max-width:100%;container-type:inline-size}
+.p115-ui *{box-sizing:border-box}
+.p115-ui h2,.p115-ui h3,.p115-ui p{margin:0}
+.p115-ui h2{font-size:22px;line-height:1.35;font-weight:700;letter-spacing:-.02em;text-wrap:balance}
+.p115-ui h3{font-size:16px;line-height:1.5;font-weight:650}
+.p115-ui .p115-muted{color:var(--p115-muted);opacity:1}
+.p115-ui .p115-copy{max-width:72ch;overflow-wrap:anywhere}
+.p115-ui .p115-header{display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:16px;margin-bottom:24px}
+.p115-ui .p115-heading{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:6px}
+.p115-ui .p115-section{padding:24px 0;border-top:1px solid var(--p115-line)}
+.p115-ui .p115-section-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+.p115-ui .p115-section-label{display:flex;align-items:center;gap:8px}
+.p115-ui .p115-switches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding:20px;background:rgba(var(--v-theme-primary),.055);border-radius:12px;margin-bottom:24px}
+.p115-ui .p115-toggle{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}
+.p115-ui .p115-toggle label{font-size:15px;font-weight:650;cursor:pointer}
+.p115-ui .p115-switches .v-switch{flex:0 0 auto}
+.p115-ui .p115-fields{display:grid;grid-template-columns:repeat(2,minmax(0,260px));gap:20px 24px}
+.p115-ui .p115-field{min-width:0}
+.p115-ui .p115-full{grid-column:1 / -1}
+.p115-ui .p115-field-label{display:block;font-weight:600;margin-bottom:8px}
+.p115-ui .p115-hint{font-size:13px;color:var(--p115-muted);margin-top:8px;line-height:1.6;overflow-wrap:anywhere}
+.p115-ui.p115-settings .p115-full .v-input{max-width:520px}
+.p115-ui.p115-settings .p115-full .v-select{max-width:420px}
+.p115-ui .v-field__input{opacity:1}
+.p115-ui input::placeholder,.p115-ui textarea::placeholder{color:var(--p115-muted);opacity:1}
+.p115-ui .p115-note{display:flex;align-items:flex-start;gap:10px;padding:14px 16px;background:rgba(var(--v-theme-on-surface),.045);border-radius:8px;margin-top:16px}
+.p115-ui .p115-note .v-icon{flex-shrink:0;margin-top:2px}
+.p115-ui .p115-disclosure{border-top:1px solid var(--p115-line)}
+.p115-ui .p115-disclosure>summary{display:flex;align-items:center;gap:10px;min-height:56px;padding:14px 0;cursor:pointer;list-style:none;font-weight:600}
+.p115-ui summary::-webkit-details-marker{display:none}
+.p115-ui .p115-disclosure>summary::after,.p115-ui .p115-task>summary::after{content:'›';font-size:24px;line-height:1;display:block;flex-shrink:0;margin-left:auto;transition:transform .18s ease-out}
+.p115-ui details[open]>summary::after{transform:rotate(90deg)}
+.p115-ui .p115-disclosure-body{padding:0 0 24px}
+.p115-ui summary:focus-visible,.p115-ui button:focus-visible{outline:2px solid rgb(var(--v-theme-primary));outline-offset:3px;border-radius:6px}
+.p115-ui .p115-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:12px 0;border-top:1px solid var(--p115-line);border-bottom:1px solid var(--p115-line);margin-bottom:24px}
+.p115-ui .p115-group{margin-bottom:28px}
+.p115-ui .p115-count{display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:650;min-width:24px;padding:1px 7px;border-radius:6px;background:rgba(var(--v-theme-on-surface),.065);font-variant-numeric:tabular-nums}
+.p115-ui .p115-list{border:1px solid var(--p115-line);border-radius:10px;overflow:clip}
+.p115-ui .p115-task+.p115-task{border-top:1px solid var(--p115-line)}
+.p115-ui .p115-task>summary{display:flex;align-items:center;gap:16px;padding:18px 20px;cursor:pointer;list-style:none;transition:background-color .18s ease-out}
+.p115-ui .p115-task>summary:hover,.p115-ui .p115-task[open]>summary{background:rgba(var(--v-theme-on-surface),.035)}
+.p115-ui .p115-task>summary:focus-visible{outline-offset:-3px}
+.p115-ui .p115-task-icon{display:flex;align-items:center;justify-content:center;width:40px;height:44px;border-radius:8px;background:rgba(var(--v-theme-on-surface),.045);flex-shrink:0}
+.p115-ui .p115-task-main{min-width:0;flex:1}
+.p115-ui .p115-task-name{font-weight:650;font-size:15px;line-height:1.5;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.p115-ui .p115-task-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;margin-top:7px;font-size:12px;color:var(--p115-muted)}
+.p115-ui .p115-schedule{flex:0 0 175px;min-width:0;text-align:right;font-variant-numeric:tabular-nums}
+.p115-ui .p115-schedule-label{font-size:12px;color:var(--p115-muted)}
+.p115-ui .p115-schedule-value{font-size:14px;font-weight:600;overflow-wrap:anywhere}
+.p115-ui .p115-task-body{padding:4px 20px 20px}
+.p115-ui .p115-result{padding:14px 16px;border-radius:8px;background:rgba(var(--v-theme-on-surface),.045);overflow-wrap:anywhere}
+.p115-ui .p115-result-label{font-size:12px;font-weight:600;margin-bottom:4px}
+.p115-ui .p115-actions{display:flex;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-top:16px}
+.p115-ui .p115-actions .v-btn{min-height:40px;letter-spacing:0}
+.p115-ui .p115-confirm{flex:1 1 180px;min-width:0}
+.p115-ui .p115-confirm>summary{display:flex;align-items:center;justify-content:center;min-height:40px;border:1px solid var(--p115-line);border-radius:6px;padding:7px 14px;cursor:pointer;list-style:none;font-size:14px;font-weight:500;transition:background-color .18s ease-out}
+.p115-ui .p115-confirm>summary:hover{background:rgba(var(--v-theme-on-surface),.045)}
+.p115-ui .p115-confirm-body{padding:12px 0;max-width:46ch}
+.p115-ui .p115-path{display:block;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px;line-height:1.7;overflow-wrap:anywhere;white-space:pre-wrap;user-select:text;margin:4px 0 16px}
+.p115-ui .p115-times{display:flex;flex-wrap:wrap;gap:4px 24px;font-size:12px;color:var(--p115-muted);font-variant-numeric:tabular-nums;margin:16px 0}
+.p115-ui .p115-empty{text-align:center;padding:40px 20px;border:1px dashed var(--p115-line);border-radius:10px}
+.p115-ui .p115-empty h3{margin:12px 0 8px}
+.p115-ui .p115-empty p{margin-inline:auto}
+.p115-ui .p115-help-list{display:grid;gap:16px;margin:0;padding-left:20px;max-width:72ch}
+.p115-ui .p115-footer{font-size:12px;color:var(--p115-muted);margin-top:20px}
+@container (max-width:600px){
+ .p115-ui .p115-switches{grid-template-columns:1fr;padding:16px;gap:20px}
+ .p115-ui .p115-task>summary{flex-wrap:wrap;gap:10px;padding:16px}
+ .p115-ui .p115-task-icon{display:none}
+ .p115-ui .p115-task-main{flex-basis:calc(100% - 32px)}
+ .p115-ui .p115-schedule{flex-basis:100%;text-align:left;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;order:1}
+ .p115-ui .p115-task-body{padding:0 16px 16px}
+}
+@container (max-width:440px){
+ .p115-ui .p115-fields{grid-template-columns:1fr;gap:20px}
+ .p115-ui .p115-header{gap:12px;margin-bottom:20px}
+ .p115-ui .p115-section{padding:20px 0}
+ .p115-ui .p115-confirm{flex-basis:100%}
+ .p115-ui .p115-actions .v-btn,.p115-ui .p115-confirm>summary{min-height:44px}
+}
+@media(prefers-reduced-motion:reduce){.p115-ui summary,.p115-ui summary::after{transition:none!important}}
+"""
 
 
 def node(component, text=None, content=None, **props):
@@ -24,36 +118,61 @@ def node(component, text=None, content=None, **props):
     return result
 
 
+def box(content, cls="", **props):
+    return node("div", content=content, **{"class": cls, **props})
+
+
 def paragraph(text, **props):
-    return node("div", text, **{"class": "text-body-2", "style": "line-height:1.65", **props})
+    return node("p", text, **{"class": "p115-copy", **props})
 
 
-def col(content, sm=6):
-    return node("VCol", content=content, cols=12, sm=sm,
-                **{"style": "box-sizing:border-box;min-width:0"})
-
-
-def field(component, model, label, hint, **props):
-    if component in ("VTextField", "VSelect"):
-        control_id = f"p115wait-{model}"
-        return node("div", content=[
-            node("label", label, **{"for": control_id, "class": "d-block mb-2",
-                                   "style": INK + "font-size:15px;font-weight:600"}),
-            node(component, model=model, id=control_id,
-                 **{"variant": "outlined", "density": "comfortable", "hide-details": "auto",
-                    "color": "primary", "style": INK, **props}),
-            paragraph(hint, **{"class": "text-body-2 mt-2"}),
-        ])
-    return node("div", content=[
-        node(component, model=model, label=label,
-             **{"variant": "outlined", "density": "comfortable", "hide-details": "auto",
-                "color": "primary", "style": INK, **props}),
-        paragraph(hint, **{"class": "text-body-2 mt-2"}),
-    ])
+def icon(name, **props):
+    return node("VIcon", name, **{"size": 20, "aria-hidden": "true", **props})
 
 
 def filename(path):
     return PurePosixPath(str(path).replace("\\", "/")).name
+
+
+def disclosure(title, children, icon_name=None, opened=False, **props):
+    heading = ([icon(icon_name)] if icon_name else []) + [node("span", title)]
+    return node("details", content=[node("summary", content=heading),
+                                   box(children, "p115-disclosure-body")],
+                **{"class": "p115-disclosure", "open": opened, **props})
+
+
+def note(text, icon_name="mdi-information-outline", **props):
+    return box([icon(icon_name), paragraph(text)], "p115-note", **props)
+
+
+def section(title, description, children):
+    return node("section", content=[
+        box([node("h3", title)], "p115-section-head"),
+        paragraph(description, **{"class": "p115-copy p115-muted mb-4"}), *children,
+    ], **{"class": "p115-section"})
+
+
+def field(component, model, label, hint, **props):
+    control_id = f"p115wait-{model}"
+    hint_id = control_id + "-hint"
+    return box([
+        node("label", label, **{"for": control_id, "class": "p115-field-label"}),
+        node(component, model=model, id=control_id,
+             **{"aria-label": label, "aria-describedby": hint_id,
+                "variant": "outlined", "density": "comfortable", "hide-details": "auto",
+                "color": "primary", **props}),
+        paragraph(hint, id=hint_id, **{"class": "p115-hint"}),
+    ], "p115-field")
+
+
+def toggle(model, title, hint):
+    control_id = f"p115wait-{model}"
+    return box([
+        box([node("label", title, **{"for": control_id}),
+             paragraph(hint, **{"class": "p115-hint"})]),
+        node("VSwitch", model=model, id=control_id, color="primary",
+             **{"aria-label": title, "inset": True, "hide-details": True}),
+    ], "p115-toggle")
 
 
 def config_form(tasks, error="", batch_result=None, history_result=None):
@@ -61,160 +180,130 @@ def config_form(tasks, error="", batch_result=None, history_result=None):
                          f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
                 "props": {"disabled": t["state"] in ("running", "uploading")}}
                for t in tasks if t["state"] in ACTIVE]
-    def toggle(model, title, hint):
-        control_id = f"p115wait-{model}"
-        return node("div", content=[
-            node("div", content=[
-                node("label", title, **{"for": control_id, "style": INK + "font-size:16px;font-weight:700;cursor:pointer"}),
-                paragraph(hint, **{"class": "text-body-2 mt-1"}),
-            ], **{"style": "min-width:0"}),
-            node("VSwitch", model=model, id=control_id, color="primary",
-                 **{"inset": True, "hide-details": True, "density": "comfortable", "style": "flex:0 0 auto"}),
-        ], **{"class": "d-flex align-center justify-space-between ga-3"})
+    selectable = sum(not t["props"]["disabled"] for t in choices)
+    history_choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}",
+                        "value": t["id"]} for t in tasks
+                       if t["state"] in ("completed", "failed", "cancelled")]
+    content = [node("style", STYLES),
+        box([box([node("h2", "让秒传按计划等待"),
+                  paragraph("设置自动尝试的节奏；需要介入时，在任务详情中处理。",
+                            **{"class": "p115-copy p115-muted mt-2"})])], "p115-header"),
+        box([toggle("enabled", "启用秒传等待", "后台处理视频，其他整理照常进行。"),
+             toggle("notify", "推送任务通知", "首次等待、达到上限或异常时通知。")], "p115-switches")]
+    if error:
+        content.append(node("VAlert", error, title="插件需要检查", type="error", variant="tonal",
+                            **{"class": "mb-5", "role": "alert"}))
 
-    intro = node("div", content=[node("VRow", content=[
-        col([toggle("enabled", "启用秒传等待", "后台等待，其他整理照常进行。")]),
-        col([toggle("notify", "任务状态通知", "首次等待、达到上限或异常时推送。")]),
-    ])], **{"class": "pa-4 rounded-lg mb-5", "style": "background:rgba(var(--v-theme-primary),.06);" + INK})
-    strategy = node("div", content=[
-        node("div", "自动重试", **{"class": "text-subtitle-1 font-weight-bold mb-4", "style": INK}),
-        node("div", content=[
-            node("div", content=[field("VTextField", "max_retries", "最多重试", "不含首次尝试。",
-                 type="number", suffix="次", min=0, max=100, step=1)],
-                 **{"style": "flex:0 1 160px;min-width:0;max-width:100%"}),
-            node("div", content=[field("VTextField", "max_wait_hours", "最长等待", "0 表示不限时。",
-                 type="number", suffix="小时", min=0, max=8760, step=1)],
-                 **{"style": "flex:0 1 160px;min-width:0;max-width:100%"}),
-            node("div", content=[field("VTextField", "retry_intervals", "每次重试间隔", "英文逗号分隔，依次使用。",
-                 placeholder="60,180,600,1800", suffix="秒", **{"spellcheck": False})],
-                 **{"style": "flex:0 1 320px;min-width:0;max-width:100%"}),
-        ], **{"class": "d-flex flex-wrap ga-4"}),
-        node("div", content=[field("VSelect", "limit_action", "达到上限后", "次数或时限任一达到，即执行所选操作。",
-            items=[{"title": "需要手动操作", "value": "manual"},
-                   {"title": "自动强制上传", "value": "upload"}])],
-            **{"class": "mt-5", "style": "width:320px;max-width:100%"}),
-        node("div", content=[node("VIcon", "mdi-cloud-upload-outline", size=20),
-            node("span", "自动强制上传：先试秒传，未命中就上传文件。")],
-            **{"class": "d-flex align-center ga-2 mt-3", "style": tone_style("info") + "font-size:14px;font-weight:600"}),
-    ], **{"class": "mb-5"})
-    def disclosure(title, children):
-        return node("details", content=[
-            node("summary", title, **{"style": INK + "cursor:pointer;box-sizing:border-box;min-height:48px;padding:12px 0;font-weight:600;line-height:24px"}),
-            node("div", content=children, **{"class": "pt-2 pb-4"}),
-        ], **{"style": "box-sizing:border-box;border-top:1px solid rgba(var(--v-theme-on-surface),.15)"})
+    strategy = section("自动重试", "次数或等待时限任一达到，即执行下方的上限策略。", [
+        box([
+            field("VTextField", "max_retries", "最多自动重试", "不含首次尝试；默认 3 次，共尝试 4 次。",
+                  type="number", suffix="次", min=0, max=100, step=1, inputmode="numeric"),
+            field("VTextField", "max_wait_hours", "最长等待时间", "0 表示不限时，仍受重试次数限制。",
+                  type="number", suffix="小时", min=0, max=8760, step=1, inputmode="decimal"),
+            box([field("VTextField", "retry_intervals", "重试间隔", "英文逗号分隔，每项 30～86400 秒；用完后沿用最后一项。",
+                       placeholder="60,180,600,1800", suffix="秒", spellcheck=False)], "p115-full"),
+            box([field("VSelect", "limit_action", "达到上限后", "修改策略不会自动恢复已暂停的任务。",
+                       items=[{"title": "暂停，等待我处理", "value": "manual"},
+                              {"title": "自动强制上传", "value": "upload"}])], "p115-full"),
+        ], "p115-fields"),
+        note("达到上限后保留本地文件。你可以继续等待、强制上传或取消任务。",
+             "mdi-pause-circle-outline", **{"show": "{{ limit_action === 'manual' }}"}),
+        note("先尝试秒传，未命中就上传视频正文，会占用上行带宽。上传失败或文件、授权异常时仍会暂停。",
+             "mdi-cloud-upload-outline", **{"show": "{{ limit_action === 'upload' }}"}),
+    ])
 
-    help_section = disclosure("规则与通知说明", [
-        paragraph("整理记录：等待时显示失败，完成后原记录更新成功；本地文件保留到整理完成。"),
-        paragraph("上限策略：默认需手动操作。自动强制上传使用独立队列；上传失败或授权、源文件异常仍暂停。已暂停任务不会因修改策略自动恢复。",
-                  **{"class": "text-body-2 mt-3"}),
-        paragraph("重试：次数不含首次，填 3 即最多尝试 4 次，填 0 只试首次。时限填 0 仍受次数限制。间隔每项 30～86400 秒，用完后沿用最后一项，从每轮结束后计时，实际有 ±10% 浮动。",
-                  **{"class": "text-body-2 mt-3"}),
-        paragraph("通知：请在 MP 通知渠道中开启「整理入库」和「手动处理」。首次等待及自动转上传走整理入库，暂停走手动处理；中间重试不重复推送。成功及最终整理失败沿用 MP 原生通知。",
-                  **{"class": "text-body-2 mt-3"}),
-        paragraph("兼容：MP V2.15.6，本地到内置 115 的复制/移动；字幕、NFO、图片沿用 MP，蓝光原盘目录暂不支持。",
-                  **{"class": "text-body-2 mt-3"}),
-        paragraph("直接写入正式目录和文件名；覆盖与旧版本清理遵循 MP 设置，不创建暂存或备份目录。",
-                  **{"class": "text-body-2 mt-3"}),
-    ])
-    scope = disclosure("视频格式 · 通常无需修改", [
-        field("VTextarea", "extensions", "接管的视频后缀", "例如 mkv,mp4,iso，不加点号；未列出的格式走 MP 原流程。",
-              rows=2, **{"auto-grow": True, "spellcheck": False}),
-    ])
-    operations = disclosure("批量任务操作", [
-            paragraph("选择多个任务，统一执行操作；强制上传会依次排队。",
-                      **{"class": "text-body-2 mb-4"}),
-            node("VRow", content=[
-                col([field("VAutocomplete", "task_ids", "选择任务（可多选、可搜索）",
-                           "执行中的任务不可选；状态不支持的任务会跳过。" if choices else "暂无可操作任务。启用插件后照常发起整理即可。",
-                           items=choices, **{"item-title": "title", "item-value": "value",
-                                            "multiple": True, "chips": True, "closable-chips": True,
-                                            "clearable": True, "disabled": not choices})], sm=8),
-                col([field("VSelect", "action", "统一执行", "继续等待仅适用于已暂停任务。",
-                           items=[{"title": "强制上传（未秒传就上传）", "value": "upload"},
-                                  {"title": "暂停自动重试", "value": "pause"},
-                                  {"title": "继续等待秒传", "value": "resume"},
-                                  {"title": "取消等待", "value": "cancel"}],
-                           **{"disabled": "{{ !task_ids || !task_ids.length }}"})], sm=4),
-            ]),
-            paragraph(ACTION_HINT, **{"class": "text-body-2 mt-3"}),
-            node("VCheckbox", model="apply_action", label="保存时对所选任务执行一次",
-                 **{"color": "primary", "class": "mt-3", "hide-details": True,
-                    "disabled": "{{ !enabled || !task_ids || !task_ids.length }}"}),
-            paragraph("执行后清空选择；重新打开配置可查看结果。"),
-    ])
+    batch_children = [
+        paragraph("多选任务，保存配置时统一执行。单个任务也可在详情页直接处理。",
+                  **{"class": "p115-copy p115-muted mb-4"}),
+        field("VAutocomplete", "task_ids", "选择任务", "可按文件名搜索；执行中的任务不可选。" if selectable else "暂无可操作任务，执行中的任务需等待本轮结束。",
+              items=choices, multiple=True, chips=True, clearable=True,
+              **{"item-title": "title", "item-value": "value", "closable-chips": True,
+                 "disabled": not selectable, "no-data-text": "没有匹配的任务"}),
+        box([field("VSelect", "action", "对所选任务执行", "状态不支持的任务会跳过；继续等待仅适用于已暂停任务。",
+                   items=[{"title": "暂停自动重试", "value": "pause"},
+                          {"title": "继续等待秒传", "value": "resume"},
+                          {"title": "强制上传", "value": "upload"},
+                          {"title": "取消任务", "value": "cancel"}],
+                   **{"disabled": "{{ !task_ids || !task_ids.length }}"})], "mt-5"),
+        note(ACTION_HINT),
+        node("VCheckbox", model="apply_action", label="保存时对所选任务执行一次",
+             **{"color": "primary", "class": "mt-3", "hide-details": True,
+                "disabled": "{{ !enabled || !task_ids || !task_ids.length }}"}),
+        paragraph("需启用插件；执行后自动清空选择，重新打开配置可查看结果。", **{"class": "p115-hint"}),
+    ]
     if batch_result:
-        actions = {"upload": "强制上传", "resume": "继续等待秒传", "pause": "暂停重试", "cancel": "取消等待"}
-        summary = (f"上次{actions.get(batch_result['action'], '批量操作')}：已接受 {batch_result['accepted']} · "
-                   f"跳过 {batch_result['skipped']} · 异常 {batch_result['failed']}")
-        result_details = [paragraph(batch_result["at"] + " · 已接受表示操作已提交，不代表文件已上传完成。",
-                                    **{"class": "text-body-2 mb-3"})]
-        for item in batch_result["items"]:
-            result_details.append(paragraph(f"{item['name']}：{item['message']}",
-                **{"class": "text-body-2 mb-2", "style": "overflow-wrap:anywhere;line-height:1.65"}))
-        operations["content"][1]["content"].insert(0, disclosure(summary, result_details))
-    history_choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])} · {record_time(t.get('updated'))}",
-                        "value": t["id"]} for t in tasks if t["state"] in ("completed", "failed", "cancelled")]
-    maintenance = disclosure("历史清理", [
-        node("div", "插件已结束记录", **{"class": "text-subtitle-1 font-weight-bold mb-2"}),
-        paragraph("仅移除插件列表中的记录，保留 MoviePilot 整理历史、本地文件及网盘文件。未完成任务，以及同批次恢复仍需要的成功记录会跳过。"),
-        node("div", content=[field("VSelect", "history_mode", "选择方式", "仅按当前选择方式清理。",
-            items=[{"title": "指定记录", "value": "selected"}, {"title": "按状态和保留天数", "value": "filtered"}])],
-            **{"class": "mt-4", "style": "width:280px;max-width:100%"}),
-        field("VAutocomplete", "history_ids", "选择已结束记录（可搜索、多选）",
-              "列出最近 200 条任务中的已结束记录；更早记录可按条件清理。" if history_choices else "最近任务中暂无已结束记录。",
-              items=history_choices, **{"item-title": "title", "item-value": "value", "multiple": True,
-                  "chips": True, "closable-chips": True, "clearable": True, "class": "mt-4",
-                  "disabled": "{{ history_mode !== 'selected' }}" if history_choices else True}),
-        node("div", content=[
-            node("div", content=[field("VSelect", "history_states", "清理状态", "只匹配勾选的结束状态。",
-                items=[{"title": "整理成功", "value": "completed"}, {"title": "整理失败", "value": "failed"},
-                       {"title": "已取消", "value": "cancelled"}], multiple=True, chips=True,
-                **{"disabled": "{{ history_mode !== 'filtered' }}"})],
-                **{"style": "flex:0 1 320px;min-width:0;max-width:100%"}),
-            node("div", content=[field("VTextField", "history_days", "保留最近", "按结束时间计算；0 清理全部匹配记录。",
-                type="number", suffix="天", min=0, max=36500, step=1,
-                **{"disabled": "{{ history_mode !== 'filtered' }}"})],
-                **{"style": "flex:0 1 180px;min-width:0;max-width:100%"}),
-        ], **{"class": "d-flex flex-wrap ga-4 mt-4"}),
-        node("VCheckbox", model="cleanup_history", label="保存时删除一次所选插件记录（不可撤销）",
+        actions = {"upload": "强制上传", "resume": "继续等待", "pause": "暂停重试", "cancel": "取消任务"}
+        title = (f"上次{actions.get(batch_result['action'], '批量操作')}：接受 {batch_result['accepted']} · "
+                 f"跳过 {batch_result['skipped']} · 异常 {batch_result['failed']}")
+        batch_children.insert(0, disclosure(title, [
+            paragraph(batch_result.get("at", "") + " · 已接受表示操作已提交，不代表传输完成。",
+                      **{"class": "p115-hint mb-3"}),
+            *[paragraph(f"{item['name']}：{item['message']}", **{"class": "p115-copy mb-2"})
+              for item in batch_result["items"]],
+        ], opened=True, **{"class": "p115-disclosure mb-4"}))
+
+    maintenance = [
+        note("只删除插件中的已结束记录，不影响 MP 整理历史、本地文件及网盘文件。未完成任务和批次恢复需要的成功记录会跳过。"),
+        box([field("VSelect", "history_mode", "清理方式", "只执行当前选择的清理方式。",
+                   items=[{"title": "选择指定记录", "value": "selected"},
+                          {"title": "按状态和保留天数", "value": "filtered"}])], "mt-5"),
+        box([field("VAutocomplete", "history_ids", "选择已结束记录", "可搜索最近 200 条任务中的结束记录；更早的记录可按条件清理。",
+                   items=history_choices, multiple=True, chips=True, clearable=True,
+                   **{"item-title": "title", "item-value": "value", "closable-chips": True,
+                      "disabled": not history_choices, "no-data-text": "没有匹配的记录"})],
+            "mt-5", show="{{ history_mode === 'selected' }}"),
+        box([
+            field("VSelect", "history_states", "清理哪些状态", "只匹配勾选的结束状态。",
+                  items=[{"title": "整理成功", "value": "completed"}, {"title": "整理失败", "value": "failed"},
+                         {"title": "已取消", "value": "cancelled"}], multiple=True, chips=True),
+            field("VTextField", "history_days", "保留最近记录", "按结束时间计算；0 清理全部匹配记录。",
+                  type="number", suffix="天", min=0, max=36500, step=1, inputmode="numeric"),
+        ], "p115-fields mt-5", show="{{ history_mode === 'filtered' }}"),
+        node("VCheckbox", model="cleanup_history", label="保存时清理一次（插件记录不可恢复）",
              **{"color": "warning", "hide-details": True, "class": "mt-3",
                 "disabled": "{{ history_mode === 'selected' ? (!history_ids || !history_ids.length) : (!history_states || !history_states.length) }}"}),
-        paragraph("插件关闭时也可清理记录。清理选项执行一次后自动取消勾选。"),
+        paragraph("插件关闭时也可清理；执行后自动取消勾选。", **{"class": "p115-hint"}),
+    ]
+    if history_result:
+        title = (f"上次清理{'未完成' if history_result.get('status') == 'failed' else '已结束'}："
+                 f"删除 {history_result.get('deleted', 0)} · 跳过 {history_result.get('skipped', 0)}")
+        maintenance.insert(0, disclosure(title, [paragraph(history_result.get("at", ""), **{"class": "p115-hint mb-3"}),
+            *[paragraph(item, **{"class": "p115-copy mb-2"}) for item in history_result.get("items", [])]], opened=True))
+
+    help_items = [
+        ("整理记录", "等待时显示失败；成功后更新同一条记录。本地文件保留到整理完成。"),
+        ("重试规则", "次数不含首次，0 表示只尝试首次。间隔从每轮结束后计时，实际有 ±10% 浮动。"),
+        ("通知设置", "在 MP 通知渠道中开启「整理入库」和「手动处理」。中间重试不重复推送；成功与最终失败沿用 MP 原生通知。"),
+        ("支持范围", "MP V2.15.6，本地到内置 115 的复制或移动。字幕、NFO、图片沿用 MP；蓝光原盘目录暂不支持。"),
+        ("目标文件", "直接写入正式目录和文件名，覆盖及旧版本清理遵循 MP 设置。不会创建暂存或备份目录。"),
+    ]
+    content.extend([
+        strategy,
+        disclosure(f"批量任务操作 · {selectable} 个可选", batch_children, "mdi-playlist-check"),
+        disclosure("视频格式", [field("VTextarea", "extensions", "接管的视频后缀", "英文逗号分隔，不加点号，例如 mkv,mp4,iso；未列出的格式走 MP 原流程。",
+                    rows=2, spellcheck=False, **{"auto-grow": True})], "mdi-file-video-outline"),
+        disclosure("清理已结束记录", maintenance, "mdi-broom"),
+        disclosure("使用说明与通知设置", [node("ul", content=[node("li", content=[node("h3", title),
+                   paragraph(text, **{"class": "p115-copy p115-muted mt-1"})]) for title, text in help_items],
+                   **{"class": "p115-help-list"})], "mdi-help-circle-outline"),
+        paragraph("修改设置后，点击 MoviePilot 配置窗口底部的「保存」生效。", **{"class": "p115-footer"}),
     ])
-    for result in (history_result,):
-        if not result:
-            continue
-        summary = f"上次记录清理（{'未完成' if result.get('status') == 'failed' else '已结束'}）：已删除 {result.get('deleted', 0)} · 跳过 {result.get('skipped', 0)}"
-        details = [paragraph(result.get("at", ""))] + [paragraph(item, **{"style": "overflow-wrap:anywhere;line-height:1.65"}) for item in result.get("items", [])]
-        maintenance["content"][1]["content"].insert(0, disclosure(summary, details))
-    content = [intro]
-    if error:
-        content.append(node("VAlert", error, type="error", variant="tonal", **{"class": "mb-4"}))
-    content.extend([strategy, help_section, scope, operations, maintenance])
-    return [node("VForm", content=content, **{"style": INK})]
-
-
-TONES = {"waiting": ("warning", "mdi-clock-outline"), "queued": ("info", "mdi-clock-outline"),
-         "paused": ("warning", "mdi-pause-circle-outline"), "running": ("primary", "mdi-sync"),
-         "uploading": ("primary", "mdi-cloud-upload-outline"), "upload_queued": ("info", "mdi-cloud-clock-outline"),
-         "completed": ("success", "mdi-check-circle-outline"), "failed": ("error", "mdi-alert-circle-outline"),
-         "cancelled": ("secondary", "mdi-close-circle-outline")}
-INK = "color:rgb(var(--v-theme-on-surface));opacity:1;"
+    return [node("VForm", content=content, **{"class": "p115-ui p115-settings"})]
 
 
 def tone_style(tone, background=False):
-    # Mix semantic colors with theme ink for readable text in both MP themes.
-    style = INK + f"color:color-mix(in srgb,rgb(var(--v-theme-{tone})) 40%,rgb(var(--v-theme-on-surface)));"
+    # Darken/lighten semantic text towards theme ink for contrast in both themes.
+    style = INK + f"color:color-mix(in srgb,rgb(var(--v-theme-{tone})) 35%,rgb(var(--v-theme-on-surface)))!important;"
     if background:
-        style += f"background:rgba(var(--v-theme-{tone}),.14);"
+        style += f"background:rgba(var(--v-theme-{tone}),.12);"
     return style
 
 
 def status_chip(state, label=None):
-    tone, icon = TONES.get(state, ("secondary", "mdi-circle-outline"))
-    return node("VChip", content=[node("VIcon", icon, size=18, **{"class": "mr-1"}),
-                                  node("span", label or LABELS.get(state, state))],
-                variant="flat", size="small", **{"style": tone_style(tone, True) + "font-weight:700"})
+    tone, name = TONES.get(state, ("secondary", "mdi-circle-outline"))
+    return node("VChip", content=[icon(name, size=16, **{"class": "mr-1"}),
+                                 node("span", label or LABELS.get(state, state))],
+                variant="flat", size="small", **{"style": tone_style(tone, True) + "font-weight:600"})
 
 
 def schedule_summary(task, enabled, now):
@@ -247,91 +336,131 @@ def record_time(value):
 
 
 def task_button(task, action, label):
-    button = node("VBtn", label, variant="tonal" if action == "upload" else "outlined",
-                  **{"size": "small", "style": "min-height:40px"})
+    button = node("VBtn", label, variant="tonal" if action in ("resume", "upload") else "outlined",
+                  color="error" if action == "cancel" else "primary", size="small",
+                  **{"aria-label": f"{label}：{filename(task['source'])}",
+                     "style": tone_style("error" if action == "cancel" else "primary")})
     button["events"] = {"click": {"api": f"plugin/P115InstantWait/tasks/{task['id']}/{action}", "method": "POST"}}
     return button
 
 
+def confirm_action(task, action, label, explanation, confirm_label):
+    return node("details", content=[node("summary", label),
+        box([paragraph(explanation, **{"class": "p115-copy p115-muted mb-3"}),
+             task_button(task, action, confirm_label)], "p115-confirm-body")],
+        **{"class": "p115-confirm"})
+
+
+def task_row(task, enabled, now, max_retries):
+    status = task["state"]
+    label, value, tone = schedule_summary(task, enabled, now)
+    auto = task.get("auto_attempts", task["attempts"])
+    budget = (f"本轮自动尝试 {auto} / {max_retries + 1} 次"
+              if max_retries is not None and status in ACTIVE else f"自动尝试 {auto} 次")
+    summary = node("summary", content=[
+        box([icon("mdi-file-video-outline", size=22)], "p115-task-icon"),
+        box([node("div", filename(task["source"]), **{"class": "p115-task-name"}),
+             box([status_chip(status), node("span", f"累计 {task['attempts']} 次"),
+                  node("span", f"记录 #{task['history_id']}" if task['history_id'] else "整理记录待生成")],
+                 "p115-task-meta")], "p115-task-main"),
+        box([node("div", label, **{"class": "p115-schedule-label"}),
+             node("div", value, **{"class": "p115-schedule-value", "style": tone_style(tone)})], "p115-schedule"),
+    ])
+    details = [box([node("div", "暂停原因" if status == "paused" else "最新结果",
+                       **{"class": "p115-result-label", "style": tone_style(TONES.get(status, ("secondary", ""))[0])}),
+                    paragraph(latest_result(task).removeprefix("暂停原因：") if status == "paused"
+                              else latest_result(task))], "p115-result")]
+    if status in ("queued", "waiting", "paused", "upload_queued") and enabled:
+        actions = [task_button(task, "resume", "继续等待秒传") if status == "paused"
+                   else task_button(task, "pause", "暂停重试")]
+        if status != "upload_queued":
+            actions.append(confirm_action(task, "upload", "强制上传…",
+                "先尝试秒传，未命中就上传视频正文，会占用上行带宽。", "确认强制上传"))
+        actions.append(confirm_action(task, "cancel", "取消任务…",
+            "停止此任务，不再自动尝试。保留本地及网盘文件；需要重新处理时，请在 MP 再次发起整理。", "确认取消任务"))
+        details.append(box(actions, "p115-actions"))
+        details.append(paragraph("继续等待会重置次数和时限。" if status == "paused" else
+                                 "强制上传和取消任务需展开后确认。", **{"class": "p115-hint"}))
+    elif status in ("running", "uploading"):
+        details.append(note("本轮执行中，暂不可操作；结束后刷新查看结果。", "mdi-sync"))
+    elif status in ACTIVE and not enabled:
+        details.append(note("启用插件后才能继续处理此任务。", "mdi-pause-circle-outline"))
+    paths = [paragraph(budget, **{"class": "p115-copy p115-muted mb-3"})]
+    for title, path in (("本地源文件", task["source"]), ("115 目标文件", task["target"]),
+                        ("任务 ID · 可在 MP 日志中搜索", task["id"])):
+        paths.extend([node("div", title, **{"class": "p115-muted"}), node("code", str(path), **{"class": "p115-path"})])
+    paths.append(box([
+        node("span", "入队时间：" + record_time(task.get("created"))),
+        node("span", ("完成时间：" if status == "completed" else "结束时间：" if status in ("failed", "cancelled") else "更新时间：") +
+                     record_time(task.get("updated"))),
+    ], "p115-times"))
+    if task.get("backup_files"):
+        paths.append(paragraph(f"旧版本备份 {len(task['backup_files'])} 个，位于目标目录 .mp115-backups。"))
+    details.append(disclosure("路径、时间与日志定位", paths, "mdi-folder-outline",
+                              **{"class": "p115-disclosure mt-4"}))
+    return node("details", content=[summary, box(details, "p115-task-body")],
+                **{"class": "p115-task", "open": status in ("paused", "failed")})
+
+
 def task_page(tasks, enabled, error="", max_retries=None):
     now = time.time()
-    active = sum(t["state"] in ACTIVE for t in tasks)
-    content = [node("div", content=[
-        node("div", "整理任务", **{"class": "text-h6 font-weight-bold"}),
-        node("VChip", "运行中" if enabled else "插件已关闭", size="small", variant="tonal"),
-    ], **{"class": "d-flex align-center justify-space-between ga-2 mb-2"}),
-        paragraph(f"最近 {len(tasks)} 条 · {active} 条未结束。展开任务可操作，路径默认收起。时间按 MP 所在时区显示。" if tasks else
-                  "启用插件后，在 MP 发起本地 → 内置 115 的视频整理，任务会出现在这里。",
-                  **{"class": "text-body-2 mb-4"})]
-    if tasks:
-        counts = [("paused", "待处理", ("paused",)), ("waiting", "等待重试", ("queued", "waiting")),
-                  ("running", "执行中", ("running", "uploading")), ("upload_queued", "上传排队", ("upload_queued",)),
-                  ("completed", "已成功", ("completed",)), ("failed", "失败", ("failed",))]
-        content.append(node("div", content=[status_chip(state, f"{label} {sum(t['state'] in states for t in tasks)}")
-            for state, label, states in counts if any(t["state"] in states for t in tasks)],
-            **{"class": "d-flex flex-wrap ga-2 mb-4"}))
+    refresh = node("VBtn", "刷新队列", variant="outlined", size="small",
+                   **{"prepend-icon": "mdi-refresh", "style": "min-height:40px", "aria-label": "刷新任务状态"})
+    # PageRender uses MP's authenticated API and emits action to reload the page.
+    refresh["events"] = {"click": {"api": "plugin/P115InstantWait/tasks", "method": "GET"}}
+    active_count = sum(t["state"] in ACTIVE for t in tasks)
+    content = [node("style", STYLES), box([
+        box([box([node("h2", "等待队列"),
+                  status_chip("running" if enabled else "cancelled", "后台运行中" if enabled else "插件已关闭")], "p115-heading"),
+             paragraph(f"最近 {len(tasks)} 条任务 · {active_count} 条未结束。" if tasks else "把等待留给后台，把结果带回原整理记录。",
+                       **{"class": "p115-copy p115-muted"})]), refresh,
+    ], "p115-header")]
     if error:
-        content.append(node("VAlert", error, type="error", variant="tonal", **{"class": "mb-4"}))
-    if tasks and not enabled:
-        content.append(node("VAlert", "插件关闭期间队列不会重试。请到配置页启用插件。",
-                            type="info", variant="tonal", **{"class": "mb-4"}))
-    panels = []
-    for task in sorted(tasks, key=lambda t: t["state"] not in ACTIVE):
-        status = task["state"]
-        next_label, next_value, next_tone = schedule_summary(task, enabled, now)
-        auto = task.get("auto_attempts", task["attempts"])
-        budget = f"本轮自动 {auto}/{max_retries + 1}" if max_retries is not None and status in ACTIVE else f"自动尝试 {auto} 次"
-        title = node("VExpansionPanelTitle", content=[
-            node("div", content=[
-                node("div", filename(task["source"]),
-                     **{"class": "text-subtitle-1 font-weight-bold", "style": INK + "overflow-wrap:anywhere;line-height:1.5"}),
-                paragraph(f"整理记录 #{task['history_id'] or '待生成'}", **{"class": "text-body-2 mt-1"}),
-                node("VRow", content=[
-                    node("VCol", content=[paragraph("当前状态", **{"class": "text-caption mb-2"}), status_chip(status)], cols=6, sm=3),
-                    node("VCol", content=[paragraph("累计尝试", **{"class": "text-caption mb-1"}),
-                        node("div", f"{task['attempts']} 次", **{"style": INK + "font-size:20px;font-weight:700;line-height:1.4;font-variant-numeric:tabular-nums"}),
-                        paragraph(budget, **{"class": "text-caption mt-1"})], cols=6, sm=3),
-                    node("VCol", content=[paragraph(next_label, **{"class": "text-caption mb-1"}),
-                        node("div", next_value, **{"style": tone_style(next_tone) + "font-size:20px;font-weight:700;line-height:1.4;font-variant-numeric:tabular-nums;overflow-wrap:anywhere"})], cols=12, sm=6),
-                ], **{"class": "mt-1"}),
-                node("div", content=[
-                    paragraph("入队时间：" + record_time(task.get("created")), **{"class": "text-caption"}),
-                    paragraph(("完成时间：" if status == "completed" else "结束时间：" if status in ("failed", "cancelled") else "更新时间：") +
-                              record_time(task.get("updated")), **{"class": "text-caption"}),
-                ], **{"class": "d-flex flex-wrap mt-3", "style": "gap:4px 24px;font-variant-numeric:tabular-nums"}),
-            ], **{"style": "min-width:0;flex:1"}),
-        ], **{"class": "ga-3 align-start py-4"})
-        details = [node("div", content=[paragraph("最新结果", **{"class": "text-caption mb-1"}),
-            paragraph(latest_result(task),
-                      **{"style": INK + "line-height:1.65;overflow-wrap:anywhere"})],
-            **{"class": "pa-3 rounded mb-3", "style": f"background:rgba(var(--v-theme-{TONES.get(status, ('secondary', ''))[0]}),.08)"})]
-        if status in ("queued", "waiting", "paused", "upload_queued") and enabled:
-            buttons = [task_button(task, "resume", "继续等待秒传") if status == "paused" else task_button(task, "pause", "暂停重试"),
-                       task_button(task, "cancel", "取消等待")]
-            if status != "upload_queued":
-                buttons.insert(0, task_button(task, "upload", "强制上传"))
-            details.extend([node("div", content=buttons, **{"class": "d-flex flex-wrap ga-2"}),
-                            paragraph("强制上传：未秒传就上传文件，占用上行带宽。取消等待不会删除文件。",
-                                      **{"class": "text-body-2 mt-2 mb-3"})])
-        paths = [node("summary", "路径与日志定位", **{"style": "cursor:pointer;min-height:40px;line-height:40px;font-weight:600;" + INK})]
-        for label, value in (("本地源文件", task["source"]), ("115 目标文件", task["target"]), ("任务 ID（可在 MP 日志中搜索）", task["id"])):
-            paths.append(node("div", content=[paragraph(label, **{"class": "text-caption mb-1"}),
-                paragraph(str(value), **{"style": "line-height:1.6;overflow-wrap:anywhere;user-select:text"})], **{"class": "my-3"}))
-        if task.get("backup_files"):
-            paths.append(paragraph(f"旧版本备份 {len(task['backup_files'])} 个，位于目标目录 .mp115-backups。"))
-        details.append(node("details", content=paths, **{"class": "mt-3"}))
-        panels.append(node("VExpansionPanel", content=[title, node("VExpansionPanelText", content=details)]))
-    if panels:
-        content.append(node("VExpansionPanels", content=panels, variant="accordion",
-                            **{"class": "border rounded-lg", "elevation": 0}))
-    else:
-        content.append(node("VSheet", content=[
-            node("VIcon", "mdi-cloud-upload-outline", size=32, **{"class": "mb-3"}),
-            node("div", "还没有整理任务", **{"class": "text-subtitle-1 font-weight-bold mb-2"}),
-            paragraph("先确认 MP 内置 115 已授权，再启用插件并整理一个视频文件。"),
-        ], **{"class": "border rounded-lg pa-6 text-center"}))
+        content.append(node("VAlert", error, title="插件需要检查", type="error", variant="tonal",
+                            **{"class": "mb-5", "role": "alert"}))
+    if not enabled:
+        content.append(node("VAlert", "请在配置页启用插件；关闭期间队列不会自动重试。",
+                            type="info", variant="tonal", **{"class": "mb-5"}))
+
+    attention = [t for t in tasks if t["state"] in ("paused", "failed")]
+    pending = [t for t in tasks if t["state"] in ACTIVE and t["state"] != "paused"]
+    ended = [t for t in tasks if t["state"] not in ACTIVE and t["state"] != "failed"]
     if tasks:
-        content.append(paragraph("页面快照 " + datetime.fromtimestamp(now).astimezone().strftime("%m-%d %H:%M:%S %z") +
-                                 " · 重新打开可更新；MP 日志搜索「115秒传等待」查看过程。",
-                                 **{"class": "text-caption mt-3"}))
-    return [node("VContainer", content=content, **{"class": "pa-0", "style": INK})]
+        content.append(box([
+            status_chip("paused", f"待处理 {len(attention)}"),
+            status_chip("waiting", f"进行中 {len(pending)}"),
+            status_chip("completed", f"已结束 {len(ended)}"),
+        ], "p115-toolbar", **{"aria-label": "最近任务状态汇总"}))
+    for title, description, group in (
+        ("需要你处理", "暂停任务可以继续等待或强制上传；失败任务请根据原因在 MP 重新整理。", attention),
+        ("正在等待与执行", "后台按计划依次处理。展开文件查看结果和操作。", pending),
+    ):
+        if not group:
+            continue
+        # In-flight jobs first, then due jobs. Keep failures' supplied recency order.
+        if group is pending:
+            group = sorted(group, key=lambda t: (t["state"] not in ("running", "uploading"), t.get("next_at") or 0))
+        content.append(node("section", content=[
+            box([box([node("h3", title), node("span", str(len(group)), **{"class": "p115-count"})], "p115-section-label")], "p115-section-head"),
+            paragraph(description, **{"class": "p115-copy p115-muted mb-3"}),
+            box([task_row(t, enabled, now, max_retries) for t in group], "p115-list"),
+        ], **{"class": "p115-group"}))
+    if ended:
+        content.append(disclosure(f"已结束记录 · {len(ended)}", [
+            paragraph("整理成功与已取消的任务。清理列表记录请到配置页，不影响 MP 整理历史。",
+                      **{"class": "p115-copy p115-muted mb-3"}),
+            box([task_row(t, enabled, now, max_retries) for t in ended], "p115-list"),
+        ], "mdi-history"))
+    if not tasks:
+        content.append(box([
+            icon("mdi-cloud-clock-outline", size=36, color="primary"),
+            node("h3", "等待你的第一个视频"),
+            paragraph("确认 MP 内置 115 已授权，在配置页启用插件，再发起本地到 115 的视频整理。任务会自动出现在这里。",
+                      **{"class": "p115-copy p115-muted"}),
+        ], "p115-empty"))
+    elif not pending and not attention:
+        content.insert(-1, note("当前没有等待中的任务，已结束记录收在下方。", "mdi-check-circle-outline"))
+    content.append(paragraph("更新于 " + datetime.fromtimestamp(now).astimezone().strftime("%m-%d %H:%M:%S %z") +
+                             " · 时间按 MP 所在时区显示；点击刷新获取最新状态。",
+                             **{"class": "p115-footer"}))
+    return [node("VContainer", content=content, **{"class": "p115-ui pa-0"})]
