@@ -145,6 +145,21 @@ class OpenAPI:
 
     get_item_strict = get_item
 
+    def delete(self, item):
+        """Execute an MP-approved file deletion by exact identity, without backups."""
+        if item.type != "file" or not item.fileid or int(item.fileid) <= 0:
+            raise PauseTask("拒绝自动删除整个远端目录")
+        current = self.raw_path(item.path)
+        if current is None:
+            return True
+        if str(current.get("file_id")) != str(item.fileid):
+            raise PauseTask("待覆盖旧文件已变化，已停止删除")
+        self.request("POST", "/open/ufile/delete", data={"file_ids": int(item.fileid)})
+        visible = self.raw_path(item.path)
+        if visible and str(visible.get("file_id")) == str(item.fileid):
+            raise RetryLater("旧文件删除后仍可见，等待远端确认")
+        return True
+
     def get_folder(self, path):
         p = PurePosixPath(str(path).replace("\\", "/"))
         if not p.is_absolute() or ".." in p.parts:
@@ -427,7 +442,7 @@ class DirectStorage:
     def get_item(self, path):
         try:
             item = self.api.get_item(path)
-            if item and str(item.fileid) == str(self.item.fileid) and PurePosixPath(str(path).replace("\\", "/")) == self.final_path:
+            if item and self.item and str(item.fileid) == str(self.item.fileid) and PurePosixPath(str(path).replace("\\", "/")) == self.final_path:
                 return None
             return item
         except Exception as exc:
@@ -437,8 +452,13 @@ class DirectStorage:
     get_item_strict = get_item
 
     def delete(self, item):
-        self.error = PauseTask("正式目录存在旧目标，拒绝自动删除或创建备份目录，请人工处理")
-        raise self.error
+        try:
+            if self.item and str(item.fileid) == str(self.item.fileid):
+                return True
+            return self.api.delete(item)
+        except Exception as exc:
+            self.error = exc
+            raise
 
     def upload(self, target_dir, local_path, new_name=None):
         try:
@@ -458,6 +478,68 @@ class DirectStorage:
         except Exception as exc:
             self.error = exc
             raise
+
+
+class NativePlanStorage(DirectStorage):
+    """Run MP's actual policy with buffered deletes and a virtual upload result."""
+    def __init__(self, api, store, job, item_factory):
+        data = job["payload"]
+        super().__init__(api, store, job, data["final_path"], None,
+                         {"fingerprint": data["source_initial"]})
+        self.item_factory = item_factory
+        self.deletions = []
+        self.upload_planned = False
+
+    def get_item(self, path):
+        item = super().get_item(path)
+        if item and any(str(old.fileid) == str(item.fileid) for old in self.deletions):
+            return None
+        return item
+
+    get_item_strict = get_item
+
+    def get_folder(self, path):
+        path = PurePosixPath(str(path).replace("\\", "/"))
+        return self.item_factory(storage="u115", type="dir", fileid="0", path=str(path), name=path.name)
+
+    def delete(self, item):
+        if item.type != "file":
+            self.error = PauseTask("不支持自动替换整个远端目录")
+            raise self.error
+        if all(str(old.fileid) != str(item.fileid) for old in self.deletions):
+            self.deletions.append(item)
+        return True
+
+    def upload(self, target_dir, local_path, new_name=None):
+        final = PurePosixPath(str(target_dir.path).replace("\\", "/")) / (new_name or Path(local_path).name)
+        if final != self.final_path or fingerprint(local_path) != self.hashes["fingerprint"]:
+            self.error = PauseTask("整理路径或源文件发生变化，已停止覆盖")
+            raise self.error
+        self.upload_planned = True
+        return self.item_factory(storage="u115", type="file", fileid="0", path=str(final),
+                                 name=final.name, size=self.hashes["fingerprint"]["size"])
+
+
+def apply_native_deletions(api, store, row, item_factory):
+    """Reconcile the persisted MP decision before writing the final filename."""
+    data = row["payload"]
+    if any(part in (".mp115-staging", ".mp115-backups") for part in PurePosixPath(data["final_path"]).parts):
+        raise PauseTask("已停用临时目录，请选择正式整理目标")
+    if not store.reserve_target(row["id"], str(PurePosixPath(data["final_path"]))):
+        raise PauseTask("另一个未结束任务占用相同正式目标")
+    for saved in data.get("native_deletions", []):
+        if saved.get("deleted"):
+            continue
+        item = item_factory(**saved["item"])
+        api.delete(item)
+        saved["deleted"] = True
+        store.update(row["id"], payload=data)
+
+
+class PlanningStepRunner:
+    """Evaluate the native plan without writing durable execution receipts."""
+    def run(self, *, phase, kind, payload, execute, observe):
+        return execute()
 
 
 class DeferredSource:

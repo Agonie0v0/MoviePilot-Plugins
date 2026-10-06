@@ -149,6 +149,33 @@ class APITests(unittest.TestCase):
         self.clients.append(api)
         return api
 
+    def test_native_delete_uses_exact_old_file_id_without_backup_or_move(self):
+        api = self.api([(200, {"state": True, "data": {"file_id": "42"}}),
+                        (200, {"state": True, "data": {}}),
+                        (200, {"state": False, "code": 430004})])
+        self.assertTrue(api.delete(SimpleNamespace(type="file", fileid="42", path="/library/A.mkv")))
+        self.assertEqual([call.url.path for call in self.calls],
+                         ["/open/folder/get_info", "/open/ufile/delete", "/open/folder/get_info"])
+        self.assertEqual(self.calls[1].content, b"file_ids=42")
+
+    def test_native_delete_never_removes_replaced_file_or_directory(self):
+        api = self.api([(200, {"state": True, "data": {"file_id": "99"}})])
+        with self.assertRaises(remote.PauseTask):
+            api.delete(SimpleNamespace(type="file", fileid="42", path="/library/A.mkv"))
+        with self.assertRaises(remote.PauseTask):
+            api.delete(SimpleNamespace(type="dir", fileid="10", path="/library"))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_native_delete_reconciles_missing_old_file_and_visibility_delay(self):
+        api = self.api([(200, {"state": False, "code": 430004})])
+        item = SimpleNamespace(type="file", fileid="42", path="/library/A.mkv")
+        self.assertTrue(api.delete(item))
+        api = self.api([(200, {"state": True, "data": {"file_id": "42"}}),
+                        (200, {"state": True, "data": {}}),
+                        (200, {"state": True, "data": {"file_id": "42"}})])
+        with self.assertRaises(remote.RetryLater):
+            api.delete(item)
+
     def test_miss_never_requests_oss_or_upload_token(self):
         api = self.api([(200, {"state": True, "code": 0, "data": {"status": 1, "bucket": "oss"}})])
         with self.assertRaises(remote.NotInstant):

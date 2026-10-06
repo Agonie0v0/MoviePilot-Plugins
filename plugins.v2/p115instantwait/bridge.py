@@ -20,7 +20,8 @@ from app.schemas import FileItem, TransferInfo, TransferTask
 from app.schemas.types import MediaType
 
 from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage,
-                     RetryLater, fingerprint, hash_file, prepare_direct)
+                     RetryLater, fingerprint, hash_file, prepare_direct, NativePlanStorage,
+                     apply_native_deletions)
 from .store import QueueStore
 
 
@@ -464,6 +465,20 @@ class InstantWaitEngine:
                 self.store.update(key, payload=payload)
             api = OpenAPI(U115Pan(), FileItem, self.stop_event)
             final = PurePosixPath(payload["final_path"])
+            if not payload.get("native_plan") and not payload.get("remote_id") and not payload.get("write_intent"):
+                planner = NativePlanStorage(api, self.store, row, FileItem)
+                args = task_kwargs(task)
+                args.update(source_oper=DeferredSource(LocalStorage()), target_oper=planner, preview=False)
+                planned = self.original_transfer(self.chain, **args)
+                if planner.error:
+                    raise planner.error
+                if not planned or not planned.success or not planner.upload_planned:
+                    self.finish_failure(row, task, planned or TransferInfo(success=False, message="MP 未允许整理"))
+                    return
+                payload["native_plan"] = True
+                payload["native_deletions"] = [{"item": item.model_dump(mode="json")} for item in planner.deletions]
+                self.store.update(key, payload=payload)
+            apply_native_deletions(api, self.store, row, FileItem)
             item = prepare_direct(api, self.store, row, path, payload, manual,
                                   lambda event: self.log_task(row, event))
             file_id = item.fileid

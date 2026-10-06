@@ -164,7 +164,8 @@ class Harness:
                      "eventmanager": NS(send_event=lambda *a, **kw: None), "ChainEventType": sys.modules["app.schemas.types"].ChainEventType,
                      "TransferInterceptEventData": Data, "TransferOverwriteCheckEventData": Data,
                      "StorageQueryError": type("StorageQueryError", (Exception,), {}),
-                     "get_runtime_setting": lambda key: [], **vars(execution)}
+                     "get_runtime_setting": lambda key: [".mkv", ".mp4"] if key == "RMT_MEDIAEXT" else [],
+                     "MetaInfoPath": lambda _: NS(season=None, episode=None, part=None), **vars(execution)}
         native_ns["__name__"] = "app.modules.filemanager.transhandler"
         selected("app/modules/filemanager/transhandler.py", {"TransHandler"}, native_ns)
         self.Handler = native_ns["TransHandler"]
@@ -250,7 +251,8 @@ class Harness:
 
     def enter(self, task):
         self.Chain()._TransferChain__handle_transfer(task)
-        return self.engine.store.active_for(self.bridge.source_key(task.fileitem))
+        return (self.engine.store.active_for(self.bridge.source_key(task.fileitem))
+                or next(row for row in self.engine.store.all() if row["source"] == self.bridge.source_key(task.fileitem)))
 
 
 class Runner:
@@ -267,6 +269,7 @@ class Fake115:
     def __init__(self, h):
         self.h, self.files, self.hit = h, {}, False
         self.hashes, self.folders, self.moves = {}, [], []
+        self.deletes = []
         self.inits = self.uploads = 0
         self.block_entered, self.block_release = threading.Event(), threading.Event()
         self.block = False
@@ -276,7 +279,11 @@ class Fake115:
         self.folders.append(str(path))
         return self.h.FileItem(storage="u115", type="dir", fileid="10", path=str(path).replace("\\", "/"))
     def get_item(self, path):
-        return next((f.model_copy() for f in self.files.values() if f.path == str(path).replace("\\", "/")), None)
+        path = str(path).replace("\\", "/")
+        item = next((f.model_copy() for f in self.files.values() if f.path == path), None)
+        if not item and any(str(PurePosixPath(f.path).parent) == path for f in self.files.values()):
+            return self.h.FileItem(storage="u115", type="dir", path=path, fileid="10", name=PurePosixPath(path).name)
+        return item
     get_item_strict = get_item
     def raw_path(self, path):
         item = self.get_item(path)
@@ -311,3 +318,14 @@ class Fake115:
     def move_id(self, file_id, folder, name):
         self.moves.append((file_id, str(folder.path)))
         self.files[str(file_id)] = self.files[str(file_id)].model_copy(update={"path": str(PurePosixPath(folder.path) / name)})
+
+    def delete(self, item):
+        current = self.get_item(item.path)
+        if current and str(current.fileid) != str(item.fileid):
+            raise self.h.remote.PauseTask("旧目标已变化")
+        self.deletes.append(str(item.fileid))
+        self.files.pop(str(item.fileid), None)
+        return True
+
+    def list(self, folder):
+        return [item for item in self.files.values() if PurePosixPath(item.path).parent == PurePosixPath(folder.path)]

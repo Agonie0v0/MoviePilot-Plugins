@@ -18,6 +18,7 @@ class Fake115:
         self.inits = 0
         self.uploads = 0
         self.moves = []
+        self.deletes = []
         self.hit = False
         self.entered, self.release = threading.Event(), threading.Event()
         self.block = False
@@ -33,7 +34,10 @@ class Fake115:
 
     def get_item(self, path):
         path = str(path).replace("\\", "/")
-        return next((f.model_copy() for f in self.files.values() if f.path == path), None)
+        item = next((f.model_copy() for f in self.files.values() if f.path == path), None)
+        if not item and any(str(PurePosixPath(f.path).parent) == path for f in self.files.values()):
+            return self.h.FileItem(storage="u115", type="dir", path=path, fileid="10", name=PurePosixPath(path).name)
+        return item
 
     get_item_strict = get_item
 
@@ -84,6 +88,17 @@ class Fake115:
         self.moves.append((str(file_id), folder.path))
         self.files[str(file_id)] = self.files[str(file_id)].model_copy(update={
             "path": str(PurePosixPath(folder.path) / name), "name": name})
+
+    def delete(self, item):
+        current = self.get_item(item.path)
+        if current and str(current.fileid) != str(item.fileid):
+            raise remote.PauseTask("旧目标已变化")
+        self.deletes.append(str(item.fileid))
+        self.files.pop(str(item.fileid), None)
+        return True
+
+    def list(self, folder):
+        return [item for item in self.files.values() if PurePosixPath(item.path).parent == PurePosixPath(folder.path)]
 
 
 @unittest.skipUnless(os.environ.get("MP115_REFERENCE"), "Set MP115_REFERENCE to test against actual MP V2 source")
@@ -793,18 +808,70 @@ class MoviePilotTests(unittest.TestCase):
         self.assertTrue(self.h.Oper().get(row["history_id"]).status)
         self.assertFalse(Path(task.fileitem.path).exists())
 
-    def test_conflict_pauses_without_upload_or_remote_mutations(self):
+    def test_native_always_overwrites_without_temporary_directory(self):
         task = self.enroll(mode="move")
         row = self.engine.store.all()[0]
         old = self.h.FileItem(storage="u115", type="file", fileid="old", path="/library/A.mkv", name="A.mkv", size=10)
         self.api.files["old"] = old
         self.api.hit = True
         self.attempt(row["id"])
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
-        self.assertEqual(self.api.files, {"old": old})
-        self.assertEqual(self.api.inits, 0)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertNotIn("old", self.api.files)
+        self.assertEqual(self.api.deletes, ["old"])
+        self.assertEqual(self.api.inits, 1)
         self.assertEqual(self.api.moves, [])
-        self.assertTrue(Path(task.fileitem.path).exists())
+        self.assertFalse(Path(task.fileitem.path).exists())
+
+    def test_native_size_policy_overwrites_only_smaller_target(self):
+        for size, expected in ((1, "completed"), (18, "failed"), (40, "failed")):
+            with self.subTest(size=size):
+                task = self.enroll(name=f"Size{size}.mkv")
+                task.target_directory.overwrite_mode = "size"
+                row = self.engine.store.active_for(self.h.bridge.source_key(task.fileitem))
+                old_id = f"old{size}"
+                self.api.files[old_id] = self.h.FileItem(storage="u115", type="file", fileid=old_id,
+                    path=row["payload"]["final_path"], name=f"Size{size}.mkv", size=size)
+                self.api.hit = True
+                self.attempt(row["id"])
+                self.assertEqual(self.engine.store.get(row["id"])["state"], expected)
+                self.assertEqual(old_id in self.api.deletes, expected == "completed")
+                self.assertEqual(old_id in self.api.files, expected == "failed")
+                self.assertTrue(Path(task.fileitem.path).exists())
+
+    def test_native_latest_removes_other_video_versions_without_backups(self):
+        task = self.enroll()
+        task.target_directory.overwrite_mode = "latest"
+        row = self.engine.store.all()[0]
+        self.api.files["old"] = self.h.FileItem(storage="u115", type="file", fileid="old",
+            path="/library/A.Old.mkv", name="A.Old.mkv", extension="mkv", size=10)
+        self.api.files["nfo"] = self.h.FileItem(storage="u115", type="file", fileid="nfo",
+            path="/library/A.nfo", name="A.nfo", extension="nfo", size=1)
+        self.api.hit = True
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertEqual(self.api.deletes, ["old"])
+        self.assertIn("nfo", self.api.files)
+        self.assertEqual(self.api.moves, [])
+
+    def test_native_overwrite_event_veto_keeps_old_file(self):
+        task = self.enroll()
+        row = self.engine.store.all()[0]
+        self.api.files["old"] = self.h.FileItem(storage="u115", type="file", fileid="old",
+            path="/library/A.mkv", name="A.mkv", size=1)
+        events = self.h.Handler.transfer_media.__globals__["eventmanager"]
+        original = events.send_event
+        from types import SimpleNamespace
+        def veto(kind, data):
+            if kind == "TransferOverwriteCheck":
+                return SimpleNamespace(event_data=SimpleNamespace(overwrite=False, source_size=None,
+                    target_size=None, source="test", reason="native event veto"))
+            return original(kind, data)
+        with patch.object(events, "send_event", side_effect=veto):
+            self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "failed")
+        self.assertEqual(self.api.deletes, [])
+        self.assertEqual(self.api.inits, 0)
+        self.assertIn("old", self.api.files)
 
     def test_success_uses_only_final_directory_and_never_moves_files(self):
         self.enroll()
@@ -901,7 +968,7 @@ class MoviePilotTests(unittest.TestCase):
             path="/library/A.mkv", name="A.mkv", size=10)
         self.api.hit = True
         self.attempt(row["id"])
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "failed")
         self.assertFalse(self.h.Oper().get(row["history_id"]).status)
         self.assertEqual(self.api.files["old"].path, "/library/A.mkv")
         self.assertTrue(Path(task.fileitem.path).exists())

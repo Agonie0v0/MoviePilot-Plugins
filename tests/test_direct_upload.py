@@ -121,6 +121,17 @@ class DirectV2Tests(unittest.TestCase):
         self.api.upload.assert_not_called()
         self.api.instant.assert_not_called()
 
+    def test_native_deletion_progress_survives_restart_and_is_not_repeated(self):
+        self.data["native_deletions"] = [{"item": dict(type="file", fileid="42", path="/library/Film.mkv")}]
+        self.store.update(self.row["id"], payload=self.data)
+        self.row = self.store.get(self.row["id"])
+        self.remote.apply_native_deletions(self.api, self.store, self.row, lambda **kw: types.SimpleNamespace(**kw))
+        self.assertTrue(self.store.get(self.row["id"])["payload"]["native_deletions"][0]["deleted"])
+        reopened = self.store_class(self.store.path)
+        self.remote.apply_native_deletions(self.api, reopened, reopened.get(self.row["id"]),
+                                          lambda **kw: types.SimpleNamespace(**kw))
+        self.assertEqual(self.api.delete.call_count, 1)
+
     def test_legacy_directory_cannot_be_used_as_a_new_upload_target(self):
         for part in (".mp115-staging", ".mp115-backups"):
             self.data["final_path"] = f"/library/{part}/Film.mkv"

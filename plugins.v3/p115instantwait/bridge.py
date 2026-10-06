@@ -18,7 +18,9 @@ from app.schemas.file import FileItem
 from app.schemas.transfer import TransferInfo
 from app.sdk.logging import logger
 
-from .remote import NotInstant, OpenAPI, PauseTask, DirectStorage, RetryLater, fingerprint, hash_file, prepare_direct
+from .remote import (NotInstant, OpenAPI, PauseTask, DirectStorage, RetryLater, fingerprint,
+                     hash_file, prepare_direct, NativePlanStorage, DeferredSource,
+                     PlanningStepRunner, apply_native_deletions)
 from .store import QueueStore
 
 
@@ -125,7 +127,8 @@ class InstantWaitEngine:
             return engine.gate(task, checkpoint, source_oper, target_oper, step_runner, original_gate)
 
         def wrapped_callback(chain, task, info, /):
-            row = engine.store.active_for(source_key(task.fileitem))
+            row = (engine.store.active_for(source_key(task.fileitem))
+                   or engine.store.get(getattr(engine.context, "native_job", "")))
             owned = row and row["payload"].get("native_task_id") == task.admission_task_id
             if owned and info.success:
                 try:
@@ -150,9 +153,14 @@ class InstantWaitEngine:
                     engine.live_tasks.pop(row["id"], None)
                 elif row["payload"].get("prepared"):
                     engine.defer(row, "paused", info.message or "V3 完成整理失败，请人工核对")
+                elif engine.store.get(row["id"])["state"] == "failed":
+                    engine.live_tasks.pop(row["id"], None)
+                    engine.log_task(engine.store.get(row["id"]), "MP 未允许整理", 原因=info.message)
             return result
 
         def wrapped_handle(chain, task, callback=None):
+            previous_job = getattr(engine.context, "native_job", None)
+            engine.context.native_job = None
             with engine.native_lock:
                 engine.native_active += 1
             try:
@@ -166,6 +174,7 @@ class InstantWaitEngine:
                             engine.store.update(row["id"], history_id=history.id, ready=1)
                             engine.wake.set()
                 finally:
+                    engine.context.native_job = previous_job
                     with engine.native_lock:
                         engine.native_active -= 1
                         engine.native_lock.notify_all()
@@ -223,6 +232,7 @@ class InstantWaitEngine:
                    "final_path": checkpoint.final_target_path, "mode": checkpoint.resolved_transfer_type,
                    "source_initial": fingerprint(task.fileitem.path), "wait_since": time.time()}
             row, created = self.store.enqueue(source_key(task.fileitem), payload)
+        self.context.native_job = row["id"]
         self.live_tasks[row["id"]] = task
         if row["payload"].get("native_task_id") != task.admission_task_id or row["payload"]["final_path"] != checkpoint.final_target_path:
             self.defer(row, "paused", "整理任务或目标发生变化，请取消旧队列后重新整理")
@@ -230,6 +240,37 @@ class InstantWaitEngine:
         if row["payload"].get("layout") != "direct":
             self.defer(row, "paused", "旧版暂存任务仅可取消，请重新整理；旧网盘文件需人工核对")
             return TransferInfo(success=False, fileitem=task.fileitem, message="旧版暂存任务已暂停")
+        if (not row["payload"].get("prepared") and not row["payload"].get("native_plan")
+                and not row["payload"].get("write_intent")):
+            api = OpenAPI(U115Pan(), FileItem, self.stop_event)
+            try:
+                self.check_source(row)
+                planner = NativePlanStorage(api, self.store, row, FileItem)
+                self.context.prepared_storage = planner
+                try:
+                    planned = original(self.chain, task, checkpoint,
+                                       source_oper=DeferredSource(source_oper), target_oper=planner,
+                                       step_runner=PlanningStepRunner())
+                finally:
+                    self.context.prepared_storage = None
+                if planner.error:
+                    raise planner.error
+                if not planned or not planned.success or not planner.upload_planned:
+                    message = planned.message if planned else "MP 未允许整理"
+                    self.store.update(row["id"], state="failed", message=message)
+                    return planned or TransferInfo(success=False, fileitem=task.fileitem, message=message)
+                data = row["payload"]
+                data["native_plan"] = True
+                data["native_deletions"] = [{"item": item.model_dump(mode="json")} for item in planner.deletions]
+                self.store.update(row["id"], payload=data)
+                if row["state"] == "finalizing":
+                    self.store.update(row["id"], state="upload_queued" if data.pop("plan_force", False) else "waiting",
+                                      payload=data, ready=1, next_at=0)
+            except (PauseTask, RetryLater) as error:
+                self.defer(row, "paused", str(error))
+                return TransferInfo(success=False, fileitem=task.fileitem, message=str(error))
+            finally:
+                api.close()
         if not row["payload"].get("prepared"):
             if created:
                 self.log_task(row, "任务入队", 原因=WAIT_MESSAGE)
@@ -354,6 +395,12 @@ class InstantWaitEngine:
                     self.defer(row, "waiting", "等待超过设定期限" if expired else "自动重试次数已用完", limit_reached=True)
                     return
             path = self.check_source(row)
+            if not data.get("native_plan") and not data.get("remote_id") and not data.get("write_intent"):
+                data["plan_force"] = force
+                self.store.update(key, state="finalizing", payload=data, next_at=0,
+                                  message="等待 V3 按原生规则判断覆盖")
+                self.request_finalize(self.store.get(key))
+                return
             self.log_task(row, "开始强制上传" if force else "开始自动尝试")
             if not data.get("hashes"):
                 data["hashes"] = hash_file(path, self.stop_event)
@@ -361,6 +408,7 @@ class InstantWaitEngine:
                     raise PauseTask("源文件在计算哈希前发生变化")
                 self.store.update(key, payload=data)
             api = OpenAPI(U115Pan(), FileItem, self.stop_event)
+            apply_native_deletions(api, self.store, row, FileItem)
             item = prepare_direct(api, self.store, row, path, data, force,
                                   lambda event: self.log_task(row, event))
             data.update(remote_id=str(item.fileid), prepared=True)

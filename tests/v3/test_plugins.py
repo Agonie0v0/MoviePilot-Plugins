@@ -146,24 +146,96 @@ def test_upload_does_not_block_other_native_tasks(h, task, tmp_path):
     assert not worker.is_alive()
 
 
-def test_old_target_cleanup_is_refused_without_backup(h, task):
+def test_old_target_cleanup_follows_native_plan_without_backup(h, task):
     old = h.FileItem(storage="u115", type="file", path="/library/Old.mkv", fileid="999", name="Old.mkv", size=2)
     h.api.files["999"] = old
     task.plan_checkpoint.planning_input.options["cleanup_dest_fileitem"] = old.model_dump(mode="json")
     row = stage(h, task)
     h.Chain()._TransferChain__handle_transfer(task)
-    assert h.api.files["999"].path == old.path
-    assert not h.history.get(row["history_id"]).status
-    assert h.engine.store.get(row["id"])["state"] == "paused"
+    assert "999" not in h.api.files
+    assert h.api.deletes == ["999"]
+    assert h.history.get(row["history_id"]).status
+    assert h.engine.store.get(row["id"])["state"] == "completed"
 
 
-def test_existing_final_file_pauses_before_upload(h, task):
+def test_existing_final_file_uses_native_always_overwrite(h, task):
     h.api.files["999"] = h.FileItem(storage="u115", type="file", path="/library/Film.mkv", fileid="999", name="Film.mkv", size=2)
     row = stage(h, task)
-    assert not h.history.get(row["history_id"]).status
-    assert h.engine.store.get(row["id"])["state"] == "paused"
-    assert h.api.inits == h.api.uploads == 0
-    assert h.api.files["999"].path == "/library/Film.mkv"
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.history.get(row["history_id"]).status
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.api.inits == 1 and h.api.uploads == 0
+    assert "999" not in h.api.files
+    assert h.api.moves == []
+
+
+@pytest.mark.parametrize("mode,size,allowed", [("never", 1, False), ("size", 1, True),
+                                               ("size", 18, False), ("size", 40, False)])
+def test_native_overwrite_policies_keep_host_decision(h, task, mode, size, allowed):
+    task.plan_checkpoint.overwrite_mode = mode
+    h.api.files["999"] = h.FileItem(storage="u115", type="file", fileid="999",
+                                   path="/library/Film.mkv", name="Film.mkv", size=size)
+    row = h.enter(task)
+    assert h.api.deletes == [] and h.api.inits == 0
+    assert Path(task.fileitem.path).exists()
+    if allowed:
+        h.api.hit = True
+        h.engine.execute(h.engine.store.claim())
+        h.Chain()._TransferChain__handle_transfer(task)
+        assert h.history.get(row["history_id"]).status
+        assert h.api.deletes == ["999"]
+    else:
+        assert h.engine.store.get(row["id"])["state"] == "failed"
+        assert not h.history.get(row["history_id"]).status
+        assert "999" in h.api.files
+    assert h.api.moves == []
+
+
+def test_native_latest_deletes_video_versions_but_keeps_nfo(h, task):
+    task.plan_checkpoint.overwrite_mode = "latest"
+    h.api.files["999"] = h.FileItem(storage="u115", type="file", fileid="999",
+        path="/library/Film.Old.mkv", name="Film.Old.mkv", extension="mkv", size=10)
+    h.api.files["998"] = h.FileItem(storage="u115", type="file", fileid="998",
+        path="/library/Film.nfo", name="Film.nfo", extension="nfo", size=1)
+    row = stage(h, task)
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.api.deletes == ["999"]
+    assert "998" in h.api.files
+    assert h.api.moves == []
+
+
+def test_native_overwrite_event_veto_is_preserved(h, task):
+    h.api.files["999"] = h.FileItem(storage="u115", type="file", fileid="999",
+        path="/library/Film.mkv", name="Film.mkv", size=1)
+    events = h.Handler._TransHandler__resolve_overwrite.__globals__["eventmanager"]
+    original = events.send_event
+    def veto(kind, data):
+        if getattr(kind, "name", "") == "TransferOverwriteCheck":
+            data.overwrite, data.source_size, data.target_size = False, None, None
+            data.source, data.reason = "test", "native event veto"
+            return NS(event_data=data)
+        return original(kind, data)
+    with patch.object(events, "send_event", side_effect=veto):
+        row = h.enter(task)
+    assert h.engine.store.get(row["id"])["state"] == "failed"
+    assert h.api.inits == 0 and h.api.deletes == []
+    assert "999" in h.api.files
+
+
+def test_existing_native_plan_is_not_recomputed_after_uncertain_upload(h, task):
+    row = h.enter(task)
+    data = row["payload"]
+    data.update(write_intent=True, remote_id="123")
+    h.engine.store.update(row["id"], payload=data)
+    h.api.files["123"] = h.FileItem(storage="u115", type="file", fileid="123", path="/library/Film.mkv", size=18)
+    h.Chain()._TransferChain__handle_transfer(task)
+    current = h.engine.store.get(row["id"])
+    assert current["payload"]["native_deletions"] == []
+    assert h.api.deletes == []
+    h.engine.execute(h.engine.store.claim())
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
 
 
 def test_direct_upload_finalization_creates_no_temporary_paths_or_moves(h, task):

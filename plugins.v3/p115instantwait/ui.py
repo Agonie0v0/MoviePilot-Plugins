@@ -113,7 +113,7 @@ def config_form(tasks, error="", batch_result=None, history_result=None):
                   **{"class": "text-body-2 mt-3"}),
         paragraph("兼容：MP V3.1.x，本地到内置 115 的复制/移动；字幕、NFO、图片沿用 MP，蓝光原盘目录暂不支持。V2 遗留任务需先完成或取消。",
                   **{"class": "text-body-2 mt-3"}),
-        paragraph("直接写入正式目录和文件名；同名目标已存在时暂停，请人工处理冲突后继续。",
+        paragraph("直接写入正式目录和文件名；覆盖与旧版本清理遵循 MP 设置，不创建暂存或备份目录。",
                   **{"class": "text-body-2 mt-3"}),
     ])
     scope = disclosure("视频格式 · 通常无需修改", [
