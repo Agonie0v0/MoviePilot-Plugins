@@ -41,8 +41,12 @@ STYLES = """
 .p115-ui .p115-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:14px 16px;border:1px solid var(--p115-line);border-radius:10px}
 .p115-ui .p115-toggle label{font-size:14px;font-weight:650;cursor:pointer}
 .p115-ui .p115-switches .v-switch{flex:0 0 auto}
-.p115-ui .p115-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 20px}
+.p115-ui .p115-fields{display:grid;grid-template-columns:repeat(2,minmax(0,320px));gap:18px 20px}
 .p115-ui .p115-field{min-width:0}
+.p115-ui.p115-settings .p115-field>.v-input{max-width:640px}
+.p115-ui.p115-settings .p115-field>.v-input:has(input[type=number]){max-width:160px}
+.p115-ui.p115-settings .p115-field>.v-input:has(#p115wait-retry_intervals){max-width:320px}
+.p115-ui.p115-settings .p115-field>.v-select:not(.v-autocomplete){max-width:280px}
 .p115-ui .p115-field-label{display:block;font-weight:600;margin-bottom:6px}
 .p115-ui .p115-hint{font-size:12px;color:var(--p115-muted);margin-top:6px;line-height:1.6;overflow-wrap:anywhere}
 .p115-ui .v-field__input{opacity:1}
