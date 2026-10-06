@@ -127,10 +127,12 @@ class MoviePilotTests(unittest.TestCase):
         self.h.close()
         self.temp.cleanup()
 
-    def enroll(self, name="A.mkv", mode="copy", target="u115"):
+    def enroll(self, name="A.mkv", mode="copy", target="u115", download_hash=None):
         path = self.root / name
         path.write_bytes(b"test video content")
         task = self.h.task(path, target=target, mode=mode)
+        if download_hash:
+            task.download_hash, task.downloader = download_hash, "qbittorrent"
         if target == "local":
             task.target_path = self.root / "local_library"
             task.target_directory.library_path = str(task.target_path)
@@ -798,7 +800,7 @@ class MoviePilotTests(unittest.TestCase):
         self.assertEqual(len(scrapes), 1)
         self.assertEqual(len(scrapes[0]["file_list"]), 2)
 
-    def test_move_keeps_source_until_native_success_record_exists(self):
+    def test_move_keeps_source_while_waiting_then_removes_it_on_verified_success(self):
         task = self.enroll(mode="move")
         row = self.engine.store.all()[0]
         self.attempt(row["id"])
@@ -807,6 +809,152 @@ class MoviePilotTests(unittest.TestCase):
         self.attempt(row["id"])
         self.assertTrue(self.h.Oper().get(row["history_id"]).status)
         self.assertFalse(Path(task.fileitem.path).exists())
+
+    def attach_qb(self, names, progress=100):
+        from types import SimpleNamespace
+        removals = []
+        self.h.Chain.list_torrents = lambda *a, **kw: ([] if removals else [SimpleNamespace(progress=progress, path=self.root / names[0])])
+        self.h.Chain.torrent_files = lambda *a, **kw: [SimpleNamespace(name=name) for name in names]
+        def remove(chain, download_hash, downloader=None):
+            removals.append((download_hash, downloader))
+            return True
+        self.h.Chain.remove_torrents = remove
+        return removals
+
+    def test_move_success_deletes_qb_task_via_native_file_existence_guard(self):
+        removed = self.attach_qb(["A.mkv"])
+        task = self.enroll(mode="move", download_hash="torrent-a")
+        row = self.engine.store.all()[0]
+        self.attempt(row["id"])
+        self.assertEqual(removed, [])
+        self.assertTrue(Path(task.fileitem.path).exists())
+        self.api.hit = True
+        self.attempt(row["id"])
+        self.assertFalse(Path(task.fileitem.path).exists())
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(removed, [("torrent-a", "qbittorrent")])
+
+    def test_copy_success_keeps_qb_task_and_source(self):
+        removed = self.attach_qb(["A.mkv"])
+        task = self.enroll(mode="copy", download_hash="torrent-a")
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        self.attempt(row["id"])
+        self.assertTrue(Path(task.fileitem.path).exists())
+        self.assertEqual(removed, [])
+
+    def test_move_multifile_torrent_is_removed_only_after_all_videos_succeed(self):
+        removed = self.attach_qb(["A.mkv", "B.mkv"])
+        first = self.enroll("A.mkv", mode="move", download_hash="torrent-a")
+        second = self.enroll("B.mkv", mode="move", download_hash="torrent-a")
+        rows = {Path(row["source"].split(":", 1)[1]).name: row for row in self.engine.store.all()}
+        self.api.hit = True
+        self.attempt(rows["A.mkv"]["id"])
+        self.assertFalse(Path(first.fileitem.path).exists())
+        self.assertTrue(Path(second.fileitem.path).exists())
+        self.assertEqual(removed, [])
+        self.api.files["124"] = self.api.files.pop("123").model_copy(update={"fileid": "124"})
+        self.attempt(rows["B.mkv"]["id"])
+        self.assertFalse(Path(second.fileitem.path).exists())
+        self.assertEqual(removed, [("torrent-a", "qbittorrent")])
+
+    def test_move_keeps_torrent_if_unhandled_media_still_exists(self):
+        removed = self.attach_qb(["A.mkv", "Unprocessed.mkv"])
+        (self.root / "Unprocessed.mkv").write_bytes(b"unprocessed video")
+        self.enroll(mode="move", download_hash="torrent-a")
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertEqual(removed, [])
+        self.assertTrue((self.root / "Unprocessed.mkv").exists())
+
+    def test_move_keeps_torrent_when_another_file_failed_or_download_is_incomplete(self):
+        for progress in (90, 100):
+            with self.subTest(progress=progress):
+                first_name, other_name = f"A{progress}.mkv", f"B{progress}.mkv"
+                removed = self.attach_qb([first_name, other_name], progress=progress)
+                task = self.enroll(first_name, mode="move", download_hash=f"torrent-{progress}")
+                if progress == 100:
+                    other = self.enroll(other_name, mode="move", download_hash=f"torrent-{progress}")
+                    other_row = self.engine.store.active_for(self.h.bridge.source_key(other.fileitem))
+                    self.engine.control(other_row["id"], "cancel")
+                row = self.engine.store.active_for(self.h.bridge.source_key(task.fileitem))
+                self.api.hit = True
+                self.attempt(row["id"])
+                self.assertEqual(removed, [])
+
+    def test_source_delete_failure_does_not_call_success_or_remove_torrent(self):
+        removed = self.attach_qb(["A.mkv"])
+        task = self.enroll(mode="move", download_hash="torrent-a")
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        with patch.object(self.h.bridge.LocalStorage, "delete", return_value=False):
+            self.attempt(row["id"])
+        self.assertTrue(Path(task.fileitem.path).exists())
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(removed, [])
+
+    def test_move_rechecks_remote_identity_before_source_or_torrent_cleanup(self):
+        removed = self.attach_qb(["A.mkv"])
+        task = self.enroll(mode="move", download_hash="torrent-a")
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        complete = self.engine.complete
+        def lost_target(*args):
+            self.api.files.clear()
+            return complete(*args)
+        with patch.object(self.engine, "complete", side_effect=lost_target):
+            self.attempt(row["id"])
+        self.assertTrue(Path(task.fileitem.path).exists())
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(removed, [])
+
+    def test_recovery_retries_native_torrent_cleanup_without_replaying_success_events(self):
+        removed = self.attach_qb(["A.mkv"])
+        task = self.enroll(mode="move", download_hash="torrent-a")
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        callback = self.engine.original_callback
+        def interrupted(chain, actual_task, info):
+            callback(chain, actual_task, info)
+            raise remote.RetryLater("callback interrupted after history committed")
+        with patch.object(self.h.Chain, "list_torrents", return_value=[]):
+            self.engine.original_callback = interrupted
+            self.attempt(row["id"])
+        self.assertFalse(Path(task.fileitem.path).exists())
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(removed, [])
+        self.engine.stop()
+        self.h.chain.jobview = self.h.JobManager()
+        self.h.chain._scrape_batches = {}
+        self.engine = self.new_engine()
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertEqual(removed, [("torrent-a", "qbittorrent")])
+        self.assertEqual(self.api.inits, 1)
+        self.assertEqual(sum(kind == "TransferComplete" for kind, _ in self.h.events), 1)
+
+    def test_source_changed_during_final_remote_check_is_not_removed(self):
+        removed = self.attach_qb(["A.mkv"])
+        task = self.enroll(mode="move", download_hash="torrent-a")
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        complete, verify = self.engine.complete, self.api.verify
+        def changed_source(*args):
+            result = verify(*args)
+            Path(task.fileitem.path).write_bytes(b"changed during final confirmation")
+            return result
+        def wrapped_complete(*args):
+            with patch.object(self.api, "verify", side_effect=changed_source):
+                return complete(*args)
+        with patch.object(self.engine, "complete", side_effect=wrapped_complete):
+            self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertEqual(Path(task.fileitem.path).read_bytes(), b"changed during final confirmation")
+        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(removed, [])
 
     def test_native_always_overwrites_without_temporary_directory(self):
         task = self.enroll(mode="move")

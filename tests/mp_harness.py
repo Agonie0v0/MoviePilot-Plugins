@@ -288,9 +288,11 @@ class Harness:
             SystemConfigKey=SimpleNamespace(TransferExcludeWords="exclude", MountedLocalDiskDeleteEmptyDirs="dirs"),
             SystemConfigOper=lambda: SimpleNamespace(get=lambda key: None),
             StorageChain=lambda: SimpleNamespace(delete_media_file=lambda *a, **kw: None))
+        module("app.db.systemconfig_oper").SystemConfigOper = native_ns["SystemConfigOper"]
+        module("app.schemas.types").SystemConfigKey = native_ns["SystemConfigKey"]
         methods = {"__handle_transfer", "__default_callback", "__get_transfer_target_dir_path", "_requires_automatic_category",
             "__is_media_file", "__is_subtitle_file", "__is_audio_file", "__mark_torrent_completed_if_done",
-            "__should_delete_empty_source_directories",
+            "__should_delete_empty_source_directories", "_can_delete_torrent",
             "__register_scrape_batch_task", "__close_scrape_batch", "__record_scrape_target", "__finish_scrape_batch_task",
             "__flush_scrape_batch_if_ready", "__send_metadata_scrape_event"}
         selected("app/chain/transfer.py", {"TransferChain"}, native_ns, methods=methods)
@@ -300,12 +302,14 @@ class Harness:
             chain._success_target_files, chain._scrape_batches = {}, {}
             chain.eventmanager = events
             chain._media_exts = owner.settings.RMT_MEDIAEXT
+            chain._allowed_exts = owner.settings.RMT_MEDIAEXT
             chain._subtitle_exts = owner.settings.RMT_SUBEXT
             chain._audio_exts = owner.settings.RMT_AUDIOEXT
         self.Chain.__init__ = initialize
         self.Chain.post_message = lambda chain, msg: owner.notifications.append(msg)
         self.Chain.send_transfer_message = lambda *a, **kw: owner.notifications.append(kw)
-        self.Chain._can_delete_torrent = lambda *a, **kw: False
+        self.Chain.list_torrents = lambda *a, **kw: []
+        self.Chain._is_blocked_by_exclude_words = lambda *a, **kw: False
         self.Chain.build_failed_transfer_buttons = lambda *a: []
         self.Chain._TransferChain__is_torrent_download_completed = lambda *a: True
         self.Chain.transfer_completed = lambda *a, **kw: None

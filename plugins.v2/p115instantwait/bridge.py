@@ -11,13 +11,14 @@ from app.chain.transfer import TransferChain, job_lock
 from app.core.context import MediaInfo
 from app.core.meta import MetaAnime, MetaBase, MetaVideo
 from app.db import SessionFactory
+from app.db.systemconfig_oper import SystemConfigOper
 from app.db.models.transferhistory import TransferHistory
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.log import logger
 from app.modules.filemanager.storages.local import LocalStorage
 from app.modules.filemanager.storages.u115 import U115Pan
 from app.schemas import FileItem, TransferInfo, TransferTask
-from app.schemas.types import MediaType
+from app.schemas.types import MediaType, SystemConfigKey
 
 from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage,
                      RetryLater, fingerprint, hash_file, prepare_direct, NativePlanStorage,
@@ -562,17 +563,28 @@ class InstantWaitEngine:
 
     def complete(self, row, task, info, api):
         key = row["id"]
-        # The native callback can delete torrents and their data in move mode.
-        # Check before entering it, including when recovering a saved result.
+        # Native move removes the source before the success callback checks
+        # whether any torrent media files still exist. Keep that ordering.
         path = Path(task.fileitem.path)
         if path.exists() and fingerprint(path) != row["payload"]["source_initial"]:
             raise PauseTask("源文件在完成确认前发生变化，已停止回写与清理")
+        if task.transfer_type == "move" and path.exists():
+            visible = api.raw_path(info.target_item.path)
+            if not visible or str(visible.get("file_id")) != str(row["payload"]["remote_id"]):
+                raise PauseTask("源文件清理前远端目标被删除或替换，已暂停")
+            api.verify(row["payload"]["remote_id"], info.target_item.path, row["payload"]["hashes"])
+            if fingerprint(path) != row["payload"]["source_initial"]:
+                raise PauseTask("源文件在远端确认期间发生变化，已停止清理")
+            LocalStorage().delete(task.fileitem)
+            if path.exists():
+                raise RetryLater("远端已确认，等待移动模式源文件清理完成")
         oper = TransferHistoryOper()
         history = oper.get(row["history_id"]) if row["history_id"] else None
         # If the callback committed history and then crashed, don't replay external events.
         if history and history.status:
             self.chain.jobview.finish_task(task)
             self.chain._TransferChain__record_scrape_target(task, info)
+            self.cleanup_recovered_move(task)
         else:
             self.context.history_job = key
             try:
@@ -581,20 +593,26 @@ class InstantWaitEngine:
                     raise RetryLater("MP 完成回调尚未成功")
             finally:
                 self.context.history_job = None
-        # Preserve the configured native copy/move semantics after history is committed.
-        if task.transfer_type == "move":
-            path = Path(task.fileitem.path)
-            if path.exists():
-                if fingerprint(path) != row["payload"]["source_initial"]:
-                    raise PauseTask("整理已成功，但源文件变化，已停止清理")
-                LocalStorage().delete(task.fileitem)
-                if path.exists():
-                    raise RetryLater("整理已成功，等待源文件清理完成")
         self.store.update(key, state="completed", message="文件传输与 MP 整理完成")
         self.original_finish_batch(self.chain, task)
         self.chain.jobview.try_remove_job(task)
         self.live_tasks.pop(key, None)
         self.log_task(self.store.get(key), "整理成功", 结果="原整理记录已更新成功")
+
+    def cleanup_recovered_move(self, task):
+        """Retry only native torrent cleanup after a committed callback was lost."""
+        if task.transfer_type != "move" or not self.chain.jobview.is_success(task):
+            return
+        excluded = SystemConfigOper().get(SystemConfigKey.TransferExcludeWords)
+        processed = set()
+        for peer in self.chain.jobview.success_tasks(task.mediainfo, task.meta.begin_season):
+            torrent_hash = peer.download_hash
+            if not torrent_hash or torrent_hash in processed or not self.chain.jobview.is_torrent_success(torrent_hash):
+                continue
+            processed.add(torrent_hash)
+            if self.chain._can_delete_torrent(torrent_hash, peer.downloader, excluded):
+                removed = self.chain.remove_torrents(torrent_hash, downloader=peer.downloader)
+                logger.info(f"【115秒传等待】恢复移动模式种子清理 | 种子={log_text(torrent_hash)} | 已删除={bool(removed)}")
 
     def finish_failure(self, row, task, info):
         self.context.history_job = row["id"]

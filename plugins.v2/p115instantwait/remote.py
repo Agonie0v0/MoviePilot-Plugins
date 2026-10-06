@@ -550,5 +550,5 @@ class DeferredSource:
         return getattr(self.backend, name)
 
     def delete(self, item):
-        # Completion/history is durably checkpointed before source cleanup.
+        # The bridge verifies and checkpoints the remote result before cleanup.
         return True
