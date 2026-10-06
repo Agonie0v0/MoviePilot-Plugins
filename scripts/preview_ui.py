@@ -47,6 +47,7 @@ def fixtures():
 
 
 TASKS = fixtures()
+BATCH_RESULT = None
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -68,7 +69,7 @@ class Handler(SimpleHTTPRequestHandler):
             if scenario == "long":
                 tasks[0]["source"] = "/downloads/" + "VeryLongMovieName_" * 30 + "电影.mkv"
                 tasks[0]["message"] = "目标路径冲突：" + "/115/电影/" * 30 + "，请核对目标文件。"
-            self.response(dict(form=ui.config_form(tasks, error), page=ui.task_page(tasks, enabled, error, 3),
+            self.response(dict(form=ui.config_form(tasks, error, BATCH_RESULT), page=ui.task_page(tasks, enabled, error, 3, BATCH_RESULT),
                                defaults={**defaults, "enabled": enabled}))
         elif self.path == "/plugin/P115InstantWait/tasks":
             self.response(TASKS)
@@ -76,12 +77,34 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
+        global BATCH_RESULT
         parts = self.path.strip("/").split("/")
+        if len(parts) == 4 and parts[:3] == ["plugin", "P115InstantWait", "batch"] and parts[3] in ("resume", "upload"):
+            action = parts[3]
+            keys = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))).get("keys", [])
+            result = dict(action=action, at=time.strftime("%Y-%m-%d %H:%M:%S"), accepted=0, skipped=0, failed=0, items=[])
+            for key in dict.fromkeys(keys):
+                task = next((t for t in TASKS if t["id"] == key), None)
+                allowed = ("paused",) if action == "resume" else ("queued", "waiting", "paused")
+                accepted = task and task["state"] in allowed
+                status = "accepted" if accepted else "skipped"
+                if accepted:
+                    task.update(state="waiting" if action == "resume" else "upload_queued", message="预览批量操作已提交", updated=time.time())
+                    if action == "resume":
+                        task["auto_attempts"] = 0
+                result[status] += 1
+                result["items"].append(dict(id=key, name=ui.filename(task["source"]) if task else key,
+                                           status=status, message="预览操作已提交" if accepted else "当前状态不支持操作"))
+            BATCH_RESULT = result
+            self.response(result)
+            return
         if len(parts) == 5 and parts[:3] == ["plugin", "P115InstantWait", "tasks"]:
             task = next((t for t in TASKS if t["id"] == parts[3]), None)
             states = {"resume": "waiting", "pause": "paused", "upload": "upload_queued", "cancel": "cancelled"}
             if task and parts[4] in states:
                 task.update(state=states[parts[4]], message="预览操作已提交", updated=time.time())
+                if parts[4] == "resume":
+                    task["auto_attempts"] = 0
                 self.response(dict(success=True, state=task["state"]))
                 return
         self.send_error(404)

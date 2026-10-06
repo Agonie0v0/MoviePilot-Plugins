@@ -24,7 +24,7 @@ const App={setup(){
   const view=ref('page'),dark=ref(false),scenario=ref('normal'),schemas=ref(null),model=reactive({}),busy=ref(false),feedback=ref('');
   const config=ref(null);
   async function load(reset=false){const data=await fetch('/schema?scenario='+scenario.value).then(r=>r.json());schemas.value=data;if(reset)Object.assign(model,data.defaults);}
-  async function action(event){busy.value=true;try{const res=await fetch('/'+event.api,{method:event.method});if(!res.ok)throw new Error('操作失败');await load();feedback.value='队列已更新（预览数据）';}catch(e){feedback.value=e.message;}finally{busy.value=false;}}
+  async function action(event){busy.value=true;try{const res=await fetch('/'+event.api,{method:event.method,...(event.method==='POST'?{headers:{'Content-Type':'application/json'},body:JSON.stringify(event.params||{})}:{})});if(!res.ok)throw new Error('操作失败');await load();feedback.value='队列已更新（预览数据）';}catch(e){feedback.value=e.message;}finally{busy.value=false;}}
   function parseProps(raw){const out={};for(const [key,value]of Object.entries(raw)){
     const expression=typeof value==='string'&&value.startsWith('{{')&&value.endsWith('}}');
     if(key==='model'||key==='v-model'){out.modelValue=model[value];out['onUpdate:modelValue']=v=>model[value]=v;}

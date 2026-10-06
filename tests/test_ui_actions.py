@@ -44,10 +44,27 @@ class TaskActionTests(unittest.TestCase):
         task = dict(id="task-1", history_id=10, source="/film.mkv", target="/library/film.mkv",
                     state="paused", attempts=4, next_at=time.time(), message="达到重试上限")
         row = ui.task_row(task, True, time.time(), 3)
-        confirmations = [n for n in walk([row]) if n.get("props", {}).get("class") == "p115-confirm"]
+        confirmations = [n for n in walk([row]) if "p115-confirm" in n.get("props", {}).get("class", "").split()]
         self.assertEqual(len(confirmations), 2)
         for confirmation in confirmations:
             self.assertFalse(confirmation.get("props", {}).get("open", False))
             self.assertNotIn("events", confirmation["content"][0])
             self.assertTrue(any(n.get("events", {}).get("click", {}).get("method") == "POST"
                                 for n in walk(confirmation["content"][1:])))
+
+    def test_filters_and_bulk_snapshots_match_actual_states(self):
+        tasks = [dict(id=state, history_id=1, source=f"/{state}.mkv", target="/library/film.mkv",
+                      state=state, attempts=4, next_at=0) for state in ui.LABELS]
+        page = ui.task_page(tasks, True, max_retries=3)
+        nodes = list(walk(page))
+        rows = [n for n in nodes if n.get("props", {}).get("class") == "p115-task"]
+        self.assertEqual(len(rows), len(tasks))
+        self.assertEqual(sum("attention" in n["props"]["data-category"].split() for n in rows), 2)
+        self.assertEqual(sum("ended" in n["props"]["data-category"].split() for n in rows), 3)
+        events = {n["events"]["click"]["api"].rsplit("/", 1)[1]: n["events"]["click"]["params"]["keys"]
+                  for n in nodes if "/batch/" in n.get("events", {}).get("click", {}).get("api", "")}
+        self.assertEqual(events["resume"], ["paused"])
+        self.assertEqual(set(events["upload"]), {"queued", "waiting", "paused"})
+        radios = [n["props"] for n in nodes if n["component"] == "input"]
+        self.assertEqual(sum(r["checked"] for r in radios), 1)
+        self.assertEqual({r["value"] for r in radios}, {"all", "waiting", "attention", "transfer", "ended"})

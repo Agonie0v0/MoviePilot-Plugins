@@ -2,7 +2,7 @@
 from pathlib import Path
 from datetime import datetime
 
-from fastapi import HTTPException
+from fastapi import Body, HTTPException
 
 from app.log import logger
 from app.plugins import _PluginBase
@@ -38,7 +38,7 @@ class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "0.3.3"
+    plugin_version = "0.3.4"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -156,6 +156,8 @@ class P115InstantWait(_PluginBase):
              "auth": "bear", "summary": "查看秒传等待队列"},
             {"path": "/tasks/{task_id}/{action}", "endpoint": self.control_task,
              "methods": ["POST"], "auth": "bear", "summary": "暂停、继续等待、强制上传或取消任务"},
+            {"path": "/batch/{action}", "endpoint": self.control_batch,
+             "methods": ["POST"], "auth": "bear", "summary": "批量恢复等待或安排强制上传"},
         ]
 
     def queue(self):
@@ -181,9 +183,29 @@ class P115InstantWait(_PluginBase):
         return config_form(self.list_tasks(), self._error, self.get_data("last_batch_result"),
                            history_result=self.get_data("last_history_cleanup")), {**DEFAULTS, "task_ids": [], "history_ids": []}
 
+    def control_batch(self, action: str, keys: list[str] = Body(..., embed=True)):
+        if not self.get_state():
+            raise HTTPException(status_code=409, detail="请先启用插件")
+        if action not in ("resume", "upload"):
+            raise HTTPException(status_code=400, detail="不支持此批量操作")
+        try:
+            # IDs are the reviewed page snapshot, never an open-ended 'all'.
+            # control_many validates the list and rechecks each current state.
+            result = self._engine.control_many(keys, action)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        try:
+            self.save_data("last_batch_result", result)
+        except Exception:
+            logger.warning("【115秒传等待】批量操作结果保存失败，请核对队列状态与日志")
+            self._error = "批量操作已提交，但结果未能保存；请核对任务状态与日志。"
+            result["notice"] = self._error
+        return result
+
     def get_page(self):
         return task_page(self.list_tasks(), self.get_state(), self._error,
-                         max_retries=int(self._engine.config["max_retries"]) if self._engine else None)
+                         max_retries=int(self._engine.config["max_retries"]) if self._engine else None,
+                         batch_result=self.get_data("last_batch_result"))
 
     def stop_service(self):
         if self._engine:
