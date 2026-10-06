@@ -266,12 +266,14 @@ class Runner:
 class Fake115:
     def __init__(self, h):
         self.h, self.files, self.hit = h, {}, False
+        self.hashes, self.folders, self.moves = {}, [], []
         self.inits = self.uploads = 0
         self.block_entered, self.block_release = threading.Event(), threading.Event()
         self.block = False
     def close(self):
         pass
     def get_folder(self, path):
+        self.folders.append(str(path))
         return self.h.FileItem(storage="u115", type="dir", fileid="10", path=str(path).replace("\\", "/"))
     def get_item(self, path):
         return next((f.model_copy() for f in self.files.values() if f.path == str(path).replace("\\", "/")), None)
@@ -286,6 +288,9 @@ class Fake115:
         if item.size != hashes["fingerprint"]["size"]:
             raise self.h.remote.PauseTask("大小错误")
         return item.model_copy(update={"path": str(path)})
+    def raw_id(self, file_id):
+        return {"sha1": self.hashes.get(str(file_id))}
+
     def instant(self, path, folder, name, hashes):
         self.inits += 1
         if self.block:
@@ -295,6 +300,7 @@ class Fake115:
             raise self.h.remote.NotInstant("未秒传")
         self.files["123"] = self.h.FileItem(storage="u115", type="file", fileid="123",
             path=str(PurePosixPath(folder.path) / name), size=hashes["fingerprint"]["size"], name=name)
+        self.hashes["123"] = hashes["sha1"]
         return "123"
     def upload(self, path, folder, hashes, init, payload, checkpoint):
         self.uploads += 1
@@ -303,4 +309,5 @@ class Fake115:
         payload["upload_confirmed"] = True
         checkpoint()
     def move_id(self, file_id, folder, name):
+        self.moves.append((file_id, str(folder.path)))
         self.files[str(file_id)] = self.files[str(file_id)].model_copy(update={"path": str(PurePosixPath(folder.path) / name)})

@@ -3,7 +3,6 @@ import hashlib
 import time
 from pathlib import Path, PurePosixPath
 
-from .maintenance import TASK_ID, parse_roots
 
 
 class RetryLater(Exception):
@@ -150,6 +149,8 @@ class OpenAPI:
         p = PurePosixPath(str(path).replace("\\", "/"))
         if not p.is_absolute() or ".." in p.parts:
             raise PauseTask("115 目标必须是绝对路径")
+        if any(part in (".mp115-staging", ".mp115-backups") for part in p.parts):
+            raise PauseTask("已停用临时目录，不允许将其作为整理目标")
         if p == PurePosixPath("/"):
             return self.item_factory(storage="u115", type="dir", path="/", fileid="0", name="/")
         existing = self.get_item(p)
@@ -186,62 +187,6 @@ class OpenAPI:
             if len(rows) < 1000:
                 return result
             offset += len(rows)
-
-    def staging_children(self, root):
-        root = parse_roots(str(root))[0]
-        info = self.raw_path(root)
-        if info is None:
-            return []
-        if str(info.get("file_category")) != "0" or not info.get("file_id") or int(info["file_id"]) <= 0:
-            raise RetryLater("暂存目录信息异常")
-        children, offset = [], 0
-        while True:
-            rows = self.request("GET", "/open/ufile/files", params={
-                "cid": int(info["file_id"]), "limit": 1000, "offset": offset,
-                "cur": 1, "show_dir": 1, "stdir": 1, "star": 0})
-            if not isinstance(rows, list):
-                raise RetryLater("暂存目录列表不完整")
-            for row in rows:
-                if str(row.get("fc")) == "0" and TASK_ID.fullmatch(str(row.get("fn", ""))):
-                    children.append(str(PurePosixPath(root) / row["fn"]))
-            if len(rows) < 1000:
-                return children
-            offset += len(rows)
-
-    def remove_empty_staging_dir(self, path):
-        path = PurePosixPath(str(path))
-        if (not path.is_absolute() or ".." in path.parts or not (
-                path.name == ".mp115-staging" or
-                (path.parent.name == ".mp115-staging" and TASK_ID.fullmatch(path.name)))):
-            raise ValueError("拒绝清理非暂存目录")
-        info = self.raw_path(path)
-        if info is None:
-            return "missing"
-        if str(info.get("file_category")) != "0" or not info.get("file_id") or int(info["file_id"]) <= 0:
-            raise RetryLater("暂存目录信息异常，保留目录")
-        folder_id = int(info["file_id"])
-        rows = self.request("GET", "/open/ufile/files", params={
-            "cid": folder_id, "limit": 1, "offset": 0,
-            "cur": 1, "show_dir": 1, "stdir": 1, "star": 0})
-        if not isinstance(rows, list):
-            raise RetryLater("暂存目录列表不完整，保留目录")
-        if rows:
-            return "retained"
-        self.request("POST", "/open/ufile/delete", data={"file_ids": folder_id})
-        return "deleted"
-
-    def move_id(self, file_id, folder, name):
-        # Query first: replaying a committed move is harmless after response loss/restart.
-        existing = self.raw_path(PurePosixPath(folder.path) / name)
-        if existing and str(existing.get("file_id")) == str(file_id):
-            return
-        if existing:
-            raise PauseTask("目标被另一个文件占用，已保留源文件及暂存文件")
-        self.request("POST", "/open/ufile/move", data={"file_ids": int(file_id), "to_cid": int(folder.fileid)})
-        self.request("POST", "/open/ufile/update", data={"file_id": int(file_id), "file_name": name})
-        visible = self.raw_path(PurePosixPath(folder.path) / name)
-        if not visible or str(visible.get("file_id")) != str(file_id):
-            raise RetryLater("115 移动后目标信息尚未可见")
 
     def verify(self, file_id, path, hashes):
         info = self.raw_id(file_id)
@@ -368,6 +313,9 @@ class OpenAPI:
             if not isinstance(response, dict) or not response.get("state"):
                 raise RetryLater("115 上传完成回调未确认，需核对远端结果")
             payload["upload_confirmed"] = True
+            result_data = response.get("data")
+            if isinstance(result_data, dict) and str(result_data.get("file_id", "")).isdigit():
+                payload["remote_id"] = str(result_data["file_id"])
             checkpoint()
         except (RetryLater, PauseTask):
             raise
@@ -376,17 +324,92 @@ class OpenAPI:
             raise RetryLater("普通上传未完成，上传进度已保留；请手动重试") from None
 
 
-class PreparedStorage:
-    """Use a verified staged file inside MP's normal transfer operation.
+def prepare_direct(api, store, row, path, data, force, progress=None):
+    """Write once at the final path; fence conflicts and uncertain responses."""
+    final = PurePosixPath(data["final_path"])
+    if any(part in (".mp115-staging", ".mp115-backups") for part in final.parts):
+        raise PauseTask("已停用临时目录，请选择正式整理目标")
+    if not store.reserve_target(row["id"], str(final)):
+        raise PauseTask("另一个未结束任务占用相同正式目标，请先处理该任务")
+    checkpoint = lambda: store.update(row["id"], payload=data)
+    existing = api.raw_path(final)
+    file_id = data.get("remote_id")
+    if existing:
+        if file_id:
+            if str(existing.get("file_id")) != str(file_id):
+                raise PauseTask("正式目标已被另一个文件占用，请人工核对")
+        else:
+            # The preflight proved absence before our persisted write intent.
+            # Require exact content evidence to recover a lost init/callback ID.
+            if not data.get("write_intent"):
+                raise PauseTask("正式目标已存在，已停止上传；请人工处理同名冲突")
+            file_id = existing.get("file_id")
+            info = api.raw_id(file_id) if file_id else None
+            digest = (info or {}).get("sha1") or (info or {}).get("file_sha1")
+            pick_code = data.get("upload_session", {}).get("pick_code")
+            same_upload = pick_code and str((info or {}).get("pick_code", "")) == str(pick_code)
+            if (digest and str(digest).upper() != data["hashes"]["sha1"]) or (not digest and not same_upload):
+                raise PauseTask("上传响应未确认，正式目标缺少匹配 SHA1 或上传标识，已停止重复上传")
+            data["remote_id"] = str(file_id)
+            checkpoint()
+        return api.verify(file_id, str(final), data["hashes"])
+    if file_id:
+        raise RetryLater("已提交上传结果，等待正式路径可见；不会重复上传")
+    if data.get("instant_confirmed") or data.get("upload_confirmed"):
+        raise RetryLater("已提交上传结果，等待正式文件可见；不会重复上传")
+    if data.get("write_intent") and not data.get("upload_session"):
+        raise PauseTask("上传初始化结果未确认，已停止重复上传；请核对正式目标后重新整理")
+    folder = api.get_folder(final.parent)
+    if data.get("target_folder_id") and str(data["target_folder_id"]) != str(folder.fileid):
+        raise PauseTask("正式目标目录身份已变化，请人工核对上传进度")
+    data["target_folder_id"] = str(folder.fileid)
+    if api.raw_path(final):
+        raise PauseTask("上传前发现同名正式目标，已停止上传")
+    if data.get("upload_session"):
+        if not force:
+            raise PauseTask("有未完成的普通上传，请强制上传继续")
+        checkpoint()
+        api.upload(path, folder, data["hashes"], None, data, checkpoint)
+        if progress:
+            progress("普通上传已提交")
+    else:
+        data["write_intent"] = True
+        checkpoint()
+        try:
+            file_id = api.instant(path, folder, final.name, data["hashes"])
+        except NotInstant as error:
+            # A definite miss creates no cloud file. Persist safe retry state.
+            data.pop("write_intent", None)
+            checkpoint()
+            if not force:
+                raise
+            if progress:
+                progress("秒传未命中，转普通上传")
+            # Check again immediately before multipart upload starts.
+            if api.raw_path(final):
+                raise PauseTask("普通上传前发现同名目标，已停止上传")
+            data["write_intent"] = True
+            checkpoint()
+            api.upload(path, folder, data["hashes"], error.upload_data, data, checkpoint)
+            if progress:
+                progress("普通上传已提交")
+        else:
+            data["instant_confirmed"] = True
+            if file_id:
+                data["remote_id"] = str(file_id)
+            checkpoint()
+            if progress:
+                progress("秒传命中")
+    # Reconcile the final path, including callbacks that don't return a file ID.
+    return prepare_direct(api, store, row, path, data, force, progress)
 
-    MP's delete-before-upload calls are buffered. Old files move to a recoverable
-    backup directory only after the new file has been verified.
-    """
-    def __init__(self, api, store, job, final_path, staged, hashes):
+
+class DirectStorage:
+    """Let MP finalize its native plan using an already verified final object."""
+    def __init__(self, api, store, job, final_path, item, hashes):
         self.api, self.store, self.job = api, store, job
         self.final_path = PurePosixPath(final_path)
-        self.staged, self.hashes = staged, hashes
-        self.deletions = []
+        self.item, self.hashes = item, hashes
         self.error = None
 
     def __getattr__(self, name):
@@ -404,23 +427,18 @@ class PreparedStorage:
     def get_item(self, path):
         try:
             item = self.api.get_item(path)
+            if item and str(item.fileid) == str(self.item.fileid) and PurePosixPath(str(path).replace("\\", "/")) == self.final_path:
+                return None
+            return item
         except Exception as exc:
             self.error = exc
             raise
-        # Our own already committed upload must not become a same-name conflict.
-        if item and str(item.fileid) == str(self.staged.fileid) and PurePosixPath(str(path).replace("\\", "/")) == self.final_path:
-            return None
-        return item
 
     get_item_strict = get_item
 
     def delete(self, item):
-        if item.type != "file":
-            self.error = PauseTask("拒绝替换整个远端目录")
-            raise self.error
-        if all(str(old.fileid) != str(item.fileid) for old in self.deletions):
-            self.deletions.append(item)
-        return True
+        self.error = PauseTask("正式目录存在旧目标，拒绝自动删除或创建备份目录，请人工处理")
+        raise self.error
 
     def upload(self, target_dir, local_path, new_name=None):
         try:
@@ -429,20 +447,11 @@ class PreparedStorage:
                 raise PauseTask("重试时整理目标发生变化，请人工处理")
             if fingerprint(local_path) != self.hashes["fingerprint"]:
                 raise PauseTask("源文件在等待期间发生变化")
-            self.api.verify(self.staged.fileid, self.staged.path, self.hashes)
+            visible = self.api.raw_path(final)
+            if not visible or str(visible.get("file_id")) != str(self.item.fileid):
+                raise PauseTask("正式目标被删除或替换，请人工核对")
+            item = self.api.verify(self.item.fileid, str(final), self.hashes)
             payload = self.store.get(self.job["id"])["payload"]
-            backups = payload.setdefault("backups", [])
-            for old in self.deletions:
-                if not any(str(b["fileid"]) == str(old.fileid) for b in backups):
-                    backups.append({"fileid": str(old.fileid), "path": old.path, "name": old.name})
-            self.store.update(self.job["id"], payload=payload)
-            # Keep old versions as recoverable backups instead of deleting them.
-            if backups:
-                backup_dir = self.api.get_folder(self.final_path.parent / ".mp115-backups" / self.job["id"])
-                for old in backups:
-                    self.api.move_id(old["fileid"], backup_dir, old["name"])
-            self.api.move_id(self.staged.fileid, target_dir, final.name)
-            item = self.api.verify(self.staged.fileid, str(final), self.hashes)
             payload["committed"] = True
             self.store.update(self.job["id"], payload=payload)
             return item

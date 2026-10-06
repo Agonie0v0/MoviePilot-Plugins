@@ -56,7 +56,7 @@ def filename(path):
     return PurePosixPath(str(path).replace("\\", "/")).name
 
 
-def config_form(tasks, error="", batch_result=None, history_result=None, staging_result=None):
+def config_form(tasks, error="", batch_result=None, history_result=None):
     choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}"
                          f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
                 "props": {"disabled": t["state"] in ("running", "uploading", "finalizing")}}
@@ -113,7 +113,7 @@ def config_form(tasks, error="", batch_result=None, history_result=None, staging
                   **{"class": "text-body-2 mt-3"}),
         paragraph("兼容：MP V3.1.x，本地到内置 115 的复制/移动；字幕、NFO、图片沿用 MP，蓝光原盘目录暂不支持。V2 遗留任务需先完成或取消。",
                   **{"class": "text-body-2 mt-3"}),
-        paragraph("覆盖备份：旧文件放在目标目录 .mp115-backups，确认无误后可自行清理。",
+        paragraph("直接写入正式目录和文件名；同名目标已存在时暂停，请人工处理冲突后继续。",
                   **{"class": "text-body-2 mt-3"}),
     ])
     scope = disclosure("视频格式 · 通常无需修改", [
@@ -155,15 +155,6 @@ def config_form(tasks, error="", batch_result=None, history_result=None, staging
     history_choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])} · {record_time(t.get('updated'))}",
                         "value": t["id"]} for t in tasks if t["state"] in ("completed", "failed", "cancelled")]
     maintenance = disclosure("历史清理", [
-        node("div", "115 空暂存目录", **{"class": "text-subtitle-1 font-weight-bold mb-2"}),
-        paragraph("成功任务会自动清理空暂存目录。补清理历史残留时，只检查插件记录过的位置和下方补充的路径。"),
-        field("VTextarea", "staging_extra_paths", "补充旧暂存目录（可选）",
-              "每行一个完整路径，例如 /电影/.mp115-staging。无需填写仍有记录的目录，不会扫描整个网盘。",
-              rows=2, **{"auto-grow": True, "spellcheck": False, "class": "mt-3"}),
-        node("VCheckbox", model="cleanup_staging", label="保存时清理一次历史空暂存目录",
-             **{"color": "primary", "hide-details": True, "disabled": "{{ !enabled }}", "class": "mt-2"}),
-        paragraph("需启用插件；后台执行，重新打开配置查看结果。有内容、正在使用的目录和 .mp115-backups 均保留。"),
-        node("VDivider", **{"class": "my-5"}),
         node("div", "插件已结束记录", **{"class": "text-subtitle-1 font-weight-bold mb-2"}),
         paragraph("仅移除插件列表中的记录，保留 MoviePilot 整理历史、本地文件及网盘文件。未完成任务，以及同批次恢复仍需要的成功记录会跳过。"),
         node("div", content=[field("VSelect", "history_mode", "选择方式", "仅按当前选择方式清理。",
@@ -188,17 +179,12 @@ def config_form(tasks, error="", batch_result=None, history_result=None, staging
         node("VCheckbox", model="cleanup_history", label="保存时删除一次所选插件记录（不可撤销）",
              **{"color": "warning", "hide-details": True, "class": "mt-3",
                 "disabled": "{{ history_mode === 'selected' ? (!history_ids || !history_ids.length) : (!history_states || !history_states.length) }}"}),
-        paragraph("插件关闭时也可清理记录。两个清理选项执行一次后自动取消勾选；目录位置会继续保留，便于日后补清理。"),
+        paragraph("插件关闭时也可清理记录。清理选项执行一次后自动取消勾选。"),
     ])
-    for result in (staging_result, history_result):
+    for result in (history_result,):
         if not result:
             continue
-        if result.get("kind") == "history":
-            summary = f"上次记录清理（{'未完成' if result.get('status') == 'failed' else '已结束'}）：已删除 {result.get('deleted', 0)} · 跳过 {result.get('skipped', 0)}"
-        else:
-            status = {"running": "执行中", "completed": "已结束", "stopped": "已停止", "failed": "异常中断"}.get(result.get("status"), "待核对")
-            summary = (f"上次空目录清理（{status}）：已删除 {result.get('deleted', 0)} · 保留 {result.get('retained', 0)}"
-                       f" · 已不存在 {result.get('missing', 0)} · 异常 {result.get('failed', 0)}")
+        summary = f"上次记录清理（{'未完成' if result.get('status') == 'failed' else '已结束'}）：已删除 {result.get('deleted', 0)} · 跳过 {result.get('skipped', 0)}"
         details = [paragraph(result.get("at", ""))] + [paragraph(item, **{"style": "overflow-wrap:anywhere;line-height:1.65"}) for item in result.get("items", [])]
         maintenance["content"][1]["content"].insert(0, disclosure(summary, details))
     content = [intro]

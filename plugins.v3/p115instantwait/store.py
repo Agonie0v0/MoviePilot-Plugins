@@ -6,7 +6,6 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .maintenance import staging_root
 
 
 TERMINAL = ("completed", "cancelled", "failed")
@@ -24,7 +23,7 @@ class QueueStore:
                 next_at REAL NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
                 history_id INTEGER, message TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL
             )""")
-            db.execute("CREATE TABLE IF NOT EXISTS staging_roots (path TEXT PRIMARY KEY)")
+            db.execute("CREATE TABLE IF NOT EXISTS target_owners (path TEXT PRIMARY KEY, job_id TEXT NOT NULL)")
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS active_source ON jobs(source)
                 WHERE state NOT IN ('completed', 'cancelled', 'failed')""")
 
@@ -76,26 +75,15 @@ class QueueStore:
             return [self.decode(row) for row in db.execute(
                 f"SELECT * FROM jobs {where} ORDER BY created DESC LIMIT ?", (limit,))]
 
-    def staging_roots(self, extra=()):
-        """Keep locations after history removal; never crawl arbitrary library trees."""
+    def reserve_target(self, key, path):
+        """Fence both workers and restarts against concurrent same-target uploads."""
         with self.connect() as db:
-            roots = set(extra)
-            for row in db.execute("SELECT payload FROM jobs"):
-                payload = json.loads(row["payload"])
-                if payload.get("final_path"):
-                    roots.add(staging_root(payload["final_path"]))
-            db.executemany("INSERT OR IGNORE INTO staging_roots(path) VALUES(?)", ((p,) for p in roots))
-            return [row["path"] for row in db.execute("SELECT path FROM staging_roots ORDER BY path")]
-
-    def staging_in_use(self, root, key=None):
-        with self.connect() as db:
-            for row in db.execute("SELECT id,payload FROM jobs WHERE state NOT IN ('completed','cancelled','failed')"):
-                if key is not None and row["id"] != key:
-                    continue
-                payload = json.loads(row["payload"])
-                if staging_root(payload["final_path"]) == str(root):
-                    return True
-        return False
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM target_owners WHERE job_id IN (SELECT id FROM jobs "
+                       "WHERE state IN ('completed','cancelled','failed'))")
+            db.execute("DELETE FROM target_owners WHERE job_id NOT IN (SELECT id FROM jobs)")
+            db.execute("INSERT OR IGNORE INTO target_owners(path,job_id) VALUES(?,?)", (str(path), key))
+            return db.execute("SELECT job_id FROM target_owners WHERE path=?", (str(path),)).fetchone()[0] == key
 
     def clear_history(self, *, mode="selected", keys=None, states=None, days=30, now=None):
         """Call while the engine is stopped. Leave active batch recovery peers intact."""
@@ -136,9 +124,6 @@ class QueueStore:
                     if len(result["items"]) < 50:
                         result["items"].append(f"{row['id']}：任务未结束，或同批次仍需此记录恢复")
                     continue
-                path = row["payload"].get("final_path")
-                if path:
-                    db.execute("INSERT OR IGNORE INTO staging_roots(path) VALUES(?)", (staging_root(path),))
                 db.execute("DELETE FROM jobs WHERE id=? AND state IN ('completed','cancelled','failed')", (row["id"],))
                 result["deleted"] += 1
             if mode == "selected":

@@ -13,6 +13,8 @@ class Fake115:
     def __init__(self, harness):
         self.h = harness
         self.files = {}
+        self.hashes = {}
+        self.folders = []
         self.inits = 0
         self.uploads = 0
         self.moves = []
@@ -26,6 +28,7 @@ class Fake115:
 
     def get_folder(self, path):
         path = str(path).replace("\\", "/")
+        self.folders.append(path)
         return self.h.FileItem(storage="u115", type="dir", path=path, fileid="10", name=PurePosixPath(path).name)
 
     def get_item(self, path):
@@ -37,6 +40,9 @@ class Fake115:
     def raw_path(self, path):
         item = self.get_item(path)
         return {"file_id": item.fileid} if item else None
+
+    def raw_id(self, file_id):
+        return {"sha1": self.hashes.get(str(file_id))}
 
     def instant(self, path, folder, name, hashes):
         self.inits += 1
@@ -50,6 +56,7 @@ class Fake115:
             path=str(PurePosixPath(folder.path) / name), name=name, basename=PurePosixPath(name).stem,
             extension=PurePosixPath(name).suffix.lstrip("."), size=hashes["fingerprint"]["size"])
         self.files[item.fileid] = item
+        self.hashes[item.fileid] = hashes["sha1"]
         return item.fileid
 
     def verify(self, file_id, path, hashes):
@@ -67,6 +74,7 @@ class Fake115:
             path=str(PurePosixPath(folder.path) / name), name=name,
             size=hashes["fingerprint"]["size"])
         self.files[item.fileid] = item
+        self.hashes[item.fileid] = hashes["sha1"]
         payload["upload_confirmed"] = True
         checkpoint()
 
@@ -316,25 +324,6 @@ class MoviePilotTests(unittest.TestCase):
         cleanup.assert_not_called()
         self.assertIn("本次未执行", plugin._error)
 
-    def test_staging_cleanup_is_consumed_once_and_not_restarted_by_saved_config(self):
-        import sys
-        import types
-        plugin = self.attach_plugin_notifier()
-        plugin.get_data_path = Mock(return_value=self.root / "plugin")
-        plugin.update_config = Mock(return_value=True)
-        fake = Mock()
-        version = types.ModuleType("version")
-        version.APP_VERSION = "v2.15.6"
-        with patch.dict(sys.modules, {"version": version}), \
-                patch.dict(plugin.init_plugin.__globals__, {"InstantWaitEngine": Mock(return_value=fake)}):
-            plugin.init_plugin({"enabled": True, "cleanup_staging": True,
-                                "staging_extra_paths": "/old/.mp115-staging"})
-            fake.maintenance.start.assert_called_once()
-            self.assertEqual(fake.maintenance.start.call_args.args[0], ["/old/.mp115-staging"])
-            saved = dict(plugin.update_config.call_args.args[0])
-            self.assertFalse(saved["cleanup_staging"])
-            plugin.init_plugin(saved)
-            self.assertEqual(fake.maintenance.start.call_count, 1)
 
     def test_invalid_history_filter_does_not_disable_engine_or_delete_records(self):
         import sys
@@ -357,24 +346,6 @@ class MoviePilotTests(unittest.TestCase):
         self.assertIn("记录状态", plugin._error)
         self.assertEqual(plugin.save_data.call_args.args[1]["status"], "failed")
 
-    def test_auto_cleanup_runs_only_after_success_and_does_not_replay_on_error(self):
-        task = self.enroll(mode="move")
-        row = self.engine.store.all()[0]
-        self.api.remove_empty_staging_dir = Mock(return_value="deleted")
-        self.attempt(row["id"])
-        self.api.remove_empty_staging_dir.assert_not_called()
-        self.api.hit = True
-        def cleaned(path):
-            self.assertTrue(self.h.Oper().get(row["history_id"]).status)
-            self.assertFalse(Path(task.fileitem.path).exists())
-            self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
-            raise remote.RetryLater("限流")
-        self.api.remove_empty_staging_dir.side_effect = cleaned
-        self.attempt(row["id"])
-        self.assertEqual(self.api.remove_empty_staging_dir.call_count, 1)
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
-        self.assertIsNone(self.engine.store.claim())
-        self.assertEqual(sum(kind == "TransferComplete" for kind, _ in self.h.events), 1)
 
     def test_notification_toggle_suppresses_both_local_and_push_messages(self):
         plugin = self.attach_plugin_notifier()
@@ -661,9 +632,11 @@ class MoviePilotTests(unittest.TestCase):
         path = Path(payload["task"]["fileitem"]["path"])
         payload["hashes"] = remote.hash_file(path, threading.Event())
         payload["upload_session"] = {"upload_id": "interrupted"}
+        payload["write_intent"] = True
+        self.api.hashes["123"] = payload["hashes"]["sha1"]
         final = PurePosixPath(payload["final_path"])
         self.api.files["123"] = self.h.FileItem(storage="u115", type="file", fileid="123",
-            path=str(final.parent / ".mp115-staging" / row["id"] / final.name),
+            path=str(final),
             name=final.name, size=path.stat().st_size)
         self.engine.store.update(row["id"], state="uploading", payload=payload)
         self.engine.stop()
@@ -820,32 +793,46 @@ class MoviePilotTests(unittest.TestCase):
         self.assertTrue(self.h.Oper().get(row["history_id"]).status)
         self.assertFalse(Path(task.fileitem.path).exists())
 
-    def test_overwrite_preserves_old_file_while_waiting_then_backs_it_up(self):
-        self.enroll()
+    def test_conflict_pauses_without_upload_or_remote_mutations(self):
+        task = self.enroll(mode="move")
         row = self.engine.store.all()[0]
         old = self.h.FileItem(storage="u115", type="file", fileid="old", path="/library/A.mkv", name="A.mkv", size=10)
         self.api.files["old"] = old
-        self.attempt(row["id"])
-        self.assertEqual(self.api.files["old"].path, old.path)
         self.api.hit = True
         self.attempt(row["id"])
-        self.assertIn(".mp115-backups", self.api.files["old"].path)
-        self.assertEqual(self.api.files["123"].path, "/library/A.mkv")
-        self.assertEqual(self.api.moves[0][0], "old")
-        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
-
-    def test_failed_promotion_keeps_non_success_record_and_source(self):
-        task = self.enroll(mode="move")
-        row = self.engine.store.all()[0]
-        self.api.hit, self.api.fail_move = True, True
-        self.attempt(row["id"])
-        self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertEqual(self.api.files, {"old": old})
+        self.assertEqual(self.api.inits, 0)
+        self.assertEqual(self.api.moves, [])
         self.assertTrue(Path(task.fileitem.path).exists())
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "waiting")
-        self.api.fail_move = False
+
+    def test_success_uses_only_final_directory_and_never_moves_files(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.api.hit = True
         self.attempt(row["id"])
-        self.assertEqual(self.api.inits, 1)
-        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertTrue(all(".mp115-" not in path for path in self.api.folders))
+        self.assertEqual(self.api.files["123"].path, row["payload"]["final_path"])
+        self.assertEqual(self.api.moves, [])
+
+    def test_legacy_staged_task_is_paused_and_cannot_resume_upload(self):
+        self.enroll()
+        row = self.engine.store.all()[0]
+        data = row["payload"]
+        data.pop("layout")
+        data["stage_path"] = "/library/.mp115-staging/old/A.mkv"
+        self.engine.store.update(row["id"], payload=data, state="upload_queued")
+        self.engine.stop()
+        self.engine = self.new_engine()
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        for action in ("resume", "upload"):
+            with self.assertRaises(ValueError):
+                self.engine.control(row["id"], action)
+        self.assertEqual(self.api.inits, 0)
+        self.assertEqual(self.api.folders, [])
+        self.engine.control(row["id"], "cancel")
+        self.assertEqual(self.engine.store.get(row["id"])["payload"], data)
 
     def test_instant_hit_without_visible_id_does_not_resubmit_upload(self):
         self.enroll()
@@ -914,7 +901,7 @@ class MoviePilotTests(unittest.TestCase):
             path="/library/A.mkv", name="A.mkv", size=10)
         self.api.hit = True
         self.attempt(row["id"])
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "failed")
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
         self.assertFalse(self.h.Oper().get(row["history_id"]).status)
         self.assertEqual(self.api.files["old"].path, "/library/A.mkv")
         self.assertTrue(Path(task.fileitem.path).exists())

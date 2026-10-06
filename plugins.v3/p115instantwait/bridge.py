@@ -1,4 +1,4 @@
-"""V3.1 adapter: stage uploads outside MP, then replay its durable plan/settlement.
+"""V3.1 adapter: upload to final paths, then replay native plan/settlement.
 
 The host owns media snapshots, leases, execution steps and history writes. This
 adapter never imports host ORM models or session factories. Narrow guarded hooks
@@ -18,9 +18,8 @@ from app.schemas.file import FileItem
 from app.schemas.transfer import TransferInfo
 from app.sdk.logging import logger
 
-from .remote import NotInstant, OpenAPI, PauseTask, PreparedStorage, RetryLater, fingerprint, hash_file
+from .remote import NotInstant, OpenAPI, PauseTask, DirectStorage, RetryLater, fingerprint, hash_file, prepare_direct
 from .store import QueueStore
-from .maintenance import StagingMaintenance
 
 
 WAIT_MESSAGE = "等待秒传，由115秒传等待插件后台处理"
@@ -42,7 +41,7 @@ def source_key(item):
 
 
 class InstantWaitEngine:
-    """Maintain a plugin-owned staging queue with native V3 final settlement."""
+    """Maintain a direct-upload queue with native V3 final settlement."""
 
     def __init__(self, data_path, config, notify=None):
         self.store = QueueStore(Path(data_path) / "queue.db")
@@ -55,8 +54,6 @@ class InstantWaitEngine:
         self.context = threading.local()
         self.native_lock = threading.Condition()
         self.native_active = 0
-        self.maintenance = StagingMaintenance(self.store, lambda: OpenAPI(U115Pan(), FileItem, self.stop_event),
-                                              self.stop_event, logger)
         self.extensions = {e.strip().lower().lstrip(".") for e in config["extensions"].split(",") if e.strip()}
 
     def log_task(self, row, event, level="info", **details):
@@ -151,7 +148,6 @@ class InstantWaitEngine:
                     engine.log_task(engine.store.get(row["id"]), "整理成功")
                     engine.original_finish(chain, task)
                     engine.live_tasks.pop(row["id"], None)
-                    engine.maintenance.cleanup_completed(row)
                 elif row["payload"].get("prepared"):
                     engine.defer(row, "paused", info.message or "V3 完成整理失败，请人工核对")
             return result
@@ -209,7 +205,7 @@ class InstantWaitEngine:
                 and Path(task.fileitem.path).suffix.lower().lstrip(".") in self.extensions)
 
     def gate(self, task, checkpoint, source_oper, target_oper, runner, original):
-        """Leave a native durable failure until a verified staged file is ready."""
+        """Leave a native durable failure until a verified final file is ready."""
         if task.fileitem.type != "file" or checkpoint.resolved_transfer_type not in ("copy", "move") or len(checkpoint.items) != 1:
             return TransferInfo(success=False, fileitem=task.fileitem, message="秒传等待只支持单视频文件的复制或移动整理")
         if not isinstance(source_oper, LocalStorage) or not isinstance(target_oper, U115Pan):
@@ -222,7 +218,7 @@ class InstantWaitEngine:
         row = self.store.active_for(source_key(task.fileitem))
         created = False
         if row is None:
-            payload = {"host_generation": 3, "native_task_id": task.admission_task_id,
+            payload = {"layout": "direct", "host_generation": 3, "native_task_id": task.admission_task_id,
                    "task": {"fileitem": task.fileitem.model_dump(mode="json")},
                    "final_path": checkpoint.final_target_path, "mode": checkpoint.resolved_transfer_type,
                    "source_initial": fingerprint(task.fileitem.path), "wait_since": time.time()}
@@ -231,6 +227,9 @@ class InstantWaitEngine:
         if row["payload"].get("native_task_id") != task.admission_task_id or row["payload"]["final_path"] != checkpoint.final_target_path:
             self.defer(row, "paused", "整理任务或目标发生变化，请取消旧队列后重新整理")
             return TransferInfo(success=False, fileitem=task.fileitem, message="秒传队列关联发生变化，已暂停")
+        if row["payload"].get("layout") != "direct":
+            self.defer(row, "paused", "旧版暂存任务仅可取消，请重新整理；旧网盘文件需人工核对")
+            return TransferInfo(success=False, fileitem=task.fileitem, message="旧版暂存任务已暂停")
         if not row["payload"].get("prepared"):
             if created:
                 self.log_task(row, "任务入队", 原因=WAIT_MESSAGE)
@@ -242,7 +241,10 @@ class InstantWaitEngine:
         api = OpenAPI(U115Pan(), FileItem, self.stop_event)
         try:
             data = row["payload"]
-            staged = api.verify(data["remote_id"], data["stage_path"], data["hashes"])
+            visible = api.raw_path(data["final_path"])
+            if not visible or str(visible.get("file_id")) != str(data["remote_id"]):
+                raise PauseTask("正式目标文件尚不可见或已被替换")
+            item = api.verify(data["remote_id"], data["final_path"], data["hashes"])
             source_path = Path(data["task"]["fileitem"]["path"])
             # A durable cross-storage move may have already deleted the source
             # before its success checkpoint response was lost. Require the exact
@@ -251,7 +253,7 @@ class InstantWaitEngine:
             if not (data.get("committed") and data["mode"] == "move" and visible
                     and str(visible.get("file_id")) == str(data["remote_id"])):
                 self.check_source(row)
-            proxy = PreparedStorage(api, self.store, row, data["final_path"], staged, data["hashes"])
+            proxy = DirectStorage(api, self.store, row, data["final_path"], item, data["hashes"])
             self.context.prepared_storage = proxy
             try:
                 info = original(self.chain, task, checkpoint, source_oper=source_oper, target_oper=proxy,
@@ -281,7 +283,7 @@ class InstantWaitEngine:
         """Verify the exact remote object before allowing native success/cleanup."""
         data = row["payload"]
         if not info.target_item or str(info.target_item.fileid) != str(data["remote_id"]):
-            raise PauseTask("V3 整理结果与远端暂存文件不一致")
+            raise PauseTask("V3 整理结果与远端正式文件不一致")
         path = Path(data["task"]["fileitem"]["path"])
         if path.exists() and fingerprint(path) != data["source_initial"]:
             raise PauseTask("源文件在完成确认前变化，已停止回写与清理")
@@ -302,11 +304,13 @@ class InstantWaitEngine:
                 self.store.update(row["id"], state="paused", message="V2 遗留任务已保留；请先在 V2 完成或取消，再在 V3 重新整理")
                 continue
             data = row["payload"]
+            if data.get("layout") != "direct":
+                self.store.update(row["id"], state="paused", message="旧版暂存任务仅可取消，请重新整理；旧网盘文件需人工核对")
+                continue
             history = (self.chain.transfer_history_repository.get(row["history_id"]) if row["history_id"]
                        else self.chain.transfer_history_repository.get_by_transfer_task_id(task_id=data["native_task_id"]))
             if history and history.status and row["history_id"] == history.id:
                 self.store.update(row["id"], state="completed", history_id=history.id, message="已恢复 V3 成功整理记录")
-                self.maintenance.cleanup_completed(row)
             elif history and history.transfer_task_id == data["native_task_id"]:
                 next_at = row["next_at"]
                 if self.config["max_wait_hours"] and row["state"] in ("queued", "waiting"):
@@ -316,7 +320,7 @@ class InstantWaitEngine:
                 self.store.update(row["id"], state="paused", message="原 V3 整理记录或持久任务不存在，请核对后重新整理")
 
     def run(self, manual=False):
-        """Stage uploads in two independent workers; native replay only finalizes."""
+        """Upload in two independent workers; native replay only finalizes."""
         wake = self.upload_wake if manual else self.wake
         while not self.stop_event.is_set():
             try:
@@ -332,11 +336,13 @@ class InstantWaitEngine:
             wake.clear()
 
     def execute(self, row):
-        """Only perform remote staging here; MP owns the final plan and history."""
+        """Write final objects here; MP owns the plan and history."""
         data, key = row["payload"], row["id"]
         force = row["state"] == "uploading"
         api = None
         try:
+            if data.get("layout") != "direct":
+                raise PauseTask("旧版暂存任务仅可取消，请重新整理")
             if data.get("host_generation") != 3:
                 raise PauseTask("V2 遗留任务需要先在 V2 完成或取消")
             if not force:
@@ -355,35 +361,9 @@ class InstantWaitEngine:
                     raise PauseTask("源文件在计算哈希前发生变化")
                 self.store.update(key, payload=data)
             api = OpenAPI(U115Pan(), FileItem, self.stop_event)
-            final = PurePosixPath(data["final_path"])
-            stage = final.parent / ".mp115-staging" / key / final.name
-            data["stage_path"] = str(stage)
-            with self.maintenance.lock:
-                folder = api.get_folder(stage.parent)
-            existing = api.raw_path(stage)
-            file_id = data.get("remote_id") or (existing.get("file_id") if existing else None)
-            if not file_id:
-                if data.get("upload_session") and not data.get("upload_confirmed"):
-                    if not force:
-                        raise PauseTask("有未完成的普通上传，请强制上传继续")
-                    api.upload(path, folder, data["hashes"], None, data, lambda: self.store.update(key, payload=data))
-                elif not data.get("instant_confirmed") and not data.get("upload_confirmed"):
-                    try:
-                        file_id = api.instant(path, folder, final.name, data["hashes"])
-                        data["instant_confirmed"] = True
-                    except NotInstant as error:
-                        if not force:
-                            raise
-                        self.log_task(row, "秒传未命中，转普通上传", 触发方式=data.get("upload_origin", "manual"))
-                        api.upload(path, folder, data["hashes"], error.upload_data, data, lambda: self.store.update(key, payload=data))
-                self.store.update(key, payload=data)
-                if not file_id:
-                    existing = api.raw_path(stage)
-                    file_id = existing.get("file_id") if existing else None
-            if not file_id:
-                raise RetryLater("已提交上传结果，等待远端文件可见")
-            api.verify(file_id, str(stage), data["hashes"])
-            data.update(remote_id=str(file_id), prepared=True)
+            item = prepare_direct(api, self.store, row, path, data, force,
+                                  lambda event: self.log_task(row, event))
+            data.update(remote_id=str(item.fileid), prepared=True)
             self.store.update(key, state="finalizing", payload=data, next_at=0, message="远端文件已确认，等待 V3 完成原整理记录")
             self.request_finalize(self.store.get(key))
         except PauseTask as error:
@@ -418,13 +398,12 @@ class InstantWaitEngine:
                 task = self.live_tasks.pop(row["id"], None)
                 if task:
                     self.original_finish(self.chain, task)
-                self.maintenance.cleanup_completed(row)
             elif not history or history.transfer_task_id != row["payload"]["native_task_id"]:
                 self.defer(row, "paused", "原 V3 持久任务或历史关联已变化")
             else:
                 snapshot = self.chain.transfer_execution_repository.get_snapshot(task_id=row["payload"]["native_task_id"])
                 if snapshot is None:
-                    self.defer(row, "paused", "V3 持久整理任务已不存在，请保留暂存文件并人工核对")
+                    self.defer(row, "paused", "V3 持久整理任务已不存在，请保留正式文件并人工核对")
                 elif str(getattr(snapshot.state, "value", snapshot.state)) == "manual_review":
                     self.defer(row, "paused", "V3 外部操作需要人工复核，请先在整理队列完成复核")
                 else:
@@ -458,10 +437,12 @@ class InstantWaitEngine:
         self.upload_wake.set()
 
     def control(self, key, action):
-        """Control staged work only; executing/native-finalizing work is fenced."""
+        """Control queued work; executing/native-finalizing work is fenced."""
         existing = self.store.get(key)
         if not existing:
             raise KeyError(key)
+        if existing["payload"].get("layout") != "direct" and action != "cancel":
+            raise ValueError("旧版暂存任务仅可取消，请重新整理")
         if existing["state"] == "finalizing":
             raise ValueError("V3 正在完成整理，请等待本轮回写结束")
         if existing["payload"].get("host_generation") != 3 and action != "cancel":
@@ -498,12 +479,12 @@ class InstantWaitEngine:
         return result
 
     def stop(self):
-        """Keep patches until both staging workers and native executions have exited."""
+        """Keep patches until upload workers and native executions have exited."""
         self.stop_event.set()
         self.wake.set()
         self.upload_wake.set()
         deadline = time.monotonic() + 35
-        for worker in (self.worker, self.upload_worker, self.maintenance.worker):
+        for worker in (self.worker, self.upload_worker):
             if worker and worker.ident is not None:
                 worker.join(max(0, deadline - time.monotonic()))
                 if worker.is_alive():

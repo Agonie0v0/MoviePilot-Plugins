@@ -19,10 +19,9 @@ from app.modules.filemanager.storages.u115 import U115Pan
 from app.schemas import FileItem, TransferInfo, TransferTask
 from app.schemas.types import MediaType
 
-from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, PreparedStorage,
-                     RetryLater, fingerprint, hash_file)
+from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage,
+                     RetryLater, fingerprint, hash_file, prepare_direct)
 from .store import QueueStore
-from .maintenance import StagingMaintenance
 
 
 WAIT_MESSAGE = "等待秒传，将自动重试（115 秒传等待插件）"
@@ -98,8 +97,6 @@ class InstantWaitEngine:
         self.worker = None
         self.upload_worker = None
         self.upload_wake = threading.Event()
-        self.maintenance = StagingMaintenance(self.store, lambda: OpenAPI(U115Pan(), FileItem, self.stop_event),
-                                              self.stop_event, logger)
         self.extensions = {ext.strip().lower().lstrip(".") for ext in config["extensions"].split(",") if ext.strip()}
 
     def log_task(self, row, event, level="info", **details):
@@ -219,7 +216,7 @@ class InstantWaitEngine:
                 if mode not in ("copy", "move"):
                     raise PauseTask("仅支持复制或移动整理")
                 task.transfer_type = mode
-                payload = {"version": 1, "task": dump_task(task),
+                payload = {"version": 2, "layout": "direct", "task": dump_task(task),
                     "final_path": preview.target_item.path, "preview": preview.model_dump(mode="json"),
                     "source_initial": fingerprint(task.fileitem.path), "wait_since": time.time()}
                 row, created = engine.store.enqueue(source_key(task.fileitem), payload)
@@ -319,7 +316,7 @@ class InstantWaitEngine:
         self.wake.set()
         self.upload_wake.set()
         deadline = time.monotonic() + 35
-        for worker in (self.worker, self.upload_worker, self.maintenance.worker):
+        for worker in (self.worker, self.upload_worker):
             if worker and worker.ident is not None:
                 worker.join(timeout=max(0, deadline - time.monotonic()))
             if worker and worker.is_alive():
@@ -370,6 +367,9 @@ class InstantWaitEngine:
         # Restore all unfinished peers before running any completion callback.
         for row in rows:
             try:
+                if row["payload"].get("layout") != "direct":
+                    self.store.update(row["id"], state="paused", message="旧版暂存任务已暂停；请取消后重新整理，旧网盘文件需人工核对")
+                    row = self.store.get(row["id"])
                 task = load_task(row["payload"]["task"])
                 self.live_tasks[row["id"]] = task
                 self.chain.jobview.add_task(task, state="waiting")
@@ -424,6 +424,8 @@ class InstantWaitEngine:
         api = None
         try:
             payload = row["payload"]
+            if payload.get("layout") != "direct":
+                raise PauseTask("旧版暂存任务已暂停；请取消后重新整理，旧网盘文件需人工核对")
             task = self.live_tasks.get(key) or load_task(payload["task"])
             self.live_tasks[key] = task
             self.ensure_history(key, task)
@@ -462,52 +464,10 @@ class InstantWaitEngine:
                 self.store.update(key, payload=payload)
             api = OpenAPI(U115Pan(), FileItem, self.stop_event)
             final = PurePosixPath(payload["final_path"])
-            stage_path = final.parent / ".mp115-staging" / key / final.name
-            with self.maintenance.lock:
-                stage_dir = api.get_folder(stage_path.parent)
-            file_id = payload.get("remote_id")
-            if not file_id:
-                # Reconcile an init response lost after a successful server-side commit.
-                existing = api.raw_path(stage_path)
-                if existing and existing.get("file_id"):
-                    file_id = existing["file_id"]
-                    self.log_task(row, "发现已有暂存文件", 说明="核对后继续整理，不重复上传")
-                elif payload.get("upload_session") and not payload.get("upload_confirmed"):
-                    if not manual:
-                        raise PauseTask("有未完成的普通上传，请点强制上传继续")
-                    self.log_task(row, "继续普通上传", 已完成分片=len(payload["upload_session"].get("parts", [])))
-                    api.upload(path, stage_dir, payload["hashes"], None, payload,
-                               lambda: self.store.update(key, payload=payload))
-                    self.log_task(row, "普通上传已提交", 说明="等待远端校验与整理完成")
-                    existing = api.raw_path(stage_path)
-                    file_id = existing.get("file_id") if existing else None
-                elif not payload.get("instant_confirmed") and not payload.get("upload_confirmed"):
-                    try:
-                        file_id = api.instant(path, stage_dir, final.name, payload["hashes"])
-                    except NotInstant as exc:
-                        if not manual:
-                            raise
-                        self.log_task(row, "秒传未命中，转普通上传", 触发方式=origin)
-                        self.store.update(key, message="未命中秒传，正在普通上传")
-                        self.history_message(key, f"{origin}：未命中秒传，正在普通上传")
-                        api.upload(path, stage_dir, payload["hashes"], exc.upload_data, payload,
-                                   lambda: self.store.update(key, payload=payload))
-                        self.log_task(row, "普通上传已提交", 说明="等待远端校验与整理完成")
-                    else:
-                        payload["instant_confirmed"] = True
-                        self.log_task(row, "秒传命中", 说明="等待远端校验与整理完成")
-                    # A hit without an ID must wait for visibility, not submit
-                    # another init that can create a duplicate remote file.
-                    self.store.update(key, payload=payload)
-                    if not file_id:
-                        existing = api.raw_path(stage_path)
-                        file_id = existing.get("file_id") if existing else None
-                if not file_id:
-                    raise RetryLater("已提交上传结果，等待远端文件 ID 可见")
-                payload["remote_id"] = str(file_id)
-                self.store.update(key, payload=payload)
-            staged = api.verify(file_id, str(stage_path), payload["hashes"])
-            proxy = PreparedStorage(api, self.store, row, str(final), staged, payload["hashes"])
+            item = prepare_direct(api, self.store, row, path, payload, manual,
+                                  lambda event: self.log_task(row, event))
+            file_id = item.fileid
+            proxy = DirectStorage(api, self.store, row, str(final), item, payload["hashes"])
             args = task_kwargs(task)
             args.update(source_oper=DeferredSource(LocalStorage()), target_oper=proxy, preview=False)
             info = self.original_transfer(self.chain, **args)
@@ -620,7 +580,6 @@ class InstantWaitEngine:
         self.chain.jobview.try_remove_job(task)
         self.live_tasks.pop(key, None)
         self.log_task(self.store.get(key), "整理成功", 结果="原整理记录已更新成功")
-        self.maintenance.cleanup_completed(row, api)
 
     def finish_failure(self, row, task, info):
         self.context.history_job = row["id"]
@@ -663,6 +622,9 @@ class InstantWaitEngine:
         return result
 
     def control(self, key, action):
+        existing = self.store.get(key)
+        if existing and existing["payload"].get("layout") != "direct" and action != "cancel":
+            raise ValueError("旧版暂存任务仅可取消，请重新整理")
         row = self.store.command(key, action)
         self.log_task(row, "用户操作", 操作={"upload": "强制上传", "resume": "继续等待秒传",
                                            "pause": "暂停", "cancel": "取消"}[action], 结果=row["message"])

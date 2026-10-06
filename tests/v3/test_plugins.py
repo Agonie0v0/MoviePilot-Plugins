@@ -63,15 +63,6 @@ def test_wait_failure_then_same_history_success(h, task):
     assert h.api.get_item("/library/Film.mkv").fileid == "123"
 
 
-def test_cleanup_only_runs_after_native_success_and_never_retries_completed_job(h, task):
-    h.api.remove_empty_staging_dir = Mock(side_effect=RuntimeError("cleanup unavailable"))
-    row = stage(h, task)
-    h.api.remove_empty_staging_dir.assert_not_called()
-    h.Chain()._TransferChain__handle_transfer(task)
-    assert h.engine.store.get(row["id"])["state"] == "completed"
-    assert h.history.get(row["history_id"]).status
-    assert h.api.remove_empty_staging_dir.call_count == 1
-    assert h.engine.store.claim() is None
 
 
 def test_history_cleanup_keeps_v3_native_history_and_remote_file(h, task):
@@ -155,23 +146,49 @@ def test_upload_does_not_block_other_native_tasks(h, task, tmp_path):
     assert not worker.is_alive()
 
 
-def test_back_up_native_overwrite_and_cleanup(h, task):
+def test_old_target_cleanup_is_refused_without_backup(h, task):
     old = h.FileItem(storage="u115", type="file", path="/library/Old.mkv", fileid="999", name="Old.mkv", size=2)
     h.api.files["999"] = old
     task.plan_checkpoint.planning_input.options["cleanup_dest_fileitem"] = old.model_dump(mode="json")
     row = stage(h, task)
     h.Chain()._TransferChain__handle_transfer(task)
-    assert ".mp115-backups/" in h.api.files["999"].path
-    assert h.history.get(row["history_id"]).status
-    assert h.engine.store.get(row["id"])["payload"]["backups"][0]["moved"]
+    assert h.api.files["999"].path == old.path
+    assert not h.history.get(row["history_id"]).status
+    assert h.engine.store.get(row["id"])["state"] == "paused"
 
 
-def test_existing_final_file_is_backed_up(h, task):
+def test_existing_final_file_pauses_before_upload(h, task):
     h.api.files["999"] = h.FileItem(storage="u115", type="file", path="/library/Film.mkv", fileid="999", name="Film.mkv", size=2)
     row = stage(h, task)
+    assert not h.history.get(row["history_id"]).status
+    assert h.engine.store.get(row["id"])["state"] == "paused"
+    assert h.api.inits == h.api.uploads == 0
+    assert h.api.files["999"].path == "/library/Film.mkv"
+
+
+def test_direct_upload_finalization_creates_no_temporary_paths_or_moves(h, task):
+    row = stage(h, task)
     h.Chain()._TransferChain__handle_transfer(task)
-    assert h.history.get(row["history_id"]).status
-    assert ".mp115-backups/" in h.api.files["999"].path
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.api.moves == []
+    assert all(".mp115-" not in path for path in h.api.folders)
+    assert h.api.files["123"].path == "/library/Film.mkv"
+
+
+def test_old_v3_staged_queue_cannot_resume_or_create_folders(h, task):
+    row = h.enter(task)
+    data = row["payload"]
+    data.pop("layout")
+    data["stage_path"] = "/library/.mp115-staging/old/Film.mkv"
+    h.engine.store.update(row["id"], payload=data, state="finalizing")
+    h.engine.restore()
+    assert h.engine.store.get(row["id"])["state"] == "paused"
+    for action in ("resume", "upload"):
+        with pytest.raises(ValueError):
+            h.engine.control(row["id"], action)
+    assert h.api.folders == []
+    h.engine.control(row["id"], "cancel")
+    assert h.engine.store.get(row["id"])["payload"] == data
 
 
 def test_source_change_pauses_without_upload_or_success(h, task):
@@ -312,9 +329,10 @@ def test_real_native_started_step_requires_exact_cloud_evidence(h, task, visible
     row = stage(h, task)
     data = row["payload"]
     data["hashes"] = h.engine.store.get(row["id"])["payload"]["hashes"]
-    if visible == "exact":
-        h.api.move_id("123", h.api.get_folder("/library"), "Film.mkv")
+    if visible == "missing":
+        h.api.files.clear()
     elif visible == "other":
+        h.api.files.clear()
         h.api.files["999"] = h.FileItem(storage="u115", type="file", path="/library/Film.mkv", fileid="999", size=18)
     ns = {**vars(h.execution), "__name__": "v3_native_runner", "time": time}
     selected("app/chain/transfer/execution.py",
