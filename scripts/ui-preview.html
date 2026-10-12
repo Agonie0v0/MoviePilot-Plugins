@@ -20,6 +20,10 @@
 // FormRender; authenticated events -> API -> page reload in PageRender.
 // Only the API transport is replaced with the local fixture server.
 const {createApp,h,ref,reactive,resolveComponent,computed}=Vue;
+window.MoviePilotAPI={get:async(path,{params})=>{
+  const res=await fetch('/'+path+'?'+new URLSearchParams(params));
+  if(!res.ok)throw new Error('查询失败');return res.json();
+}};
 const App={setup(){
   const view=ref('page'),dark=ref(false),scenario=ref('normal'),schemas=ref(null),model=reactive({}),busy=ref(false),feedback=ref('');
   const config=ref(null);
@@ -29,6 +33,7 @@ const App={setup(){
     const expression=typeof value==='string'&&value.startsWith('{{')&&value.endsWith('}}');
     if(key==='model'||key==='v-model'){out.modelValue=model[value];out['onUpdate:modelValue']=v=>model[value]=v;}
     else if(key==='show'||key==='v-show'){out.style={display:new Function('model','with(model){return '+(expression?value.slice(2,-2).trim():value)+'}')(model)?'':'none'};}
+    else if(key.startsWith('on')&&typeof value==='string'){out[key]=event=>new Function('model','event','with(model){return ('+value+')(event)}')(model,event);}
     else if(expression){out[key]=new Function('model','with(model){return '+value.slice(2,-2).trim()+'}')(model);}
     else if(typeof value==='string'&&value in model){out[key]=model[value];}else{out[key]=value;}
   }return out;}

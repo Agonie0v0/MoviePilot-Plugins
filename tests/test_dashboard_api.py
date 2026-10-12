@@ -21,7 +21,7 @@ class DashboardApiTests(unittest.TestCase):
         namespace = {"Body": Body, "HTTPException": HTTPException, "logger": Mock()}
         exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
         self.plugin = namespace[cls.name]()
-        self.plugin.list_tasks = self.plugin.control_task = Mock()
+        self.plugin.list_tasks = self.plugin.control_task = self.plugin.search_records = Mock()
         self.plugin._engine = Mock()
         self.plugin._engine.stop_event.is_set.return_value = False
         self.plugin.save_data = Mock()

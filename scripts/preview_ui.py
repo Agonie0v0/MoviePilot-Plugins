@@ -16,6 +16,7 @@ import sys
 import time
 import types
 from urllib.request import urlretrieve
+from urllib.parse import urlparse, parse_qs
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,19 @@ TASKS = fixtures()
 BATCH_RESULT = None
 
 
+def search_records(scope="history", query="", state="", page=1):
+    older = [dict(TASKS[0 if kind == "paused" else 4], id=f"old-{kind}-{i}", state=kind,
+                  source=f"/downloads/旧任务-{kind}-{i:03}.mkv", history_id=10000 + i)
+             for kind in ("paused", "completed") for i in range(251)]
+    rows = [t for t in TASKS + older if (t["state"] in ui.ACTIVE) == (scope == "tasks")
+            and (not state or t["state"] == state)
+            and (not query or query.casefold() in t["source"].casefold() or query == t["id"]
+                 or query.lstrip("#") == str(t["history_id"]))]
+    pages = max(1, (len(rows) + 49) // 50)
+    page = min(max(1, int(page)), pages)
+    return dict(items=ui.record_choices(rows[(page-1)*50:page*50]), total=len(rows), page=page, pages=pages)
+
+
 class Handler(SimpleHTTPRequestHandler):
     def response(self, payload):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -61,7 +75,10 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path.startswith("/schema"):
+        if urlparse(self.path).path == "/plugin/P115InstantWait/records":
+            params = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            self.response(search_records(**params))
+        elif self.path.startswith("/schema"):
             scenario = self.path.split("scenario=", 1)[-1] if "scenario=" in self.path else "normal"
             tasks = [] if scenario == "empty" else copy.deepcopy(TASKS)
             enabled = scenario != "disabled"
@@ -69,8 +86,12 @@ class Handler(SimpleHTTPRequestHandler):
             if scenario == "long":
                 tasks[0]["source"] = "/downloads/" + "VeryLongMovieName_" * 30 + "电影.mkv"
                 tasks[0]["message"] = "目标路径冲突：" + "/115/电影/" * 30 + "，请核对目标文件。"
+            model = {**defaults, "enabled": enabled}
+            for scope in ("tasks", "history"):
+                result = search_records(scope) if tasks else dict(items=[], total=0, page=1, pages=1)
+                model.update(ui.record_search_model(scope, result))
             self.response(dict(form=ui.config_form(tasks, error, BATCH_RESULT), page=ui.task_page(tasks, enabled, error, 3, BATCH_RESULT),
-                               defaults={**defaults, "enabled": enabled}))
+                               defaults=model))
         elif self.path == "/plugin/P115InstantWait/tasks":
             self.response(TASKS)
         else:

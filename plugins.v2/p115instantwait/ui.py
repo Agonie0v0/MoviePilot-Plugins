@@ -47,6 +47,7 @@ STYLES = """
 .p115-ui.p115-settings .p115-field>.v-input:has(input[type=number]){max-width:160px}
 .p115-ui.p115-settings .p115-field>.v-input:has(#p115wait-retry_intervals){max-width:320px}
 .p115-ui.p115-settings .p115-field>.v-select:not(.v-autocomplete){max-width:280px}
+.p115-ui.p115-settings .p115-field>.v-select:has(#p115wait-task_ids,#p115wait-history_ids){max-width:640px}
 .p115-ui .p115-field-label{display:block;font-weight:600;margin-bottom:6px}
 .p115-ui .p115-hint{font-size:12px;color:var(--p115-muted);margin-top:6px;line-height:1.6;overflow-wrap:anywhere}
 .p115-ui .v-field__input{opacity:1}
@@ -185,15 +186,71 @@ def toggle(model, title, hint):
     ], "p115-toggle")
 
 
+def record_choices(tasks):
+    return [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}"
+                      f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
+             "props": {"disabled": t["state"] in ("running", "uploading")}}
+            for t in tasks]
+
+
+def record_search_model(scope, result):
+    values = dict(query="", state="", applied_query="", applied_state="", busy=False, error="", **result)
+    return {f"_records_{scope}_{key}": value for key, value in values.items()}
+
+
+def record_search_handler(scope, direction=0):
+    prefix = f"_records_{scope}_"
+    selection, flag = ("task_ids", "apply_action") if scope == "tasks" else ("history_ids", "cleanup_history")
+    # FormRender runs handlers with the dialog's model in scope. Use MP's
+    # authenticated API instance; no tokens, global selection or saved query.
+    return """async () => {
+        const p = PREFIX;
+        if (model[p+'busy']) return;
+        model[p+'busy'] = true; model[p+'error'] = '';
+        model[SELECTION] = []; model[FLAG] = false;
+        const query = model[p+'query'] || '', state = model[p+'state'] || '';
+        const same = query === model[p+'applied_query'] && state === model[p+'applied_state'];
+        const page = DIRECTION === 0 || !same ? 1 : model[p+'page'] + DIRECTION;
+        try {
+            if (!window.MoviePilotAPI) throw new Error('当前前端不支持查询，请更新 MoviePilot 前端');
+            const data = await window.MoviePilotAPI.get('plugin/P115InstantWait/records',
+                {params: {scope: SCOPE, query, state, page}});
+            for (const key of ['items','total','page','pages']) model[p+key] = data[key];
+            model[p+'applied_query'] = query; model[p+'applied_state'] = state;
+        } catch (error) {
+            model[p+'items'] = []; model[p+'total'] = 0; model[p+'page'] = 1; model[p+'pages'] = 1;
+            const detail = error.response?.data?.detail;
+            model[p+'error'] = typeof detail === 'string' ? detail : !window.MoviePilotAPI
+                ? '当前前端不支持查询，请更新 MoviePilot 前端' : '查询失败，请检查连接后重试';
+        } finally { model[p+'busy'] = false; }
+    }""".replace("PREFIX", repr(prefix)).replace("SELECTION", repr(selection)).replace("FLAG", repr(flag)).replace("DIRECTION", str(direction)).replace("SCOPE", repr(scope))
+
+
+def record_search_controls(scope):
+    p = f"_records_{scope}_"
+    states = [s for s in LABELS if (s in ACTIVE) == (scope == "tasks")]
+    return [
+        box([
+            field("VTextField", p + "query", "全库搜索", "按文件名、源路径、任务 ID 或整理记录编号搜索，最多 200 字。",
+                  maxlength=200, clearable=True, **{"onKeydown": "async (event) => { if (event.key === 'Enter') { event.preventDefault(); await (" + record_search_handler(scope) + ")(); } }",
+                                                  "disabled": "{{ " + p + "busy }}"}),
+            field("VSelect", p + "state", "筛选状态", "选择后点击搜索；留空显示此范围内全部状态。",
+                  items=[{"title": "全部状态", "value": ""}] + [{"title": LABELS[s], "value": s} for s in states],
+                  **{"disabled": "{{ " + p + "busy }}"}),
+        ], "p115-fields"),
+        box([
+            node("VBtn", "搜索", variant="tonal", color="primary", **{"onClick": record_search_handler(scope), "loading": "{{ " + p + "busy }}"}),
+            node("VBtn", "上一页", variant="outlined", **{"onClick": record_search_handler(scope, -1), "disabled": "{{ " + p + "busy || " + p + "page <= 1 }}"}),
+            node("VBtn", "下一页", variant="outlined", **{"onClick": record_search_handler(scope, 1), "disabled": "{{ " + p + "busy || " + p + "page >= " + p + "pages }}"}),
+        ], "p115-bulk-actions mt-3"),
+        node("p", **{"class": "p115-hint mt-3", "aria-live": "polite",
+                      "textContent": "{{ '共 ' + " + p + "total + ' 条 · 第 ' + " + p + "page + ' / ' + " + p + "pages + ' 页 · 每页 50 条' }}"}),
+        node("VAlert", type="error", variant="tonal", **{"show": "{{ !!" + p + "error }}", "text": "{{ " + p + "error }}", "class": "mt-3"}),
+        paragraph("搜索与翻页不会执行任务；重新查询会清空本区选择及执行勾选。", **{"class": "p115-hint mb-4"}),
+    ]
+
+
 def config_form(tasks, error="", batch_result=None, history_result=None):
-    choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}"
-                         f" · 整理记录 #{t['history_id'] or '待生成'}", "value": t["id"],
-                "props": {"disabled": t["state"] in ("running", "uploading")}}
-               for t in tasks if t["state"] in ACTIVE]
-    selectable = sum(not t["props"]["disabled"] for t in choices)
-    history_choices = [{"title": f"{filename(t['source'])} · {LABELS.get(t['state'], t['state'])}",
-                        "value": t["id"]} for t in tasks
-                       if t["state"] in ("completed", "failed", "cancelled")]
     content = [node("style", STYLES),
         box([box([icon("mdi-cloud-clock-outline", size=26)], "p115-brand-icon"),
              box([paragraph("115 秒传等待 / 参数设置", **{"class": "p115-eyebrow"}),
@@ -227,10 +284,11 @@ def config_form(tasks, error="", batch_result=None, history_result=None):
     batch_children = [
         paragraph("多选任务，保存配置时统一执行。单个任务也可在详情页直接处理。",
                   **{"class": "p115-copy p115-muted mb-4"}),
-        field("VAutocomplete", "task_ids", "选择任务", "可按文件名搜索；执行中的任务不可选。" if selectable else "暂无可操作任务，执行中的任务需等待本轮结束。",
-              items=choices, multiple=True, chips=True, clearable=True,
+        *record_search_controls("tasks"),
+        field("VSelect", "task_ids", "选择本页任务", "可多选当前页任务；执行中的任务不可选。查找更早任务请使用上方全库搜索或翻页。",
+              items="{{ _records_tasks_items }}", multiple=True, chips=True, clearable=True,
               **{"item-title": "title", "item-value": "value", "closable-chips": True,
-                 "disabled": not selectable, "no-data-text": "没有匹配的任务"}),
+                 "disabled": "{{ _records_tasks_busy || !_records_tasks_items.length }}", "no-data-text": "没有匹配的任务"}),
         box([field("VSelect", "action", "对所选任务执行", "状态不支持的任务会跳过；继续等待仅适用于已暂停任务。",
                    items=[{"title": "暂停自动重试", "value": "pause"},
                           {"title": "继续等待秒传", "value": "resume"},
@@ -259,10 +317,11 @@ def config_form(tasks, error="", batch_result=None, history_result=None):
         box([field("VSelect", "history_mode", "清理方式", "只执行当前选择的清理方式。",
                    items=[{"title": "选择指定记录", "value": "selected"},
                           {"title": "按状态和保留天数", "value": "filtered"}])], "mt-5"),
-        box([field("VAutocomplete", "history_ids", "选择已结束记录", "可搜索最近 200 条任务中的结束记录；更早的记录可按条件清理。",
-                   items=history_choices, multiple=True, chips=True, clearable=True,
+        box([*record_search_controls("history"),
+             field("VSelect", "history_ids", "选择本页已结束记录", "全库查询结果，每页 50 条；只清理本页勾选的记录。",
+                   items="{{ _records_history_items }}", multiple=True, chips=True, clearable=True,
                    **{"item-title": "title", "item-value": "value", "closable-chips": True,
-                      "disabled": not history_choices, "no-data-text": "没有匹配的记录"})],
+                      "disabled": "{{ _records_history_busy || !_records_history_items.length }}", "no-data-text": "没有匹配的记录"})],
             "mt-5", show="{{ history_mode === 'selected' }}"),
         box([
             field("VSelect", "history_states", "清理哪些状态", "只匹配勾选的结束状态。",
@@ -293,7 +352,7 @@ def config_form(tasks, error="", batch_result=None, history_result=None):
         strategy,
         disclosure("视频格式", [field("VTextarea", "extensions", "接管的视频后缀", "英文逗号分隔，不加点号，例如 mkv,mp4,iso；未列出的格式走 MP 原流程。",
                     rows=2, spellcheck=False, **{"auto-grow": True})], "mdi-file-video-outline"),
-        disclosure(f"批量任务操作 · {selectable} 个可选", batch_children, "mdi-playlist-check"),
+        disclosure("批量任务操作 · 全库查询", batch_children, "mdi-playlist-check"),
         disclosure("清理已结束记录", maintenance, "mdi-broom"),
         disclosure("使用说明与通知设置", [node("ul", content=[node("li", content=[node("h3", title),
                    paragraph(text, **{"class": "p115-copy p115-muted mt-1"})]) for title, text in help_items],
@@ -471,7 +530,7 @@ def bulk_tools(tasks, enabled):
                                        "method": "POST", "params": {"keys": keys}}}
         if keys and enabled:
             controls.append(confirmation(f"{title} · {len(keys)} 项…", explanation, button))
-    children = [paragraph("作用于本页最近 200 条记录中的适用任务，不随状态筛选变化。提交时会检查最新状态；不适用项跳过，新入队任务不包含在内。",
+    children = [paragraph("作用于本页最近 50 条记录中的适用任务，不随状态筛选变化。提交时会检查最新状态；不适用项跳过，新入队任务不包含在内。",
                           **{"class": "p115-hint"})]
     if controls:
         children.append(box(controls, "p115-bulk-actions"))
@@ -481,7 +540,7 @@ def bulk_tools(tasks, enabled):
     return disclosure("批量操作与记录管理", children, "mdi-playlist-edit")
 
 
-def task_page(tasks, enabled, error="", max_retries=None, batch_result=None):
+def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, summary=None):
     now = time.time()
     refresh = node("VBtn", "刷新", variant="outlined", size="small",
                    **{"prepend-icon": "mdi-refresh", "style": "min-height:40px", "aria-label": "刷新任务状态"})
@@ -502,21 +561,30 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None):
                             type="info", variant="tonal", **{"class": "mb-4"}))
     groups = {group: [t for t in tasks if group in categories(t).split()]
               for group in ("waiting", "transfer", "attention", "ended")}
-    completed = [t for t in tasks if t["state"] == "completed"]
     waiting = groups["waiting"]
-    if waiting and enabled:
-        next_at = min(t.get("next_at") or 0 for t in waiting)
+    if summary is None:
+        # Standalone previews can derive a summary from their supplied sample.
+        summary = dict(states={s: sum(t["state"] == s for t in tasks) for s in LABELS},
+                       methods={m: sum(t["state"] == "completed" and t.get("transfer_method") == m for t in tasks)
+                                for m in ("instant", "upload")}, total=len(tasks),
+                       next_at=min((t.get("next_at") or 0 for t in waiting), default=None))
+    states, methods = summary["states"], summary["methods"]
+    count = lambda *values: sum(states.get(value, 0) for value in values)
+    waiting_count, completed_count = count("queued", "waiting"), count("completed")
+    if waiting_count and enabled:
+        next_at = summary["next_at"] or 0
         wait_caption = "已到时间，等待调度" if next_at <= now else "下次 " + datetime.fromtimestamp(next_at).strftime("%H:%M:%S")
     else:
-        wait_caption = "启用后继续调度" if waiting else "暂无等待任务"
-    instant = sum(t.get("transfer_method") == "instant" for t in completed)
-    upload = sum(t.get("transfer_method") == "upload" for t in completed)
+        wait_caption = "启用后继续调度" if waiting_count else "暂无等待任务"
+    instant, upload = methods.get("instant", 0), methods.get("upload", 0)
     content.append(box([
-        metric("等待秒传", len(waiting), wait_caption, "info", "mdi-clock-outline"),
-        metric("执行与上传", len(groups["transfer"]), f"执行中 {sum(t['state'] in ('running', 'uploading') for t in tasks)} · 上传排队 {sum(t['state'] == 'upload_queued' for t in tasks)}", "primary", "mdi-cloud-upload-outline"),
-        metric("需要处理", len(groups["attention"]), f"暂停 {sum(t['state'] == 'paused' for t in tasks)} · 失败 {sum(t['state'] == 'failed' for t in tasks)}", "error", "mdi-alert-circle-outline", True),
-        metric("整理完成", len(completed), f"秒传 {instant} · 上传 {upload}" + (f" · 未记录 {len(completed)-instant-upload}" if len(completed) > instant+upload else ""), "success", "mdi-check-circle-outline"),
-    ], "p115-metrics", **{"aria-label": "最近任务状态概览"}))
+        metric("等待秒传", waiting_count, wait_caption, "info", "mdi-clock-outline"),
+        metric("执行与上传", count("running", "uploading", "upload_queued"), f"执行中 {count('running', 'uploading')} · 上传排队 {count('upload_queued')}", "primary", "mdi-cloud-upload-outline"),
+        metric("需要处理", count("paused", "failed"), f"暂停 {count('paused')} · 失败 {count('failed')}", "error", "mdi-alert-circle-outline", True),
+        metric("整理完成", completed_count, f"秒传 {instant} · 上传 {upload}" + (f" · 未记录 {completed_count-instant-upload}" if completed_count > instant+upload else ""), "success", "mdi-check-circle-outline"),
+    ], "p115-metrics", **{"aria-label": "全部保留记录状态概览"}))
+    content.append(paragraph(f"全库共 {summary['total']} 条记录 · 下方仅预览最近 50 条，筛选与批量操作仅作用于预览记录。",
+                             **{"class": "p115-hint mb-3"}))
     filters = []
     for value, title, count in [("all", "全部", len(tasks)), ("waiting", "等待", len(waiting)),
                                  ("attention", "待处理", len(groups["attention"])),
@@ -542,7 +610,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None):
         for group, title in empty_copy.items():
             if not groups[group]:
                 content.append(box([icon("mdi-check-circle-outline", size=28), node("h3", title),
-                    paragraph("切换到其他状态查看任务。", **{"class": "p115-muted"})],
+                    paragraph("最近 50 条中没有匹配项；切换状态查看其他预览记录，更早的记录仍保存在完整历史中。", **{"class": "p115-muted"})],
                     "p115-empty p115-filter-empty", **{"data-filter": group}))
     else:
         content.append(box([icon("mdi-cloud-clock-outline", size=32, color="primary"),
@@ -550,6 +618,6 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None):
             paragraph("在配置页启用插件，确认 MP 内置 115 已授权，再发起本地到 115 的视频整理。",
                       **{"class": "p115-copy p115-muted"})], "p115-empty"))
     content.append(bulk_tools(tasks, enabled))
-    content.append(paragraph("概览仅统计本页最近 200 条记录 · 更新于 " + datetime.fromtimestamp(now).astimezone().strftime("%m-%d %H:%M:%S %z") +
+    content.append(paragraph("概览统计全部保留记录，手动清理后数量会减少；完整整理结果也可在 MP 整理历史查看。更新于 " + datetime.fromtimestamp(now).astimezone().strftime("%m-%d %H:%M:%S %z") +
                              " · 时间按 MP 时区显示，点击刷新更新。", **{"class": "p115-footer"}))
     return [node("VContainer", content=content, **{"class": "p115-ui pa-0"})]

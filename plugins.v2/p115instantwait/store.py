@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .records import transfer_method
 
 
 TERMINAL = ("completed", "cancelled", "failed")
@@ -26,6 +27,16 @@ class QueueStore:
             db.execute("CREATE TABLE IF NOT EXISTS target_owners (path TEXT PRIMARY KEY, job_id TEXT NOT NULL)")
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS active_source ON jobs(source)
                 WHERE state NOT IN ('completed', 'cancelled', 'failed')""")
+            # Migrate once, transactionally; reuse the checkpoint interpretation
+            # used by task records instead of parsing every payload on page loads.
+            db.execute("BEGIN IMMEDIATE")
+            if "transfer_method" not in {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}:
+                db.execute("ALTER TABLE jobs ADD COLUMN transfer_method TEXT NOT NULL DEFAULT 'unknown'")
+                for row in db.execute("SELECT id,payload FROM jobs"):
+                    db.execute("UPDATE jobs SET transfer_method=? WHERE id=?",
+                               (transfer_method(json.loads(row["payload"])), row["id"]))
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created DESC)")
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_summary ON jobs(state,transfer_method,next_at)")
 
     @contextmanager
     def connect(self):
@@ -55,9 +66,9 @@ class QueueStore:
             if row:
                 return self.decode(row), False
             key = hashlib.sha256(f"{source}:{time.time_ns()}".encode()).hexdigest()[:24]
-            db.execute("INSERT INTO jobs(id,source,state,next_at,created,updated,payload) "
-                       "VALUES(?,?,'queued',?,?,?,?)",
-                       (key, source, now, now, now, json.dumps(payload, ensure_ascii=False)))
+            db.execute("INSERT INTO jobs(id,source,state,next_at,created,updated,payload,transfer_method) "
+                       "VALUES(?,?,'queued',?,?,?,?,?)",
+                       (key, source, now, now, now, json.dumps(payload, ensure_ascii=False), transfer_method(payload)))
             return self.decode(db.execute("SELECT * FROM jobs WHERE id=?", (key,)).fetchone()), True
 
     def get(self, key):
@@ -74,6 +85,51 @@ class QueueStore:
             where = "WHERE state NOT IN ('completed','cancelled','failed')" if active else ""
             return [self.decode(row) for row in db.execute(
                 f"SELECT * FROM jobs {where} ORDER BY created DESC LIMIT ?", (limit,))]
+
+    def dashboard(self):
+        """All retained records counted, only 50 payloads read, one snapshot."""
+        with self.connect() as db:
+            db.execute("BEGIN")
+            states, methods, next_at = {}, {}, None
+            for row in db.execute("SELECT state,transfer_method,COUNT(*) AS count,MIN(next_at) AS next_at "
+                                  "FROM jobs GROUP BY state,transfer_method"):
+                state = row["state"]
+                states[state] = states.get(state, 0) + row["count"]
+                if state == "completed":
+                    methods[row["transfer_method"]] = row["count"]
+                if state in ("queued", "waiting"):
+                    next_at = row["next_at"] if next_at is None else min(next_at, row["next_at"])
+            tasks = [self.decode(row) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 50")]
+            return tasks, dict(states=states, methods=methods, next_at=next_at, total=sum(states.values()))
+
+    def search(self, *, scope="history", query="", state="", page=1):
+        """Search the whole queue, returning at most 50 records per request."""
+        scopes = {"tasks": ("queued", "waiting", "running", "paused", "upload_queued", "uploading"),
+                  "history": TERMINAL}
+        if scope not in scopes or (state and state not in scopes[scope]):
+            raise ValueError("不支持的记录范围或状态")
+        if not isinstance(query, str) or len(query) > 200:
+            raise ValueError("搜索内容不能超过 200 个字符")
+        if type(page) is not int or page < 1:
+            raise ValueError("页码必须是正整数")
+        states = (state,) if state else scopes[scope]
+        where = "state IN (" + ",".join("?" for _ in states) + ")"
+        params = list(states)
+        query = query.strip()
+        if query:
+            # Treat %, _ and backslash literally, not as LIKE wildcards.
+            pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where += " AND (source LIKE ? ESCAPE '\\' OR id=? OR CAST(history_id AS TEXT)=?)"
+            params.extend((pattern, query, query.lstrip("#")))
+        with self.connect() as db:
+            db.execute("BEGIN")
+            total = db.execute(f"SELECT COUNT(*) FROM jobs WHERE {where}", params).fetchone()[0]
+            pages = max(1, (total + 49) // 50)
+            page = min(page, pages)
+            rows = [self.decode(row) for row in db.execute(
+                f"SELECT * FROM jobs WHERE {where} ORDER BY created DESC,id DESC LIMIT 50 OFFSET ?",
+                (*params, (page - 1) * 50))]
+            return dict(rows=rows, page=page, pages=pages, total=total)
 
     def reserve_target(self, key, path):
         """Fence both workers and restarts against concurrent same-target uploads."""
@@ -135,6 +191,7 @@ class QueueStore:
         if not changes or set(changes) - allowed:
             raise ValueError("Invalid queue update")
         if "payload" in changes:
+            changes["transfer_method"] = transfer_method(changes["payload"])
             changes["payload"] = json.dumps(changes["payload"], ensure_ascii=False)
         changes["updated"] = time.time()
         with self.connect() as db:

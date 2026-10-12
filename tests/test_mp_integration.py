@@ -164,12 +164,10 @@ class MoviePilotTests(unittest.TestCase):
                  methods={"post_message"}, bases="object")
         plugins = types.ModuleType("app.plugins")
         plugins._PluginBase = ns["_PluginBase"]
-        fastapi = types.ModuleType("fastapi")
-        fastapi.HTTPException = RuntimeError
         spec = importlib.util.spec_from_file_location("instantwait_test.plugin_entry", PLUGIN / "__init__.py")
         spec.submodule_search_locations = None
         entry = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {"app.plugins": plugins, "fastapi": fastapi}), \
+        with patch.dict(sys.modules, {"app.plugins": plugins}), \
                 patch.object(self.h.schemas, "NotificationType", ns["NotificationType"], create=True):
             spec.loader.exec_module(entry)
         plugin = entry.P115InstantWait()

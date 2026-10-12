@@ -11,7 +11,7 @@ from app.schemas import NotificationType
 from .bridge import InstantWaitEngine
 from .store import QueueStore
 from .records import task_record
-from .ui import config_form, task_page
+from .ui import config_form, task_page, record_choices, record_search_model
 
 
 DEFAULTS = {
@@ -38,7 +38,7 @@ class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "0.3.5"
+    plugin_version = "0.3.6"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -53,7 +53,7 @@ class P115InstantWait(_PluginBase):
 
     def init_plugin(self, config=None):
         self.stop_service()
-        self._config = {**DEFAULTS, **(config or {})}
+        self._config = {**DEFAULTS, **{k: v for k, v in (config or {}).items() if not k.startswith("_records_")}}
         self._error = ""
         apply_action = self._config["apply_action"]
         cleanup_history = self._config["cleanup_history"]
@@ -62,7 +62,7 @@ class P115InstantWait(_PluginBase):
         # must not fall back to a stale task_id from a previous version.
         selected = self._config["task_ids"] if "task_ids" in (config or {}) else ([self._config["task_id"]] if self._config["task_id"] else [])
         try:
-            if apply_action or cleanup_history:
+            if apply_action or cleanup_history or any(k.startswith("_records_") for k in (config or {})):
                 # Consume the one-shot request before mutating any task. A
                 # restart must never repeat uploads/cancels from saved config.
                 self._config.update(apply_action=False, task_ids=[], task_id="",
@@ -154,6 +154,8 @@ class P115InstantWait(_PluginBase):
         return [
             {"path": "/tasks", "endpoint": self.list_tasks, "methods": ["GET"],
              "auth": "bear", "summary": "查看秒传等待队列"},
+            {"path": "/records", "endpoint": self.search_records, "methods": ["GET"],
+             "auth": "bear", "summary": "全库搜索任务与历史，每页50条"},
             {"path": "/tasks/{task_id}/{action}", "endpoint": self.control_task,
              "methods": ["POST"], "auth": "bear", "summary": "暂停、继续等待、强制上传或取消任务"},
             {"path": "/batch/{action}", "endpoint": self.control_batch,
@@ -164,7 +166,15 @@ class P115InstantWait(_PluginBase):
         return self._engine.store if self._engine else QueueStore(Path(self.get_data_path()) / "queue.db")
 
     def list_tasks(self):
-        return [task_record(row) for row in self.queue().all()]
+        return [task_record(row) for row in self.queue().all(limit=50)]
+
+    def search_records(self, scope: str = "history", query: str = "", state: str = "", page: int = 1):
+        try:
+            result = self.queue().search(scope=scope, query=query, state=state, page=page)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return {k: v for k, v in result.items() if k != "rows"} | {
+            "items": record_choices([task_record(row) for row in result["rows"]])}
 
     def control_task(self, task_id: str, action: str):
         if not self.get_state():
@@ -180,8 +190,11 @@ class P115InstantWait(_PluginBase):
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
     def get_form(self):
-        return config_form(self.list_tasks(), self._error, self.get_data("last_batch_result"),
-                           history_result=self.get_data("last_history_cleanup")), {**DEFAULTS, "task_ids": [], "history_ids": []}
+        model = {**DEFAULTS, "task_ids": [], "history_ids": []}
+        for scope in ("tasks", "history"):
+            model.update(record_search_model(scope, self.search_records(scope=scope)))
+        return config_form([], self._error, self.get_data("last_batch_result"),
+                           history_result=self.get_data("last_history_cleanup")), model
 
     def control_batch(self, action: str, keys: list[str] = Body(..., embed=True)):
         if not self.get_state():
@@ -203,7 +216,8 @@ class P115InstantWait(_PluginBase):
         return result
 
     def get_page(self):
-        return task_page(self.list_tasks(), self.get_state(), self._error,
+        rows, summary = self.queue().dashboard()
+        return task_page([task_record(row) for row in rows], self.get_state(), self._error, summary=summary,
                          max_retries=int(self._engine.config["max_retries"]) if self._engine else None,
                          batch_result=self.get_data("last_batch_result"))
 

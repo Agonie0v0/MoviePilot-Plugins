@@ -345,6 +345,43 @@ def test_api_response_models_preserve_bare_json(h, task):
     assert client.post(f"/tasks/{row['id']}/upload").json() == {"success": True, "state": "upload_queued"}
 
 
+def test_full_history_search_preview_and_finalizing_are_consistent(h, task):
+    row = h.enter(task)
+    h.engine.store.update(row["id"], state="finalizing")
+    for i in range(251):
+        payload = {**row["payload"], "instant_confirmed": True}
+        old, _ = h.engine.store.enqueue(f"/old-record-{i:03}.mkv", payload)
+        h.engine.store.update(old["id"], state="completed")
+    plugin = h.plugin.P115InstantWait()
+    plugin._engine = h.engine
+    app = FastAPI()
+    for route in plugin.get_api():
+        assert route["auth"] == "bear" and route["response_model"]
+        app.add_api_route(route["path"], route["endpoint"], methods=route["methods"], response_model=route["response_model"])
+    client = TestClient(app)
+    assert len(client.get("/tasks").json()) == 50
+    result = client.get("/records", params={"scope": "history", "query": "old-record-000"}).json()
+    assert result["total"] == 1 and len(result["items"]) == 1
+    last = client.get("/records", params={"scope": "history", "page": 6}).json()
+    assert (last["total"], last["pages"], len(last["items"])) == (251, 6, 1)
+    finalizing = client.get("/records", params={"scope": "tasks", "state": "finalizing"}).json()
+    assert finalizing["total"] == 1 and finalizing["items"][0]["props"]["disabled"]
+    assert client.post(f"/tasks/{row['id']}/cancel").status_code == 409
+    assert client.post("/batch/upload", json={"keys": [row["id"]]}).json()["skipped"] == 1
+    assert h.engine.store.clear_history(keys=[row["id"]])["skipped"] == 1
+    rows, summary = h.engine.store.dashboard()
+    assert len(rows) == 50 and summary["total"] == 252
+    assert summary["states"]["finalizing"] == 1 and summary["methods"]["instant"] == 251
+    form, model = plugin.get_form()
+    assert form and model["_records_history_total"] == 251
+    assert len(model["_records_history_items"]) == 50
+    assert plugin.get_page()
+    ui = __import__(h.plugin.__name__ + ".ui", fromlist=["ui"])
+    record = h.plugin.task_record(h.engine.store.get(row["id"]))
+    assert ui.categories(record) == "transfer"
+    assert "V3 回写" in ui.schedule_summary(record, True, time.time())[1]
+
+
 def test_qmj_import_form_history_api_and_message_type(h):
     p = load_plugin("qmjsign")
     plugin = p.qmjsign()
