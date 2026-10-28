@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from sqlalchemy import Boolean, CheckConstraint, Index, Integer, JSON, String, create_engine, false, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, declared_attr, mapped_column, sessionmaker
 
@@ -103,11 +103,12 @@ class Harness:
             sys.modules.pop(name, None)
         ns = {**vars(typing), "__name__": "app.schemas.types", "Enum": enum.Enum, "IntEnum": enum.IntEnum,
               "auto": enum.auto}
-        selected("app/schemas/types.py", {"MessageType", "EventType", "MediaType", "ChainEventType"}, ns)
+        selected("app/schemas/types.py", {"MessageType", "EventType", "MediaType", "MediaSource", "ChainEventType"}, ns)
         module("app.schemas.types").__dict__.update(ns)
         self.MediaType = ns["MediaType"]
         ns = {**vars(typing), "__name__": "app.schemas.file", "BaseModel": BaseModel, "ConfigDict": ConfigDict,
-              "Field": Field, "Path": Path, "re": re, "WINDOWS_DRIVE_PATTERN": re.compile(r"^[A-Za-z]:")}
+              "Field": Field, "_field_serializer": field_serializer, "Path": Path, "re": re,
+              "WINDOWS_DRIVE_PATTERN": re.compile(r"^[A-Za-z]:")}
         selected("app/schemas/file.py", {"FileURI", "FileItem"}, ns)
         module("app.schemas.file").__dict__.update(ns)
         self.FileItem = ns["FileItem"]
@@ -147,7 +148,11 @@ class Harness:
         self.history = HistoryRepository()
         class Local:
             def get_item_strict(self, path):
-                return owner.FileItem(storage="local", path=str(path), type="file") if Path(path).exists() else None
+                if not Path(path).exists():
+                    return None
+                stat = Path(path).stat()
+                return owner.FileItem(storage="local", path=str(path), type="file", size=stat.st_size,
+                    modify_time=stat.st_mtime, modify_time_ns=stat.st_mtime_ns, change_time_ns=stat.st_ctime_ns)
             def delete(self, item):
                 Path(item.path).unlink(missing_ok=True)
                 return True
@@ -156,6 +161,7 @@ class Harness:
         module("app.modules.filemanager.storages.local").LocalStorage = Local
         module("app.modules.filemanager.storages.u115").U115Pan = U115
         self.Local, self.U115 = Local, U115
+        self.source_oper = self.target_oper = None
         class Data(NS):
             cancel = False
         native_ns = {**vars(typing), "__name__": "app.modules.filemanager.transhandler", "Path": Path,
@@ -169,13 +175,16 @@ class Harness:
         native_ns["__name__"] = "app.modules.filemanager.transhandler"
         selected("app/modules/filemanager/transhandler.py", {"TransHandler"}, native_ns)
         self.Handler = native_ns["TransHandler"]
-        chain_ns = {**vars(typing), "__name__": "app.chain.transfer", "TransferInfo": self.Info}
+        chain_ns = {**vars(typing), "__name__": "app.chain.transfer", "TransferInfo": self.Info,
+                    "StorageOperSelectionEventData": NS, "ChainEventType": native_ns["ChainEventType"]}
         selected("app/chain/transfer/plan.py", {"TransferPlanningOwner"}, chain_ns,
-                 methods={"_TransferChain__execute_host_transfer_plan"}, base="object")
+                 methods={"_TransferChain__execute_host_transfer_plan", "_TransferChain__select_storage_oper"}, base="object")
         class Chain(chain_ns["TransferPlanningOwner"]):
             def __init__(self):
                 self.transfer_history_repository = owner.history
                 self.transfer_execution_repository = NS(get_snapshot=lambda **kw: NS(state="failed"))
+                self.eventmanager = NS(send_event=lambda kind, data: NS(event_data=NS(
+                    storage_oper=owner.source_oper if data.storage == "local" else owner.target_oper)))
             def run_module(self, name, **kwargs):
                 kwargs.pop("raise_exception", None)
                 checkpoint = kwargs.pop("checkpoint")
@@ -202,7 +211,9 @@ class Harness:
                 return info.success, info.message or ""
             def _TransferChain__handle_transfer(self, task, callback=None):
                 info = self._TransferChain__execute_host_transfer_plan(task, task.plan_checkpoint,
-                    source_oper=Local(), target_oper=U115(), step_runner=task.runner)
+                    source_oper=self._TransferChain__select_storage_oper(task.fileitem.storage),
+                    target_oper=self._TransferChain__select_storage_oper(task.plan_checkpoint.target_storage),
+                    step_runner=task.runner)
                 return (callback or self._TransferChain__default_callback)(task, info)
             def queue_failed_transfer_notification(self, *, task, transferinfo, **kwargs):
                 owner.events.append("failure-notification")
@@ -238,8 +249,10 @@ class Harness:
         sys.modules.pop("v3_test_history", None)
 
     def task(self, path, mode="copy", cleanup=None):
+        stat = Path(path).stat()
         item = self.FileItem(storage="local", path=str(path), type="file", name=Path(path).name,
-                             size=Path(path).stat().st_size, extension="mkv")
+                             size=stat.st_size, extension="mkv", modify_time=stat.st_mtime,
+                             modify_time_ns=stat.st_mtime_ns, change_time_ns=stat.st_ctime_ns)
         checkpoint = NS(preview=False, skip_reason=None, rejection_error=None, resolved_transfer_type=mode,
             target_storage="u115", final_target_path="/library/Film.mkv", need_scrape=True, need_notify=True,
             overwrite_mode="always", planning_input=NS(source_fileitem=item.model_dump(mode="json"),

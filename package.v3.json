@@ -53,7 +53,7 @@
     "name": "115秒传等待",
     "description": "V3 内置115等待秒传，独立上传队列，成功回写原整理记录",
     "labels": "云盘,整理",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "release": false,
     "icon": "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png",
     "author": "Agonie",
@@ -62,6 +62,7 @@
     "system_version": ">=3.1.0,<4.0.0",
     "level": 1,
     "history": {
+      "v1.2.1": "适配MP 3.2.1：修复未接管时空存储对象误报冲突；支持原生覆盖预执行和移动目标身份校验、回执重放",
       "v1.2.0": "移除 MoviePilot 版本号硬校验与清单 system_version 上限，改为装载时探测整理接口；同一实现适用于整个 V3 系列",
       "v1.1.2": "全库统计与最近50条预览；操作和清理支持全库搜索、状态筛选及分页；保留V3回写状态与恢复保护",
       "v1.1.1": "恢复 MP 原生覆盖模式与旧版本清理，按原生裁决删除旧文件后直传正式路径，保留无临时目录和上传恢复保护",

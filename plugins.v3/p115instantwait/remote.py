@@ -426,6 +426,7 @@ class DirectStorage:
         self.final_path = PurePosixPath(final_path)
         self.item, self.hashes = item, hashes
         self.error = None
+        self.materialized = False
 
     def __getattr__(self, name):
         value = getattr(self.api, name)
@@ -442,7 +443,7 @@ class DirectStorage:
     def get_item(self, path):
         try:
             item = self.api.get_item(path)
-            if item and self.item and str(item.fileid) == str(self.item.fileid) and PurePosixPath(str(path).replace("\\", "/")) == self.final_path:
+            if not self.materialized and item and self.item and str(item.fileid) == str(self.item.fileid) and PurePosixPath(str(path).replace("\\", "/")) == self.final_path:
                 return None
             return item
         except Exception as exc:
@@ -474,6 +475,7 @@ class DirectStorage:
             payload = self.store.get(self.job["id"])["payload"]
             payload["committed"] = True
             self.store.update(self.job["id"], payload=payload)
+            self.materialized = True
             return item
         except Exception as exc:
             self.error = exc
@@ -482,16 +484,32 @@ class DirectStorage:
 
 class NativePlanStorage(DirectStorage):
     """Run MP's actual policy with buffered deletes and a virtual upload result."""
-    def __init__(self, api, store, job, item_factory):
+    def __init__(self, api, store, job, item_factory, source_fileitem):
         data = job["payload"]
         super().__init__(api, store, job, data["final_path"], None,
                          {"fingerprint": data["source_initial"]})
         self.item_factory = item_factory
         self.deletions = []
         self.upload_planned = False
+        self.changes, self.originals = {}, {}
+        self.stage_path = self.backup_path = None
+        try:
+            from app.application.transfer.execution import build_transfer_overwrite_paths
+        except ImportError:
+            pass  # V3.1 has no staged overwrite contract.
+        else:
+            self.stage_path, self.backup_path = map(PurePosixPath, build_transfer_overwrite_paths(
+                source=source_fileitem, target_storage="u115", target_path=data["final_path"],
+                transfer_type=data["mode"]))
 
     def get_item(self, path):
+        path = PurePosixPath(str(path).replace("\\", "/"))
+        if path in self.changes:
+            return self.changes[path]
         item = super().get_item(path)
+        if item and path in (self.stage_path, self.backup_path):
+            self.error = PauseTask("MP 覆盖暂存或备份路径已存在，请先在整理队列核对")
+            raise self.error
         if item and any(str(old.fileid) == str(item.fileid) for old in self.deletions):
             return None
         return item
@@ -506,18 +524,40 @@ class NativePlanStorage(DirectStorage):
         if item.type != "file":
             self.error = PauseTask("不支持自动替换整个远端目录")
             raise self.error
-        if all(str(old.fileid) != str(item.fileid) for old in self.deletions):
-            self.deletions.append(item)
+        original = self.originals.get(str(item.fileid), item)
+        if all(str(old.fileid) != str(original.fileid) for old in self.deletions):
+            self.deletions.append(original)
+        self.changes[PurePosixPath(item.path)] = None
         return True
+
+    def rename(self, item, name):
+        """Simulate V3.2 overwrite renames; never rename a real cloud object."""
+        source = PurePosixPath(item.path)
+        target = source.with_name(name)
+        if (source, target) not in ((self.final_path, self.backup_path), (self.stage_path, self.final_path)):
+            self.error = PauseTask("MP 覆盖路径不匹配，已停止预执行")
+            raise self.error
+        self.originals.setdefault(str(item.fileid), item)
+        self.changes[source] = None
+        self.changes[target] = item.model_copy(update={"path": str(target), "name": name})
+        return True
+
+    def list(self, folder):
+        items = {PurePosixPath(item.path): item for item in self.api.list(folder)}
+        items.update({path: item for path, item in self.changes.items()
+                      if path.parent == PurePosixPath(folder.path)})
+        return [item for item in items.values() if item is not None]
 
     def upload(self, target_dir, local_path, new_name=None):
         final = PurePosixPath(str(target_dir.path).replace("\\", "/")) / (new_name or Path(local_path).name)
-        if final != self.final_path or fingerprint(local_path) != self.hashes["fingerprint"]:
+        if final not in (self.final_path, self.stage_path) or fingerprint(local_path) != self.hashes["fingerprint"]:
             self.error = PauseTask("整理路径或源文件发生变化，已停止覆盖")
             raise self.error
         self.upload_planned = True
-        return self.item_factory(storage="u115", type="file", fileid="0", path=str(final),
+        item = self.item_factory(storage="u115", type="file", fileid="0", path=str(final),
                                  name=final.name, size=self.hashes["fingerprint"]["size"])
+        self.changes[final] = item
+        return item
 
 
 def apply_native_deletions(api, store, row, item_factory):
@@ -537,7 +577,7 @@ def apply_native_deletions(api, store, row, item_factory):
 
 
 class PlanningStepRunner:
-    """Evaluate the native plan without writing durable execution receipts."""
+    """Evaluate native policy against virtual storage without durable receipts."""
     def run(self, *, phase, kind, payload, execute, observe):
         return execute()
 

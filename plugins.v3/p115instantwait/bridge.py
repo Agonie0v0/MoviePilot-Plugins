@@ -217,6 +217,12 @@ class InstantWaitEngine:
         """Leave a native durable failure until a verified final file is ready."""
         if task.fileitem.type != "file" or checkpoint.resolved_transfer_type not in ("copy", "move") or len(checkpoint.items) != 1:
             return TransferInfo(success=False, fileitem=task.fileitem, message="秒传等待只支持单视频文件的复制或移动整理")
+        # V3 selection returns None when no plugin supplies a storage operator;
+        # the filemanager normally resolves built-ins later, after this gate.
+        if source_oper is None:
+            source_oper = LocalStorage()
+        if target_oper is None:
+            target_oper = U115Pan()
         if not isinstance(source_oper, LocalStorage) or not isinstance(target_oper, U115Pan):
             return TransferInfo(success=False, fileitem=task.fileitem, message="其他插件已接管存储，无法安全接管秒传等待")
         if not task.admission_task_id or runner is None:
@@ -245,7 +251,8 @@ class InstantWaitEngine:
             api = OpenAPI(U115Pan(), FileItem, self.stop_event)
             try:
                 self.check_source(row)
-                planner = NativePlanStorage(api, self.store, row, FileItem)
+                planner = NativePlanStorage(api, self.store, row, FileItem,
+                                            checkpoint.planning_input.source_fileitem)
                 self.context.prepared_storage = planner
                 try:
                     planned = original(self.chain, task, checkpoint,
@@ -298,7 +305,7 @@ class InstantWaitEngine:
             self.context.prepared_storage = proxy
             try:
                 info = original(self.chain, task, checkpoint, source_oper=source_oper, target_oper=proxy,
-                                step_runner=PreparedStepRunner(runner, api, data))
+                                step_runner=PreparedStepRunner(runner, api, data, proxy))
             finally:
                 self.context.prepared_storage = None
             if proxy.error:
@@ -557,8 +564,8 @@ class InstantWaitEngine:
 class PreparedStepRunner:
     """Give V3 strict evidence for an upload that committed before a lost response."""
 
-    def __init__(self, runner, api, data):
-        self.runner, self.api, self.data = runner, api, data
+    def __init__(self, runner, api, data, storage):
+        self.runner, self.api, self.data, self.storage = runner, api, data, storage
 
     def run(self, *, phase, kind, payload, execute, observe):
         """Replace only cloud materialization observation; preserve native intents/CAS."""
@@ -574,4 +581,8 @@ class PreparedStepRunner:
                     return TransferOperationObservation(state=TransferOperationObservationState.APPLIED,
                         evidence=TransferStepResult(payload={"item": item.model_dump(mode="json"), "message": "远端文件已核对"}))
                 return original_observe()
-        return self.runner.run(phase=phase, kind=kind, payload=payload, execute=execute, observe=observe)
+        result = self.runner.run(phase=phase, kind=kind, payload=payload, execute=execute, observe=observe)
+        if kind == "materialize_target":
+            # Also expose the committed object when a durable receipt is replayed.
+            self.storage.materialized = True
+        return result

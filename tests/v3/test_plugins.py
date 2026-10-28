@@ -63,6 +63,66 @@ def test_wait_failure_then_same_history_success(h, task):
     assert h.api.get_item("/library/Film.mkv").fileid == "123"
 
 
+@pytest.mark.parametrize("source,target", [(False, False), (True, False), (False, True), (True, True)])
+def test_builtin_storage_selection_accepts_none_and_instances(h, task, source, target):
+    h.source_oper = h.Local() if source else None
+    h.target_oper = h.U115() if target else None
+    row = stage(h, task)
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.history.get(row["history_id"]).status
+
+
+@pytest.mark.parametrize("side", ["source_oper", "target_oper"])
+@pytest.mark.parametrize("falsy", [False, True])
+def test_foreign_storage_is_rejected_before_queue_or_upload(h, task, side, falsy):
+    class Foreign:
+        def __bool__(self):
+            return not falsy
+    setattr(h, side, Foreign())
+    success, message = h.Chain()._TransferChain__handle_transfer(task)
+    assert not success and "其他插件已接管存储" in message
+    assert h.engine.store.all() == []
+    assert h.api.inits == h.api.uploads == 0 and h.api.deletes == []
+    assert Path(task.fileitem.path).exists()
+
+
+def test_v32_move_checks_materialized_target_before_deleting_source(h, task):
+    if not hasattr(h.Handler, "_TransHandler__assert_file_identity"):
+        pytest.skip("V3.1 predates native move identity checks")
+    task.plan_checkpoint.resolved_transfer_type = "move"
+    row = stage(h, task)
+    run = task.runner.run
+    def replace_before_delete(**kwargs):
+        if kwargs["kind"] == "delete_move_source":
+            h.api.files.clear()
+            h.api.files["999"] = h.FileItem(storage="u115", type="file", fileid="999",
+                path="/library/Film.mkv", size=Path(task.fileitem.path).stat().st_size)
+        return run(**kwargs)
+    task.runner.run = replace_before_delete
+    with pytest.raises(h.execution.TransferExecutionConflictError):
+        h.Chain()._TransferChain__handle_transfer(task)
+    assert Path(task.fileitem.path).exists()
+    assert not h.history.get(row["history_id"]).status
+    assert h.engine.store.get(row["id"])["state"] == "finalizing"
+
+
+@pytest.mark.parametrize("kind", ["stage", "backup"])
+def test_v32_existing_overwrite_artifact_pauses_without_side_effects(h, task, kind):
+    build_paths = getattr(h.execution, "build_transfer_overwrite_paths", None)
+    if build_paths is None:
+        pytest.skip("V3.1 predates staged overwrite")
+    paths = build_paths(source=task.plan_checkpoint.planning_input.source_fileitem,
+        target_storage="u115", target_path="/library/Film.mkv", transfer_type="copy")
+    h.api.files["999"] = h.FileItem(storage="u115", type="file", fileid="999", path="/library/Film.mkv", size=1)
+    h.api.files["888"] = h.FileItem(storage="u115", type="file", fileid="888",
+        path=paths[kind == "backup"], size=1)
+    row = h.enter(task)
+    assert row["state"] == "paused"
+    assert h.api.inits == h.api.uploads == 0 and h.api.deletes == h.api.moves == []
+    assert set(h.api.files) == {"999", "888"} and Path(task.fileitem.path).exists()
+
+
 
 
 def test_history_cleanup_keeps_v3_native_history_and_remote_file(h, task):
@@ -158,7 +218,9 @@ def test_old_target_cleanup_follows_native_plan_without_backup(h, task):
     assert h.engine.store.get(row["id"])["state"] == "completed"
 
 
-def test_existing_final_file_uses_native_always_overwrite(h, task):
+@pytest.mark.parametrize("mode", ["copy", "move"])
+def test_existing_final_file_uses_native_always_overwrite(h, task, mode):
+    task.plan_checkpoint.resolved_transfer_type = mode
     h.api.files["999"] = h.FileItem(storage="u115", type="file", path="/library/Film.mkv", fileid="999", name="Film.mkv", size=2)
     row = stage(h, task)
     h.Chain()._TransferChain__handle_transfer(task)
@@ -167,6 +229,7 @@ def test_existing_final_file_uses_native_always_overwrite(h, task):
     assert h.api.inits == 1 and h.api.uploads == 0
     assert "999" not in h.api.files
     assert h.api.moves == []
+    assert Path(task.fileitem.path).exists() == (mode == "copy")
 
 
 @pytest.mark.parametrize("mode,size,allowed", [("never", 1, False), ("size", 1, True),
@@ -453,7 +516,7 @@ def test_real_native_started_step_requires_exact_cloud_evidence(h, task, visible
     runner._command = Mock()
     runner._command.prepare.return_value = step
     runner._command.complete.side_effect = lambda **kw: NS(result=kw["result"])
-    proxy = h.bridge.PreparedStepRunner(runner, h.api, data)
+    proxy = h.bridge.PreparedStepRunner(runner, h.api, data, NS(materialized=False))
     execute = Mock(side_effect=AssertionError("uncertain step must not be blindly replayed"))
     observe = lambda: h.execution.TransferOperationObservation(
         state=h.execution.TransferOperationObservationState.UNKNOWN,
