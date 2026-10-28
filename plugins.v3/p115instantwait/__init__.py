@@ -1,4 +1,9 @@
-"""115 秒传等待 — MoviePilot V3 plugin entry point."""
+"""115 秒传等待 — MoviePilot V3 plugin entry point.
+
+不再按 MoviePilot 版本号拒绝启用：整理接口的兼容性由 ``InstantWaitEngine.install()``
+在装载时逐项探测（所需方法是否存在、执行合同签名是否匹配），缺失或变化时才拒绝，
+并给出具体原因。
+"""
 from pathlib import Path
 from datetime import datetime
 
@@ -8,7 +13,6 @@ from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 from app.schemas.types import MessageType as NotificationType
 from pydantic import BaseModel
-from packaging.version import Version
 
 from .bridge import InstantWaitEngine
 from .store import QueueStore
@@ -94,7 +98,7 @@ class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.2.0"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -138,9 +142,6 @@ class P115InstantWait(_PluginBase):
                 if apply_action:
                     raise ValueError("请先启用插件，再执行批量操作")
                 return
-            from version import APP_VERSION
-            if not Version("3.1.0") <= Version(APP_VERSION.lstrip("v")) < Version("3.2.0"):
-                raise ValueError(f"当前支持 V3.1.x，检测到 {APP_VERSION}；需先验证整理接口兼容性")
             hours = float(self._config["max_wait_hours"])
             if not 0 <= hours <= 8760:
                 raise ValueError("等待时限必须在 0 到 8760 小时之间，0 表示不限时")
