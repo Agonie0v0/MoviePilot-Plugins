@@ -58,10 +58,15 @@ class QueueTask(BaseModel):
     result_message: str = ""
 
 
-class ControlResponse(BaseModel):
-    """任务操作仍返回裸 JSON 成功状态。"""
-    success: bool
+class ControlResult(BaseModel):
     state: str
+
+
+class ControlResponse(BaseModel):
+    """PageRender 使用宿主客户端，必须返回完整的标准响应。"""
+    success: bool
+    message: str = ""
+    data: ControlResult
 
 
 class RecordChoice(BaseModel):
@@ -84,7 +89,7 @@ class BatchItem(BaseModel):
     message: str
 
 
-class BatchResponse(BaseModel):
+class BatchResult(BaseModel):
     action: str
     at: str
     accepted: int
@@ -94,11 +99,17 @@ class BatchResponse(BaseModel):
     notice: str = ""
 
 
+class BatchResponse(BaseModel):
+    success: bool
+    message: str = ""
+    data: BatchResult
+
+
 class P115InstantWait(_PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -241,7 +252,7 @@ class P115InstantWait(_PluginBase):
             raise HTTPException(status_code=400, detail="不支持此操作")
         try:
             row = self._engine.control(task_id, action)
-            return {"success": True, "state": row["state"]}
+            return {"success": True, "message": "", "data": {"state": row["state"]}}
         except KeyError:
             raise HTTPException(status_code=404, detail="任务不存在") from None
         except ValueError as exc:
@@ -271,7 +282,7 @@ class P115InstantWait(_PluginBase):
             logger.warning("【115秒传等待】批量操作结果保存失败，请核对队列状态与日志")
             self._error = "批量操作已提交，但结果未能保存；请核对任务状态与日志。"
             result["notice"] = self._error
-        return result
+        return {"success": True, "message": "", "data": result}
 
     def get_page(self):
         rows, summary = self.queue().dashboard()
