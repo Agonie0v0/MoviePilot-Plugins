@@ -277,7 +277,7 @@ def config_form(tasks, error="", batch_result=None, history_result=None):
         ], "p115-fields"),
         note("达到上限后保留本地文件。你可以继续等待、强制上传或取消任务。",
              "mdi-pause-circle-outline", **{"show": "{{ limit_action === 'manual' }}"}),
-        note("先尝试秒传，未命中就上传视频正文，会占用上行带宽。上传失败或文件、授权异常时仍会暂停。",
+        note("先尝试秒传，未命中就上传视频正文，会占用上行带宽。若上次请求结果未知，将在目标当前不存在时重试；延迟出现的远端文件可能造成重复，请先核对目标。上传失败或文件、授权异常时仍会暂停。",
              "mdi-cloud-upload-outline", **{"show": "{{ limit_action === 'upload' }}"}),
     ])
 
@@ -463,7 +463,7 @@ def task_row(task, enabled, now, max_retries):
                        else task_button(task, "pause", "暂停"))
         if status != "upload_queued":
             actions.append(confirm_action(task, "upload", "强制上传…",
-                "先尝试秒传，未命中就上传视频正文，会占用上行带宽。", "确认强制上传"))
+                "先尝试秒传，未命中就上传视频正文，会占用上行带宽。若上次请求结果未知，将在目标当前不存在时重试；延迟出现的远端文件可能造成重复，请先核对目标。", "确认强制上传"))
     row = [box([icon(TONES.get(status, ("secondary", "mdi-file-video-outline"))[1], size=21,
                           style=tone_style(TONES.get(status, ("secondary", ""))[0]))], "p115-task-icon"),
            box(main, "p115-task-main")]
@@ -522,15 +522,16 @@ def bulk_tools(tasks, enabled):
     controls = []
     for action, keys, title, explanation in (
         ("resume", paused, "批量继续等待", "重置这些暂停任务的自动尝试次数和等待时限，继续只尝试秒传。请先确认暂停原因已处理。"),
-        ("upload", uploadable, "批量强制上传", "这些等待或暂停任务将先试秒传，未命中就上传正文，占用上行带宽；依次进入现有上传队列。"),
+        ("upload", uploadable, "批量强制上传", "这些任务将先试秒传，未命中则上传正文。上次请求结果未知时，目标当前不存在也可能延迟出现，请先核对目标，避免重复。"),
     ):
+        keys = keys[:200]
         button = node("VBtn", f"确认{title} {len(keys)} 项", variant="tonal", color="primary", size="small",
                       style=tone_style("primary"))
         button["events"] = {"click": {"api": f"plugin/P115InstantWait/batch/{action}",
                                        "method": "POST", "params": {"keys": keys}}}
         if keys and enabled:
             controls.append(confirmation(f"{title} · {len(keys)} 项…", explanation, button))
-    children = [paragraph("作用于本页最近 50 条记录中的适用任务，不随状态筛选变化。提交时会检查最新状态；不适用项跳过，新入队任务不包含在内。",
+    children = [paragraph("作用于本页显示的适用任务（每次最多 200 项），不随状态筛选变化。提交时会检查最新状态；不适用项跳过，新入队任务不包含在内。",
                           **{"class": "p115-hint"})]
     if controls:
         children.append(box(controls, "p115-bulk-actions"))
@@ -583,7 +584,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
         metric("需要处理", count("paused", "failed"), f"暂停 {count('paused')} · 失败 {count('failed')}", "error", "mdi-alert-circle-outline", True),
         metric("整理完成", completed_count, f"秒传 {instant} · 上传 {upload}" + (f" · 未记录 {completed_count-instant-upload}" if completed_count > instant+upload else ""), "success", "mdi-check-circle-outline"),
     ], "p115-metrics", **{"aria-label": "全部保留记录状态概览"}))
-    content.append(paragraph(f"全库共 {summary['total']} 条记录 · 下方仅预览最近 50 条，筛选与批量操作仅作用于预览记录。",
+    content.append(paragraph(f"全库共 {summary['total']} 条记录 · 下方显示最近 50 条及全部待处理任务；筛选与批量操作作用于当前显示的记录。",
                              **{"class": "p115-hint mb-3"}))
     filters = []
     for value, title, count in [("all", "全部", len(tasks)), ("waiting", "等待", len(waiting)),
@@ -597,7 +598,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
             node("span", title), node("span", str(count), **{"class": "p115-count"})],
             **{"class": "p115-filter"}))
     content.append(box([box(filters, "p115-filters", role="radiogroup", **{"aria-label": "筛选任务状态"}),
-                        node("span", f"最近 {len(tasks)} 条", **{"class": "p115-hint"})], "p115-toolbar"))
+                        node("span", f"显示 {len(tasks)} 条", **{"class": "p115-hint"})], "p115-toolbar"))
     if batch_result:
         content.append(batch_feedback(batch_result))
     if tasks:
@@ -610,7 +611,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
         for group, title in empty_copy.items():
             if not groups[group]:
                 content.append(box([icon("mdi-check-circle-outline", size=28), node("h3", title),
-                    paragraph("最近 50 条中没有匹配项；切换状态查看其他预览记录，更早的记录仍保存在完整历史中。", **{"class": "p115-muted"})],
+                    paragraph("当前显示的记录中没有匹配项；切换状态查看其他任务。", **{"class": "p115-muted"})],
                     "p115-empty p115-filter-empty", **{"data-filter": group}))
     else:
         content.append(box([icon("mdi-cloud-clock-outline", size=32, color="primary"),

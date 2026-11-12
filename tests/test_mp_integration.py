@@ -413,7 +413,7 @@ class MoviePilotTests(unittest.TestCase):
         self.engine.control(row["id"], "upload")
         with patch.object(self.api, "upload", side_effect=remote.RetryLater("网络连接中断")):
             self.engine.execute(self.engine.store.claim(manual=True))
-        self.assertIn("手动处理未完成", plugin.chain.post_message.call_args.args[0].text)
+        self.assertIn("手动强制上传未完成", plugin.chain.post_message.call_args.args[0].text)
         self.assertEqual(plugin.chain.post_message.call_count, 3)
         self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
 
@@ -450,7 +450,7 @@ class MoviePilotTests(unittest.TestCase):
             waiting = self.engine.store.get(row["id"])
             lines = [str(call.args[0]) for call in info.call_args_list]
             self.assertTrue(any("任务入队" in line and f"整理记录={row['history_id']}" in line for line in lines))
-            start = next(line for line in lines if "开始自动尝试" in line)
+            start = next(line for line in lines if "开始自动秒传尝试" in line)
             deferred = next(line for line in lines if "等待下次重试" in line)
             for line in (start, deferred):
                 self.assertIn(row["id"], line)
@@ -477,7 +477,7 @@ class MoviePilotTests(unittest.TestCase):
             self.engine.execute(self.engine.store.claim(manual=True))
             lines = [str(call.args[0]) for call in info.call_args_list if "【115秒传等待】" in str(call.args[0])]
         self.assertFalse(any("do-not-log-this" in line or "\n" in line or "\r" in line for line in lines))
-        for event in ("用户操作", "开始手动处理", "秒传未命中，转普通上传", "普通上传已提交", "整理成功"):
+        for event in ("用户操作", "开始手动强制上传", "秒传未命中，转普通上传", "普通上传已提交", "整理成功"):
             self.assertTrue(any(event in line and row["id"] in line for line in lines), event)
 
     def test_retry_limit_pauses_then_manual_miss_uploads_and_updates_original_history(self):
@@ -521,6 +521,43 @@ class MoviePilotTests(unittest.TestCase):
         self.assertTrue(self.h.Oper().get(row["history_id"]).status)
         self.assertEqual(self.h.db.query(self.h.History).count(), 1)
         self.assertFalse(Path(task.fileitem.path).exists())
+
+    def test_risk_cooldown_preserves_both_retry_budget_and_upload_queue(self):
+        self.engine.config.update(max_retries=0, limit_action="upload")
+        self.enroll()
+        row = self.engine.store.all()[0]
+        until = time.time() + 3600
+        with patch.object(self.api, "instant", side_effect=remote.RateLimited("115风控", until)):
+            self.attempt(row["id"])
+        saved = self.engine.store.get(row["id"])
+        self.assertEqual(saved["state"], "waiting")
+        self.assertEqual(saved["attempts"], 0)
+        self.assertEqual(saved["payload"]["auto_attempts"], 0)
+        self.assertNotIn("write_intent", saved["payload"])
+        self.assertEqual(saved["next_at"], until)
+        self.engine.control(row["id"], "upload")
+        with patch.object(self.api, "raw_path", side_effect=remote.RateLimited("115风控", until)):
+            self.engine.execute(self.engine.store.claim(manual=True))
+        saved = self.engine.store.get(row["id"])
+        self.assertEqual(saved["state"], "upload_queued")
+        self.assertEqual(saved["attempts"], 0)
+        self.assertEqual(saved["next_at"], until)
+
+    def test_uncertain_init_reaches_limit_and_automatically_uploads(self):
+        self.engine.config.update(max_retries=1, limit_action="upload")
+        self.enroll()
+        row = self.engine.store.all()[0]
+        original = self.api.instant
+        with patch.object(self.api, "instant", side_effect=remote.RetryLater("网络超时")) as init:
+            self.attempt(row["id"])
+            self.assertEqual(self.engine.store.get(row["id"])["state"], "waiting")
+            self.attempt(row["id"])
+            self.assertEqual(self.engine.store.get(row["id"])["state"], "upload_queued")
+            self.assertEqual(init.call_count, 1)
+        self.api.instant = original
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.api.uploads, 1)
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
 
     def test_time_limit_schedules_deadline_and_does_not_count_unattempted_retry(self):
         self.engine.config.update(max_wait_hours=1, limit_action="upload")

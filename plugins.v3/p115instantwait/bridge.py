@@ -18,7 +18,7 @@ from app.schemas.file import FileItem
 from app.schemas.transfer import TransferInfo
 from app.sdk.logging import logger
 
-from .remote import (NotInstant, OpenAPI, PauseTask, DirectStorage, RetryLater, fingerprint,
+from .remote import (NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited, RetryLater, fingerprint,
                      hash_file, prepare_direct, NativePlanStorage, DeferredSource,
                      PlanningStepRunner, apply_native_deletions)
 from .store import QueueStore
@@ -421,6 +421,18 @@ class InstantWaitEngine:
             data.update(remote_id=str(item.fileid), prepared=True)
             self.store.update(key, state="finalizing", payload=data, next_at=0, message="远端文件已确认，等待 V3 完成原整理记录")
             self.request_finalize(self.store.get(key))
+        except RateLimited as error:
+            # A throttled operation did not spend a seconds-transfer attempt.
+            current = self.store.get(key)
+            data = current["payload"]
+            current_attempts = max(0, current["attempts"] - 1)
+            if not force:
+                data["auto_attempts"] = max(0, data.get("auto_attempts", 1) - 1)
+            state = "upload_queued" if force else "waiting"
+            message = str(error) + "；冷却结束后自动继续"
+            self.store.update(key, state=state, attempts=current_attempts, payload=data,
+                              next_at=error.until, message=message)
+            self.log_task(self.store.get(key), "115风控冷却", level="warning", 原因=message)
         except PauseTask as error:
             self.defer(row, "paused", str(error))
         except (NotInstant, RetryLater) as error:

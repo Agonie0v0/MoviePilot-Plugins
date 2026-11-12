@@ -20,7 +20,7 @@ from app.modules.filemanager.storages.u115 import U115Pan
 from app.schemas import FileItem, TransferInfo, TransferTask
 from app.schemas.types import MediaType, SystemConfigKey
 
-from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage,
+from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited,
                      RetryLater, fingerprint, hash_file, prepare_direct, NativePlanStorage,
                      apply_native_deletions)
 from .store import QueueStore
@@ -432,7 +432,7 @@ class InstantWaitEngine:
             self.live_tasks[key] = task
             self.ensure_history(key, task)
             origin = "达到上限自动触发" if payload.get("upload_origin") == "limit" else "用户手动"
-            self.log_task(self.store.get(key), ("开始自动强制上传" if origin == "达到上限自动触发" else "开始手动处理") if manual else "开始自动尝试")
+            self.log_task(self.store.get(key), ("开始自动强制上传" if origin == "达到上限自动触发" else "开始手动强制上传") if manual else "开始自动秒传尝试")
             if payload.get("result"):
                 self.log_task(row, "恢复整理结果", 说明="核对远端后继续原记录回写")
                 info = TransferInfo.model_validate(payload["result"])
@@ -502,6 +502,18 @@ class InstantWaitEngine:
             payload["result"] = info.model_dump(mode="json")
             self.store.update(key, payload=payload)
             self.complete(self.store.get(key), task, info, api)
+        except RateLimited as error:
+            # A throttled operation did not spend a seconds-transfer attempt.
+            current = self.store.get(key)
+            data = current["payload"]
+            current_attempts = max(0, current["attempts"] - 1)
+            if not manual:
+                data["auto_attempts"] = max(0, data.get("auto_attempts", 1) - 1)
+            state = "upload_queued" if manual else "waiting"
+            message = str(error) + "；冷却结束后自动继续"
+            self.store.update(key, state=state, attempts=current_attempts, payload=data,
+                              next_at=error.until, message=message)
+            self.log_task(self.store.get(key), "115风控冷却", level="warning", 原因=message)
         except PauseTask as exc:
             self.defer(row, "paused", str(exc))
         except NotInstant as exc:
@@ -523,7 +535,7 @@ class InstantWaitEngine:
         deadline = payload.get("wait_since", row["created"]) + limit if limit else None
         if row["state"] == "uploading":
             state = "paused"
-            source = "自动强制上传" if payload.get("upload_origin") == "limit" else "手动处理"
+            source = "自动强制上传" if payload.get("upload_origin") == "limit" else "手动强制上传"
             reason = f"{source}未完成：{reason}；可再次点强制上传核对并继续"
         elif state == "waiting":
             reached = ("等待超过设定期限" if deadline and now >= deadline else
@@ -659,7 +671,7 @@ class InstantWaitEngine:
         if existing and existing["payload"].get("layout") != "direct" and action != "cancel":
             raise ValueError("旧版暂存任务仅可取消，请重新整理")
         row = self.store.command(key, action)
-        self.log_task(row, "用户操作", 操作={"upload": "强制上传", "resume": "继续等待秒传",
+        self.log_task(row, "用户操作", 操作={"upload": "强制上传（先试秒传，未命中上传正文）", "resume": "继续等待秒传（不会普通上传）",
                                            "pause": "暂停", "cancel": "取消"}[action], 结果=row["message"])
         self.history_message(key, "等待秒传，将自动重试" if action == "resume" else row["message"])
         if action == "cancel":

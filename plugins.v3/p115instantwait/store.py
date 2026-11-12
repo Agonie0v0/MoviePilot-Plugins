@@ -87,7 +87,7 @@ class QueueStore:
                 f"SELECT * FROM jobs {where} ORDER BY created DESC LIMIT ?", (limit,))]
 
     def dashboard(self):
-        """All retained records counted, only 50 payloads read, one snapshot."""
+        """Count all records; include every task needing attention plus recent records."""
         with self.connect() as db:
             db.execute("BEGIN")
             states, methods, next_at = {}, {}, None
@@ -99,7 +99,8 @@ class QueueStore:
                     methods[row["transfer_method"]] = row["count"]
                 if state in ("queued", "waiting"):
                     next_at = row["next_at"] if next_at is None else min(next_at, row["next_at"])
-            tasks = [self.decode(row) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 50")]
+            tasks = [self.decode(row) for row in db.execute("SELECT * FROM jobs WHERE state IN ('paused','failed') OR id IN "
+                "(SELECT id FROM jobs ORDER BY created DESC LIMIT 50) ORDER BY created DESC")]
             return tasks, dict(states=states, methods=methods, next_at=next_at, total=sum(states.values()))
 
     def search(self, *, scope="history", query="", state="", page=1):

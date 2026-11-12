@@ -40,9 +40,9 @@ class DashboardHistoryTests(unittest.TestCase):
             self.job(f"instant-{i}", instant_confirmed=True)
         with patch.object(self.db, "decode", wraps=self.db.decode) as decode:
             rows, summary = self.db.dashboard()
-            self.assertEqual(decode.call_count, 50)
-        self.assertEqual(len(rows), 50)
-        self.assertEqual({r["source"] for r in rows}, {f"instant-{i}" for i in range(201, 251)})
+            self.assertEqual(decode.call_count, 52)
+        self.assertEqual(len(rows), 52)
+        self.assertEqual({r["source"] for r in rows}, {f"instant-{i}" for i in range(201, 251)} | {"old-paused", "old-failed"})
         self.assertEqual(summary["total"], 261)
         self.assertEqual(summary["states"]["completed"], 254)
         self.assertEqual(summary["methods"], dict(instant=251, upload=2, unknown=1))
@@ -51,8 +51,8 @@ class DashboardHistoryTests(unittest.TestCase):
         nodes = list(walk(page))
         metrics = [n for n in nodes if "p115-metric-value" in n.get("props", {}).get("class", "")]
         self.assertEqual([n["text"] for n in metrics], ["1", "3", "2", "254"])
-        self.assertEqual(len([n for n in nodes if n.get("props", {}).get("class") == "p115-task"]), 50)
-        self.assertFalse(any("/batch/" in n.get("events", {}).get("click", {}).get("api", "") for n in nodes))
+        self.assertEqual(len([n for n in nodes if n.get("props", {}).get("class") == "p115-task"]), 52)
+        self.assertTrue(any("/batch/" in n.get("events", {}).get("click", {}).get("api", "") for n in nodes))
         self.assertEqual(store.QueueStore(self.path).dashboard()[1], summary)
         # The production page and refresh endpoint must use the bounded paths.
         tree = ast.parse((PLUGIN / "__init__.py").read_text(encoding="utf-8"))
@@ -67,7 +67,7 @@ class DashboardHistoryTests(unittest.TestCase):
         self.assertEqual(len(plugin.list_tasks()), 50)
         self.assertEqual(plugin.get_page(), "page")
         args, kwargs = namespace["task_page"].call_args
-        self.assertEqual(len(args[0]), 50)
+        self.assertEqual(len(args[0]), 52)
         self.assertEqual(kwargs["summary"]["total"], 261)
 
     def test_updates_cleanup_and_empty_database_have_no_stale_counts(self):

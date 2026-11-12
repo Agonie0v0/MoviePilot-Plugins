@@ -1,3 +1,4 @@
+import time
 import hashlib
 import copy
 import json
@@ -126,7 +127,8 @@ class APITests(unittest.TestCase):
         self.path = Path(self.temp.name) / "A.mkv"
         self.path.write_bytes(b"test movie content")
         self.hashes = remote.hash_file(self.path, NoSleep())
-        self.backend = SimpleNamespace(access_token="secret-token", base_url="https://proapi.115.com")
+        self.backend = SimpleNamespace(access_token="secret-token", base_url="https://proapi.115.com",
+                                       _limit_lock=threading.Lock(), _limit_until=0, limit_sleep_seconds=3600)
         self.calls = []
         self.clients = []
 
@@ -204,13 +206,33 @@ class APITests(unittest.TestCase):
             api.raw_id("12")
         self.assertNotIn("secret-token", str(exc.exception))
 
-    def test_rate_limit_does_not_modify_native_cooldown(self):
-        self.backend._limit_until = 0
-        api = self.api([(429, {})])
-        with self.assertRaises(remote.RetryLater):
+    def test_rate_limits_share_native_cooldown_and_prevent_further_requests(self):
+        for status, body in ((429, {}), (200, {"state": False, "code": 123,
+                                               "message": "已达到当前访问上限"})):
+            self.backend._limit_until = 0
+            api = self.api([(status, body)])
+            before = len(self.calls)
+            with self.assertRaises(remote.RateLimited) as error:
+                api.raw_id("12")
+            self.assertIn("风控", str(error.exception))
+            self.assertGreater(self.backend._limit_until, time.time())
+            with self.assertRaises(remote.RateLimited):
+                api.raw_id("12")
+            self.assertEqual(len(self.calls), before + 1)
+
+    def test_existing_native_cooldown_stops_plugin_request(self):
+        self.backend._limit_until = time.time() + 100
+        api = self.api([])
+        with self.assertRaises(remote.RateLimited):
             api.raw_id("12")
-        self.assertEqual(self.backend._limit_until, 0)
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 0)
+
+    def test_unknown_business_message_cannot_leak_secrets(self):
+        api = self.api([(200, {"state": False, "code": 42, "message": "secret-token"})])
+        with self.assertRaises(remote.RetryLater) as error:
+            api.raw_id("12")
+        self.assertIn("42", str(error.exception))
+        self.assertNotIn("secret-token", str(error.exception))
 
     def test_network_exception_is_sanitized(self):
         api = self.api([httpx.ConnectError("request secret-token")])

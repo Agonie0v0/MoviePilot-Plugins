@@ -9,6 +9,12 @@ class RetryLater(Exception):
     pass
 
 
+class RateLimited(RetryLater):
+    def __init__(self, message, until):
+        super().__init__(message)
+        self.until = until
+
+
 class PauseTask(Exception):
     pass
 
@@ -68,10 +74,26 @@ class OpenAPI:
         self.client.close()
 
     def request(self, method, endpoint, *, data=None, params=None, missing=False):
-        # An independent session avoids changing MP's global storage cooldown state.
+        import httpx
+
+        def cooldown(reason, start=False):
+            lock = getattr(self.backend, "_limit_lock", None)
+            if lock is None:
+                raise PauseTask("115 风控保护不可用：宿主未提供共享冷却锁，请检查 MoviePilot 版本")
+            with lock:
+                until = getattr(self.backend, "_limit_until", 0)
+                if start:
+                    until = max(until, time.time() + getattr(self.backend, "limit_sleep_seconds", 3600))
+                    self.backend._limit_until = until
+            if until > time.time():
+                raise RateLimited(f"115 风控：{reason}；接口 {endpoint}，冷却至 " +
+                                  time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)), until)
+
+        cooldown("MoviePilot 共享冷却中")
         delay = max(0, 1.0 - (time.monotonic() - self._last_request))
         if self.stop.wait(delay):
             raise RetryLater("插件正在停止")
+        cooldown("MoviePilot 共享冷却中")
         token = self.backend.access_token
         if not token:
             raise PauseTask("内置 115 授权失效，请重新授权后恢复任务")
@@ -81,26 +103,35 @@ class OpenAPI:
                 data=data, params=params, headers={"Authorization": f"Bearer {token}",
                     "User-Agent": "MoviePilot-P115InstantWait/0.1",
                     "Content-Type": "application/x-www-form-urlencoded"})
-            if resp.status_code in (401, 403):
-                raise PauseTask("115 授权或访问权限异常，请检查授权后恢复")
-            if resp.status_code == 429:
-                raise RetryLater("115 请求限流，稍后重试")
-            if resp.status_code >= 500:
-                raise RetryLater("115 服务暂时异常")
-            resp.raise_for_status()
+        except httpx.TimeoutException:
+            raise RetryLater(f"115 请求超时（{endpoint}）") from None
+        except httpx.RequestError:
+            raise RetryLater(f"115 网络连接失败（{endpoint}）") from None
+        if resp.status_code in (401, 403):
+            raise PauseTask(f"115 授权或访问权限异常（HTTP {resp.status_code}，{endpoint}），请检查授权")
+        if resp.status_code == 429:
+            cooldown("请求限流（HTTP 429）", start=True)
+        if resp.status_code >= 500:
+            raise RetryLater(f"115 服务异常（HTTP {resp.status_code}，{endpoint}）")
+        if resp.status_code >= 400:
+            raise RetryLater(f"115 请求失败（HTTP {resp.status_code}，{endpoint}）")
+        try:
             result = resp.json()
-        except (RetryLater, PauseTask):
-            raise
-        except Exception:
-            # Never copy response headers, tokens, or request bodies into logs/history.
-            raise RetryLater("115 网络请求或响应解析失败") from None
+        except ValueError:
+            raise RetryLater(f"115 响应不是有效 JSON（{endpoint}）") from None
         if not isinstance(result, dict):
-            raise RetryLater("115 接口响应格式异常")
+            raise RetryLater(f"115 接口响应格式异常（{endpoint}）")
         code = result.get("code", 0 if result.get("state") else -1)
         if missing and code in (20004, 430004):
             return None
         if code != 0 or result.get("state") is False:
-            raise RetryLater(f"115 接口返回业务错误（代码 {code}）")
+            message = result.get("message")
+            if isinstance(message, str) and "已达到当前访问上限" in message:
+                cooldown(f"已达到当前访问上限（代码 {code}）", start=True)
+            # The remote message can contain credentials or signed URLs. Only
+            # expose the known risk-control message above, plus the error code.
+            code = code if isinstance(code, int) else "未知"
+            raise RetryLater(f"115 接口返回业务错误（{endpoint}，代码 {code}）")
         return result.get("data")
 
     @staticmethod
@@ -373,7 +404,14 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
     if data.get("instant_confirmed") or data.get("upload_confirmed"):
         raise RetryLater("已提交上传结果，等待正式文件可见；不会重复上传")
     if data.get("write_intent") and not data.get("upload_session"):
-        raise PauseTask("上传初始化结果未确认，已停止重复上传；请核对正式目标后重新整理")
+        if not force:
+            raise RetryLater("上次115初始化请求的结果未知，目标文件暂不可见；本轮不重复发送，等待重试或达到上限后的处理")
+        # The user explicitly accepted another attempt after an uncertain response.
+        # A delayed remote result can still appear after this check.
+        if progress:
+            progress("上次初始化结果未知；目标当前不存在，按强制上传策略重新尝试")
+        data.pop("write_intent", None)
+        checkpoint()
     folder = api.get_folder(final.parent)
     if data.get("target_folder_id") and str(data["target_folder_id"]) != str(folder.fileid):
         raise PauseTask("正式目标目录身份已变化，请人工核对上传进度")
@@ -408,6 +446,13 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
             api.upload(path, folder, data["hashes"], error.upload_data, data, checkpoint)
             if progress:
                 progress("普通上传已提交")
+        except RateLimited:
+            # A 429 / access-limit response definitively rejected the request.
+            data.pop("write_intent", None)
+            checkpoint()
+            raise
+        except RetryLater as error:
+            raise RetryLater(f"115 秒传初始化未确认（{error}）；目标可能延迟出现，本次不会重复提交") from error
         else:
             data["instant_confirmed"] = True
             if file_id:
