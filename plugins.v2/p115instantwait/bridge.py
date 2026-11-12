@@ -142,7 +142,7 @@ class InstantWaitEngine:
     def patch(self, cls, name, method):
         original = getattr(cls, name)
         if getattr(original, "__instant_wait_owner__", None):
-            raise RuntimeError("115 秒传等待补丁已存在")
+            raise RuntimeError("115 秒传等待已有实例接管整理接口；请等待正在执行的任务结束后重启 MoviePilot，再检查是否重复安装或启用了插件")
         if original.__module__ not in ("app.chain", "app.chain.transfer", "app.db.transferhistory_oper"):
             raise RuntimeError(f"{name} 已被其他插件接管，请先停用冲突插件")
         own = name in cls.__dict__

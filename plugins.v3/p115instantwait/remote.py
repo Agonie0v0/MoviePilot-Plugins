@@ -404,14 +404,9 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
     if data.get("instant_confirmed") or data.get("upload_confirmed"):
         raise RetryLater("已提交上传结果，等待正式文件可见；不会重复上传")
     if data.get("write_intent") and not data.get("upload_session"):
-        if not force:
-            raise RetryLater("上次115初始化请求的结果未知，目标文件暂不可见；本轮不重复发送，等待重试或达到上限后的处理")
-        # The user explicitly accepted another attempt after an uncertain response.
         # A delayed remote result can still appear after this check.
         if progress:
-            progress("上次初始化结果未知；目标当前不存在，按强制上传策略重新尝试")
-        data.pop("write_intent", None)
-        checkpoint()
+            progress("上次初始化结果未知；目标当前不存在，本轮重新尝试秒传")
     folder = api.get_folder(final.parent)
     if data.get("target_folder_id") and str(data["target_folder_id"]) != str(folder.fileid):
         raise PauseTask("正式目标目录身份已变化，请人工核对上传进度")

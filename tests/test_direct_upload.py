@@ -79,13 +79,14 @@ class DirectV2Tests(unittest.TestCase):
         self.prepare()
         self.assertEqual(self.api.instant.call_count, 1)
 
-    def test_uncertain_init_with_missing_target_never_repeats(self):
+    def test_uncertain_init_with_missing_target_retries_instant(self):
         self.api.instant.side_effect = self.remote.RetryLater("lost response")
         with self.assertRaises(self.remote.RetryLater):
             self.prepare()
-        with self.assertRaises(self.remote.RetryLater):
-            self.prepare()
-        self.assertEqual(self.api.instant.call_count, 1)
+        self.api.instant.side_effect = self.hit
+        self.prepare()
+        self.assertEqual(self.api.instant.call_count, 2)
+        self.api.upload.assert_not_called()
 
     def test_force_retries_uncertain_init_after_target_check(self):
         self.data.update(write_intent=True, upload_origin="limit")
@@ -98,6 +99,13 @@ class DirectV2Tests(unittest.TestCase):
         self.prepare(True)
         self.api.instant.assert_called_once()
         self.api.upload.assert_called_once()
+
+    def test_uncertain_target_appearing_before_retry_stops_submission(self):
+        self.data["write_intent"] = True
+        self.api.raw_path.side_effect = [None, {"file_id": "123"}]
+        with self.assertRaises(self.remote.PauseTask):
+            self.prepare(True)
+        self.api.instant.assert_not_called()
 
     def test_unowned_recovery_requires_hash_or_exact_saved_upload_identity(self):
         self.data["write_intent"] = True

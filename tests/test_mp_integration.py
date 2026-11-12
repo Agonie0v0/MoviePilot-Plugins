@@ -553,7 +553,7 @@ class MoviePilotTests(unittest.TestCase):
             self.assertEqual(self.engine.store.get(row["id"])["state"], "waiting")
             self.attempt(row["id"])
             self.assertEqual(self.engine.store.get(row["id"])["state"], "upload_queued")
-            self.assertEqual(init.call_count, 1)
+            self.assertEqual(init.call_count, 2)
         self.api.instant = original
         self.engine.execute(self.engine.store.claim(manual=True))
         self.assertEqual(self.api.uploads, 1)
