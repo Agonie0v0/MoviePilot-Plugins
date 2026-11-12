@@ -388,7 +388,7 @@ def test_uninstall_restores_inherited_native_gate(h, task):
     assert h.finish_calls == [task.admission_task_id]
 
 
-def test_api_response_models_preserve_bare_json(h, task):
+def test_api_response_models_preserve_reads_and_wrap_page_actions(h, task):
     row = h.enter(task)
     plugin = h.plugin.P115InstantWait()
     plugin._engine = h.engine
@@ -405,7 +405,54 @@ def test_api_response_models_preserve_bare_json(h, task):
     h.engine.store.update(row["id"], state="completed", payload=data)
     assert "触发秒传成功" in client.get("/tasks").json()[0]["result_message"]
     h.engine.store.update(row["id"], state="waiting")
-    assert client.post(f"/tasks/{row['id']}/upload").json() == {"success": True, "state": "upload_queued"}
+    assert client.post(f"/tasks/{row['id']}/upload").json() == {
+        "success": True, "message": "", "data": {"state": "upload_queued"}}
+
+
+def test_page_actions_satisfy_native_client_and_reload_current_state(h, task):
+    row = h.enter(task)
+    plugin = h.plugin.P115InstantWait()
+    plugin._engine = h.engine
+    app = FastAPI()
+    for route in plugin.get_api():
+        app.add_api_route(route["path"], route["endpoint"], methods=route["methods"], response_model=route["response_model"])
+    client = TestClient(app)
+
+    def walk(nodes):
+        for node in nodes:
+            yield node
+            yield from walk(node.get("content", []))
+
+    def click(action):
+        event = next(n["events"]["click"] for n in walk(plugin.get_page())
+                     if n.get("events", {}).get("click", {}).get("api", "").endswith(action))
+        path = event["api"].removeprefix("plugin/P115InstantWait")
+        res = client.request(event["method"], path, json=event.get("params", {}))
+        assert res.status_code == 200
+        result = res.json()
+        # PageRender uses the host data client, whose isApiResponse() requires
+        # exactly these three fields before it emits the page reload event.
+        assert set(result) == {"success", "message", "data"}
+        assert result["success"] is True and isinstance(result["message"], str)
+        return result["data"]
+
+    h.engine.store.update(row["id"], state="paused")
+    assert click("/resume")["state"] == "waiting"
+    assert client.get("/tasks").json()[0]["state"] == "waiting"
+    assert not any(n.get("text") == "继续等待" for n in walk(plugin.get_page()))
+    assert click("/pause")["state"] == "paused"
+    # Batch responses need the same envelope, including partial acceptance.
+    h.engine.control_many = Mock(return_value=dict(action="resume", at="now", accepted=1,
+        skipped=1, failed=0, items=[]))
+    result = click("/batch/resume")
+    assert result["accepted"] == result["skipped"] == 1
+    assert plugin.get_data("last_batch_result") == {k: v for k, v in result.items() if k != "notice"}
+    assert click("/upload")["state"] == "upload_queued"
+    assert click("/cancel")["state"] == "cancelled"
+    refresh = next(n for n in walk(plugin.get_page()) if n.get("text") == "刷新")
+    assert refresh["events"]["click"] == {"api": "plugin/page/P115InstantWait", "method": "GET"}
+    h.engine.store.update(row["id"], state="running")
+    assert client.post(f"/tasks/{row['id']}/pause").status_code == 409
 
 
 def test_full_history_search_preview_and_finalizing_are_consistent(h, task):
@@ -430,7 +477,7 @@ def test_full_history_search_preview_and_finalizing_are_consistent(h, task):
     finalizing = client.get("/records", params={"scope": "tasks", "state": "finalizing"}).json()
     assert finalizing["total"] == 1 and finalizing["items"][0]["props"]["disabled"]
     assert client.post(f"/tasks/{row['id']}/cancel").status_code == 409
-    assert client.post("/batch/upload", json={"keys": [row["id"]]}).json()["skipped"] == 1
+    assert client.post("/batch/upload", json={"keys": [row["id"]]}).json()["data"]["skipped"] == 1
     assert h.engine.store.clear_history(keys=[row["id"]])["skipped"] == 1
     rows, summary = h.engine.store.dashboard()
     assert len(rows) == 50 and summary["total"] == 252

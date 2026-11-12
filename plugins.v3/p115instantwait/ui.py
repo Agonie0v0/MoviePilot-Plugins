@@ -547,8 +547,9 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
     now = time.time()
     refresh = node("VBtn", "刷新", variant="outlined", size="small",
                    **{"prepend-icon": "mdi-refresh", "style": "min-height:40px", "aria-label": "刷新任务状态"})
-    # PageRender uses MP's authenticated API and reloads after each action.
-    refresh["events"] = {"click": {"api": "plugin/P115InstantWait/tasks", "method": "GET"}}
+    # Native page API returns the standard envelope required by PageRender;
+    # /tasks intentionally stays a bare list for existing plugin API clients.
+    refresh["events"] = {"click": {"api": "plugin/page/P115InstantWait", "method": "GET"}}
     content = [node("style", STYLES), box([
         box([icon("mdi-cloud-clock-outline", size=26)], "p115-brand-icon"),
         box([paragraph("115 秒传等待 / 任务监控", **{"class": "p115-eyebrow"}),
