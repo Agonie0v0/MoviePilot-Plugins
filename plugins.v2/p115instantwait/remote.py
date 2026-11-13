@@ -11,6 +11,7 @@ _LAST_REQUEST_AT = 0.0
 _MIN_REQUEST_INTERVAL = 30.0
 _COOLDOWN_GRACE = 60.0
 _COOLDOWN_UNTIL = 0.0
+_PATH_CACHE = {}
 
 
 def cooldown_until():
@@ -80,6 +81,7 @@ class OpenAPI:
         import httpx
         self.backend, self.item_factory, self.stop = backend, item_factory, stop
         self.client = client or httpx.Client(timeout=30, follow_redirects=False)
+        self._path_cache, self._id_cache = {}, {}
         self._last_request = 0
 
     def close(self):
@@ -95,6 +97,11 @@ class OpenAPI:
     def _request_locked(self, method, endpoint, *, data=None, params=None, missing=False):
         import httpx
         global _LAST_REQUEST_AT
+
+        if method.upper() == "POST" and endpoint != "/open/folder/get_info":
+            _PATH_CACHE.clear()
+            self._path_cache.clear()
+            self._id_cache.clear()
 
         def cooldown(reason, start=False):
             global _COOLDOWN_UNTIL
@@ -118,6 +125,12 @@ class OpenAPI:
             _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, until)
 
         cooldown("MoviePilot 共享冷却中")
+        limiter = getattr(self.backend, "_api_limiter", None)
+        if limiter is not None:
+            limiter.acquire()
+        stats = getattr(self.backend, "_rate_stats", None)
+        if stats is not None:
+            stats.record()
         delay = max(0, _MIN_REQUEST_INTERVAL - (time.monotonic() - _LAST_REQUEST_AT))
         if self.stop.wait(delay):
             raise RetryLater("插件正在停止")
@@ -176,14 +189,27 @@ class OpenAPI:
         return data
 
     def raw_path(self, path):
-        return self.one_info(self.request("POST", "/open/folder/get_info",
-            data={"path": str(path).replace("\\", "/")}, missing=True))
+        key = str(path).replace("\\", "/")
+        cache_key = (id(self.backend), key)
+        cached = _PATH_CACHE.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        value = self.one_info(self.request("POST", "/open/folder/get_info",
+            data={"path": key}, missing=True))
+        if value and str(value.get("file_category")) == "0":
+            _PATH_CACHE[cache_key] = (time.monotonic() + 300.0, value)
+        self._path_cache[key] = value
+        return value
 
     def raw_id(self, file_id):
+        key = str(file_id)
+        if key in self._id_cache:
+            return self._id_cache[key]
         info = self.one_info(self.request("GET", "/open/folder/get_info",
             params={"file_id": int(file_id)}, missing=True))
         if info and str(info.get("file_id")) != str(file_id):
             raise PauseTask("115 返回的文件 ID 不一致")
+        self._id_cache[key] = info
         return info
 
     def item(self, info, path):
