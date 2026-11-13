@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from tests.support import PLUGIN, load
 from tests.test_ui_actions import walk
+from tests.test_records import modules
 
 store, records, ui = load("store"), load("records"), load("ui")
 
@@ -40,9 +41,10 @@ class DashboardHistoryTests(unittest.TestCase):
             self.job(f"instant-{i}", instant_confirmed=True)
         with patch.object(self.db, "decode", wraps=self.db.decode) as decode:
             rows, summary = self.db.dashboard()
-            self.assertEqual(decode.call_count, 52)
-        self.assertEqual(len(rows), 52)
-        self.assertEqual({r["source"] for r in rows}, {f"instant-{i}" for i in range(201, 251)} | {"old-paused", "old-failed"})
+            self.assertEqual(decode.call_count, 57)
+        self.assertEqual(len(rows), 57)
+        self.assertEqual({r["source"] for r in rows}, {f"instant-{i}" for i in range(201, 251)} |
+                         {"old-wait", "old-paused", "old-failed", "old-running", "old-uploading", "old-upload-queued", "old-cancelled"})
         self.assertEqual(summary["total"], 261)
         self.assertEqual(summary["states"]["completed"], 254)
         self.assertEqual(summary["methods"], dict(instant=251, upload=2, unknown=1))
@@ -51,10 +53,9 @@ class DashboardHistoryTests(unittest.TestCase):
         nodes = list(walk(page))
         metrics = [n for n in nodes if "p115-metric-value" in n.get("props", {}).get("class", "")]
         self.assertEqual([n["text"] for n in metrics], ["1", "3", "2", "254"])
-        self.assertEqual(len([n for n in nodes if n.get("props", {}).get("class") == "p115-task"]), 52)
+        self.assertEqual(len([n for n in nodes if n.get("props", {}).get("class") == "p115-task"]), 57)
         self.assertTrue(any("/batch/" in n.get("events", {}).get("click", {}).get("api", "") for n in nodes))
         self.assertEqual(store.QueueStore(self.path).dashboard()[1], summary)
-        # The production page and refresh endpoint must use the bounded paths.
         tree = ast.parse((PLUGIN / "__init__.py").read_text(encoding="utf-8"))
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
         cls.bases = []
@@ -67,8 +68,35 @@ class DashboardHistoryTests(unittest.TestCase):
         self.assertEqual(len(plugin.list_tasks()), 50)
         self.assertEqual(plugin.get_page(), "page")
         args, kwargs = namespace["task_page"].call_args
-        self.assertEqual(len(args[0]), 52)
+        self.assertEqual(len(args[0]), 57)
         self.assertEqual(kwargs["summary"]["total"], 261)
+
+    def test_only_completed_tasks_are_limited_in_both_generations(self):
+        for generation in ("v2", "v3"):
+            with self.subTest(generation=generation):
+                record_module, store_module, ui_module = modules(generation)
+                database = store_module.QueueStore(Path(self.temp.name) / f"{generation}.db")
+                states = list(ui_module.LABELS)
+                payload = json.dumps(dict(task={"fileitem": {"path": "/film.mkv"}}, final_path="/library/film.mkv"))
+                with database.connect() as connection:
+                    connection.executemany(
+                        "INSERT INTO jobs(id,source,state,next_at,created,updated,payload) VALUES(?,?,?,0,?,?,?)",
+                        [(f"{state}-{index:03}", f"/{state}-{index:03}.mkv", state, index, 1000-index, payload)
+                         for state in states for index in range(65)])
+                rows, summary = database.dashboard()
+                expected = {f"{state}-{index:03}" for state in states for index in range(65)
+                            if state != "completed" or index < 50}
+                self.assertEqual({row["id"] for row in rows}, expected)
+                self.assertEqual(len(rows), len(expected))
+                self.assertEqual(summary["total"], len(states) * 65)
+                page = ui_module.task_page([record_module.task_record(row) for row in rows], True, summary=summary)
+                nodes = list(walk(page))
+                self.assertEqual(sum(node.get("props", {}).get("class") == "p115-task" for node in nodes), len(expected))
+                filters = {node["props"]["value"]: node["props"]["aria-label"] for node in nodes
+                           if node["component"] == "input"}
+                self.assertEqual(filters["waiting"], "等待 130 条任务")
+                self.assertEqual(filters["attention"], "待处理 130 条任务")
+                self.assertEqual(filters["transfer"], f"执行/上传 {260 if generation == 'v3' else 195} 条任务")
 
     def test_updates_cleanup_and_empty_database_have_no_stale_counts(self):
         self.assertEqual(self.db.dashboard(), ([], dict(states={}, methods={}, next_at=None, total=0)))

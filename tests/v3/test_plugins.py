@@ -480,7 +480,8 @@ def test_full_history_search_preview_and_finalizing_are_consistent(h, task):
     assert client.post("/batch/upload", json={"keys": [row["id"]]}).json()["data"]["skipped"] == 1
     assert h.engine.store.clear_history(keys=[row["id"]])["skipped"] == 1
     rows, summary = h.engine.store.dashboard()
-    assert len(rows) == 50 and summary["total"] == 252
+    assert len(rows) == 51 and summary["total"] == 252
+    assert row["id"] in {item["id"] for item in rows}
     assert summary["states"]["finalizing"] == 1 and summary["methods"]["instant"] == 251
     form, model = plugin.get_form()
     assert form and model["_records_history_total"] == 251

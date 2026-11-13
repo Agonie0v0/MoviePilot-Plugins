@@ -842,7 +842,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
         metric("需要处理", count("paused", "failed"), f"暂停 {count('paused')} · 失败 {count('failed')}", "error", "mdi-alert-circle-outline", True),
         metric("整理完成", completed_count, f"秒传 {instant} · 上传 {upload}" + (f" · 未记录 {completed_count-instant-upload}" if completed_count > instant+upload else ""), "success", "mdi-check-circle-outline"),
     ], "p115-metrics", **{"aria-label": "全部保留记录状态概览"}))
-    content.append(paragraph(f"全库共 {summary['total']} 条记录 · 下方显示最近 50 条及全部待处理任务；筛选与批量操作作用于当前显示的记录。",
+    content.append(paragraph(f"全库共 {summary['total']} 条记录 · 成功任务仅显示最近完成的 50 条，其他状态全部显示；筛选与批量操作作用于当前显示的记录。",
                              **{"class": "p115-hint mb-3"}))
     filters = []
     for value, title, count in [("all", "全部", len(tasks)), ("waiting", "等待", len(waiting)),
