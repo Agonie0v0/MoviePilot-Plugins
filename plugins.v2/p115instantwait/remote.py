@@ -6,10 +6,6 @@ from pathlib import Path, PurePosixPath
 
 
 _REQUEST_LOCK = threading.Lock()
-_LAST_REQUEST_AT = 0.0
-# Keep the account-wide request rate conservative after a large queue resumes.
-_MIN_REQUEST_INTERVAL = 30.0
-_COOLDOWN_GRACE = 60.0
 _COOLDOWN_UNTIL = 0.0
 _PATH_CACHE = {}
 
@@ -96,8 +92,6 @@ class OpenAPI:
 
     def _request_locked(self, method, endpoint, *, data=None, params=None, missing=False):
         import httpx
-        global _LAST_REQUEST_AT
-
         if method.upper() == "POST" and endpoint != "/open/folder/get_info":
             _PATH_CACHE.clear()
             self._path_cache.clear()
@@ -115,13 +109,9 @@ class OpenAPI:
                     self.backend._limit_until = until
             until = max(until, _COOLDOWN_UNTIL)
             if until > time.time():
-                # Leave a short quiet period after MP's nominal cooldown. A
-                # large queue otherwise resumes at the exact boundary and
-                # immediately trips the same account-wide limit again.
-                blocked_until = until + _COOLDOWN_GRACE if start else until
-                _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, blocked_until)
+                _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, until)
                 raise RateLimited(f"115 风控：{reason}；接口 {endpoint}，冷却至 " +
-                                  time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(blocked_until)), blocked_until)
+                                  time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)), until)
             _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, until)
 
         cooldown("MoviePilot 共享冷却中")
@@ -131,14 +121,10 @@ class OpenAPI:
         stats = getattr(self.backend, "_rate_stats", None)
         if stats is not None:
             stats.record()
-        delay = max(0, _MIN_REQUEST_INTERVAL - (time.monotonic() - _LAST_REQUEST_AT))
-        if self.stop.wait(delay):
-            raise RetryLater("插件正在停止")
         cooldown("MoviePilot 共享冷却中")
         token = self.backend.access_token
         if not token:
             raise PauseTask("内置 115 授权失效，请重新授权后恢复任务")
-        _LAST_REQUEST_AT = time.monotonic()
         try:
             resp = self.client.request(method, self.backend.base_url + endpoint,
                 data=data, params=params, headers={"Authorization": f"Bearer {token}",
