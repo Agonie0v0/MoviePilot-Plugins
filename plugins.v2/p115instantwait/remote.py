@@ -8,7 +8,8 @@ from pathlib import Path, PurePosixPath
 _REQUEST_LOCK = threading.Lock()
 _LAST_REQUEST_AT = 0.0
 # Keep the account-wide request rate conservative after a large queue resumes.
-_MIN_REQUEST_INTERVAL = 2.0
+_MIN_REQUEST_INTERVAL = 30.0
+_COOLDOWN_GRACE = 60.0
 _COOLDOWN_UNTIL = 0.0
 
 
@@ -105,10 +106,16 @@ class OpenAPI:
                 if start:
                     until = max(until, time.time() + getattr(self.backend, "limit_sleep_seconds", 3600))
                     self.backend._limit_until = until
-            _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, until)
+            until = max(until, _COOLDOWN_UNTIL)
             if until > time.time():
+                # Leave a short quiet period after MP's nominal cooldown. A
+                # large queue otherwise resumes at the exact boundary and
+                # immediately trips the same account-wide limit again.
+                blocked_until = until + _COOLDOWN_GRACE if start else until
+                _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, blocked_until)
                 raise RateLimited(f"115 风控：{reason}；接口 {endpoint}，冷却至 " +
-                                  time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)), until)
+                                  time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(blocked_until)), blocked_until)
+            _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, until)
 
         cooldown("MoviePilot 共享冷却中")
         delay = max(0, _MIN_REQUEST_INTERVAL - (time.monotonic() - _LAST_REQUEST_AT))
