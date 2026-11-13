@@ -5,7 +5,7 @@
     "name": "115秒传等待",
     "description": "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录",
     "labels": "云盘,整理",
-    "version": "0.3.9",
+    "version": "0.3.10",
     "release": false,
     "icon": "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png",
     "author": "Agonie",
@@ -14,6 +14,7 @@
     "system_version": "==2.15.6",
     "level": 1,
     "history": {
+      "v0.3.10": "升级界面视觉层次与光影质感：流光横幅、宝石指标卡、任务左侧语义光条与同行通栏确认框、双列路径检查器及配置页对称网格",
       "v0.3.9": "修复初始化结果未知后自动轮次只查询不秒传的问题",
       "v0.3.8": "识别115风控并共享MP冷却，明确记录错误与恢复时间，冷却不消耗重试次数",
       "v0.3.7": "修复初始化结果未知时自动强制上传被提前暂停；监控页显示全部待处理任务，改进操作与原因日志",
