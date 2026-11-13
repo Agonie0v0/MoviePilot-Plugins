@@ -1,8 +1,19 @@
 """115 open API adapter; OSS upload is only called by the manual worker."""
 import hashlib
+import threading
 import time
 from pathlib import Path, PurePosixPath
 
+
+_REQUEST_LOCK = threading.Lock()
+_LAST_REQUEST_AT = 0.0
+# Keep the account-wide request rate conservative after a large queue resumes.
+_MIN_REQUEST_INTERVAL = 2.0
+_COOLDOWN_UNTIL = 0.0
+
+
+def cooldown_until():
+    return _COOLDOWN_UNTIL
 
 
 class RetryLater(Exception):
@@ -74,9 +85,18 @@ class OpenAPI:
         self.client.close()
 
     def request(self, method, endpoint, *, data=None, params=None, missing=False):
+        # Every task creates a fresh OpenAPI object. Serialize those clients so
+        # a large queue cannot send a burst of requests when the shared 115
+        # cooldown expires.
+        with _REQUEST_LOCK:
+            return self._request_locked(method, endpoint, data=data, params=params, missing=missing)
+
+    def _request_locked(self, method, endpoint, *, data=None, params=None, missing=False):
         import httpx
+        global _LAST_REQUEST_AT
 
         def cooldown(reason, start=False):
+            global _COOLDOWN_UNTIL
             lock = getattr(self.backend, "_limit_lock", None)
             if lock is None:
                 raise PauseTask("115 风控保护不可用：宿主未提供共享冷却锁，请检查 MoviePilot 版本")
@@ -85,19 +105,20 @@ class OpenAPI:
                 if start:
                     until = max(until, time.time() + getattr(self.backend, "limit_sleep_seconds", 3600))
                     self.backend._limit_until = until
+            _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, until)
             if until > time.time():
                 raise RateLimited(f"115 风控：{reason}；接口 {endpoint}，冷却至 " +
                                   time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)), until)
 
         cooldown("MoviePilot 共享冷却中")
-        delay = max(0, 1.0 - (time.monotonic() - self._last_request))
+        delay = max(0, _MIN_REQUEST_INTERVAL - (time.monotonic() - _LAST_REQUEST_AT))
         if self.stop.wait(delay):
             raise RetryLater("插件正在停止")
         cooldown("MoviePilot 共享冷却中")
         token = self.backend.access_token
         if not token:
             raise PauseTask("内置 115 授权失效，请重新授权后恢复任务")
-        self._last_request = time.monotonic()
+        _LAST_REQUEST_AT = time.monotonic()
         try:
             resp = self.client.request(method, self.backend.base_url + endpoint,
                 data=data, params=params, headers={"Authorization": f"Bearer {token}",

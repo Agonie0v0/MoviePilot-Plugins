@@ -20,7 +20,7 @@ from app.sdk.logging import logger
 
 from .remote import (NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited, RetryLater, fingerprint,
                      hash_file, prepare_direct, NativePlanStorage, DeferredSource,
-                     PlanningStepRunner, apply_native_deletions)
+                     PlanningStepRunner, apply_native_deletions, cooldown_until)
 from .store import QueueStore
 
 
@@ -374,6 +374,15 @@ class InstantWaitEngine:
             try:
                 if not manual:
                     self.poll_finalizing()
+                # Do not claim every due task while MP's shared 115 cooldown
+                # is active. This prevents a large queue from immediately
+                # replaying the same risk-control request after cooldown.
+                until = max(float(getattr(U115Pan(), "_limit_until", 0) or 0), cooldown_until())
+                delay = until - time.time()
+                if delay > 0:
+                    wake.wait(min(delay, 60))
+                    wake.clear()
+                    continue
                 row = self.store.claim(manual=manual)
                 if row:
                     self.execute(row)

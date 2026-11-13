@@ -22,7 +22,7 @@ from app.schemas.types import MediaType, SystemConfigKey
 
 from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited,
                      RetryLater, fingerprint, hash_file, prepare_direct, NativePlanStorage,
-                     apply_native_deletions)
+                     apply_native_deletions, cooldown_until)
 from .store import QueueStore
 
 
@@ -410,6 +410,16 @@ class InstantWaitEngine:
         wake = self.upload_wake if manual else self.wake
         while not self.stop_event.is_set():
             try:
+                # Do not claim every due task while MP's shared 115 cooldown
+                # is active. Claiming first made a large queue repeatedly
+                # enter execute(), producing a risk-control storm in logs and
+                # needlessly churning each task's retry state.
+                until = max(float(getattr(U115Pan(), "_limit_until", 0) or 0), cooldown_until())
+                delay = until - time.time()
+                if delay > 0:
+                    wake.wait(min(delay, 60))
+                    wake.clear()
+                    continue
                 row = self.store.claim(manual=manual)
                 if not row:
                     wake.wait(5)
