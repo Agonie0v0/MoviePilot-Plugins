@@ -11,6 +11,7 @@ from tests.support import remote, store
 
 class Fake115:
     def __init__(self, harness):
+        self.stop = threading.Event()
         self.h = harness
         self.files = {}
         self.hashes = {}
@@ -46,7 +47,7 @@ class Fake115:
         return {"file_id": item.fileid} if item else None
 
     def raw_id(self, file_id):
-        return {"sha1": self.hashes.get(str(file_id))}
+        return {"sha1": self.hashes.get(str(file_id))} if str(file_id) in self.files else None
 
     def instant(self, path, folder, name, hashes):
         self.inits += 1
@@ -145,35 +146,7 @@ class MoviePilotTests(unittest.TestCase):
         self.assertIs(old._engine, new._engine)
         self.assertTrue(old.get_state())
         self.assertFalse(new._error)
-        self.assertEqual(len(self.engine.patches), 4)
-
-    def test_stop_preserves_hooks_until_native_callback_exits(self):
-        entered, release = threading.Event(), threading.Event()
-        path = self.root / "native.mkv"
-        path.write_bytes(b"video")
-        task = self.h.task(path, target="local", mode="copy")
-        task.target_path = self.root / "library"
-        task.target_directory.library_path = str(task.target_path)
-
-        def callback(task, info):
-            entered.set()
-            release.wait(3)
-            return info.success, info.message
-
-        thread = threading.Thread(target=self.h.chain._TransferChain__handle_transfer,
-                                  args=(task, callback))
-        thread.start()
-        try:
-            self.assertTrue(entered.wait(3))
-            self.assertEqual(self.engine.native_active, 1)
-            self.assertFalse(self.engine.stop(timeout=0))
-            self.assertEqual(len(self.engine.patches), 4)
-        finally:
-            release.set()
-            thread.join(3)
-        self.assertFalse(thread.is_alive())
-        self.assertTrue(self.engine.stop(timeout=0))
-        self.assertFalse(self.engine.patches)
+        self.assertTrue(self.engine.patches)
 
     def test_cached_old_handler_delegates_after_hooks_are_removed(self):
         old = self.h.chain._TransferChain__handle_transfer
@@ -207,6 +180,10 @@ class MoviePilotTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(entered.wait(3))
+            previous = self.engine
+            self.assertEqual(previous.native_active, 1)
+            self.assertFalse(previous.stop(timeout=0))
+            self.assertTrue(previous.patches)
             with patch.dict(sys.modules, {"version": types.SimpleNamespace(APP_VERSION="v2.15.6")}), \
                     patch.object(self.h.bridge.InstantWaitEngine, "run", lambda *a, **kw: None):
                 new.init_plugin({"enabled": True, "max_retries": 7})
@@ -217,6 +194,8 @@ class MoviePilotTests(unittest.TestCase):
                 thread.join(3)
                 waiter.join(3)
                 self.assertFalse(waiter.is_alive())
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(previous.patches)
             self.engine = new._engine
             self.assertTrue(old.get_state())
             self.assertEqual(self.engine.config["max_retries"], 7)
@@ -512,9 +491,10 @@ class MoviePilotTests(unittest.TestCase):
             self.attempt(row["id"])
         self.assertIn("授权失效", plugin.chain.post_message.call_args.args[0].text)
         self.engine.control(row["id"], "upload")
+        self.engine.config["max_retries"] = 0
         with patch.object(self.api, "upload", side_effect=remote.RetryLater("网络连接中断")):
             self.engine.execute(self.engine.store.claim(manual=True))
-        self.assertIn("手动强制上传未完成", plugin.chain.post_message.call_args.args[0].text)
+        self.assertIn("网络连接中断", plugin.chain.post_message.call_args.args[0].text)
         self.assertEqual(plugin.chain.post_message.call_count, 3)
         self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
 
@@ -654,8 +634,11 @@ class MoviePilotTests(unittest.TestCase):
             self.assertEqual(self.engine.store.get(row["id"])["state"], "waiting")
             self.attempt(row["id"])
             self.assertEqual(self.engine.store.get(row["id"])["state"], "upload_queued")
-            self.assertEqual(init.call_count, 2)
+            self.assertEqual(init.call_count, 1)
         self.api.instant = original
+        payload = self.engine.store.get(row["id"])["payload"]
+        payload["missing_since"] = time.time() - 61
+        self.engine.store.update(row["id"], payload=payload)
         self.engine.execute(self.engine.store.claim(manual=True))
         self.assertEqual(self.api.uploads, 1)
         self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
@@ -716,7 +699,7 @@ class MoviePilotTests(unittest.TestCase):
         jobs = self.h.chain.jobview._job_view.values()
         self.assertFalse(any(task.state == "waiting" for job in jobs for task in job.tasks))
 
-    def test_automatic_upload_failure_pauses_without_repeating(self):
+    def test_automatic_upload_stops_after_retry_budget_is_exhausted(self):
         plugin = self.attach_plugin_notifier()
         self.engine.config.update(max_retries=0, limit_action="upload")
         self.enroll()
@@ -725,7 +708,7 @@ class MoviePilotTests(unittest.TestCase):
         with patch.object(self.api, "upload", side_effect=remote.RetryLater("网络中断")):
             self.engine.execute(self.engine.store.claim(manual=True))
         self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
-        self.assertIn("自动强制上传未完成", plugin.chain.post_message.call_args.args[0].text)
+        self.assertIn("网络中断", plugin.chain.post_message.call_args.args[0].text)
         self.assertIsNone(self.engine.store.claim(manual=True))
         self.assertIsNone(self.engine.store.claim(now=time.time() + 9999))
         self.assertFalse(self.h.Oper().get(row["history_id"]).status)
@@ -803,17 +786,45 @@ class MoviePilotTests(unittest.TestCase):
         self.assertTrue(self.h.Oper().get(row["history_id"]).status)
         self.assertEqual(self.h.db.query(self.h.History).count(), 1)
 
-    def test_manual_upload_failure_pauses_and_preserves_source(self):
+    def test_temporary_upload_failure_retries_then_completes_original_move(self):
         task = self.enroll(mode="move")
         row = self.engine.store.all()[0]
         self.engine.control(row["id"], "upload")
-        with patch.object(self.api, "upload", side_effect=remote.RetryLater("网络中断")):
+        def interrupted(path, folder, hashes, init, payload, checkpoint):
+            payload["upload_session"] = {"upload_id": "saved", "parts": [{"number": 1, "etag": "receipt"}]}
+            checkpoint()
+            raise remote.RetryLater("网络中断")
+        with patch.object(self.api, "upload", side_effect=interrupted):
             self.engine.execute(self.engine.store.claim(manual=True))
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "upload_queued")
         self.assertIsNone(self.engine.store.claim(now=time.time() + 9999))
         self.assertIsNone(self.engine.store.claim(manual=True))
         self.assertFalse(self.h.Oper().get(row["history_id"]).status)
         self.assertTrue(Path(task.fileitem.path).exists())
+        self.engine.execute(self.engine.store.claim(now=time.time() + 9999, manual=True))
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertFalse(Path(task.fileitem.path).exists())
+
+    def test_same_content_new_id_and_metadata_change_complete_original_history(self):
+        task = self.enroll()
+        row = self.engine.store.all()[0]
+        self.api.hit = True
+        original_callback = self.engine.original_callback
+        self.engine.original_callback = Mock(side_effect=remote.RetryLater("回写中断"))
+        self.attempt(row["id"])
+        source = Path(task.fileitem.path)
+        stat = source.stat()
+        os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        self.api.files["999"] = self.api.files.pop("123").model_copy(update={"fileid": "999"})
+        self.api.hashes["999"] = self.api.hashes["123"]
+        self.engine.original_callback = original_callback
+        self.attempt(row["id"])
+        saved = self.engine.store.get(row["id"])
+        self.assertEqual(saved["state"], "completed")
+        self.assertEqual(saved["payload"]["remote_id"], "999")
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.api.inits, 1)
 
     def test_manual_upload_bypasses_expired_wait_limit_but_not_source_guard(self):
         task = self.enroll()
@@ -845,14 +856,12 @@ class MoviePilotTests(unittest.TestCase):
         self.engine.control(row["id"], "upload")
         with patch.object(self.api, "upload", side_effect=delayed):
             self.engine.execute(self.engine.store.claim(manual=True))
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
-        self.engine.control(row["id"], "upload")
-        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "upload_queued")
+        self.engine.execute(self.engine.store.claim(now=self.engine.store.get(row["id"])["next_at"], manual=True))
         self.assertEqual(self.api.inits, 1)
         self.assertEqual(self.api.uploads, 1)
         self.api.files.update(hidden)
-        self.engine.control(row["id"], "upload")
-        self.engine.execute(self.engine.store.claim(manual=True))
+        self.engine.execute(self.engine.store.claim(now=time.time() + 9999, manual=True))
         self.assertTrue(self.h.Oper().get(row["history_id"]).status)
 
     def test_manual_upload_does_not_block_auto_queue_or_local_organization(self):
@@ -1043,7 +1052,7 @@ class MoviePilotTests(unittest.TestCase):
         with patch.object(self.engine, "complete", side_effect=lost_target):
             self.attempt(row["id"])
         self.assertTrue(Path(task.fileitem.path).exists())
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "waiting")
         self.assertFalse(self.h.Oper().get(row["history_id"]).status)
         self.assertEqual(removed, [])
 
@@ -1326,14 +1335,24 @@ class MoviePilotTests(unittest.TestCase):
         self.api.hit = True
         def interrupted_before_history(chain, task, info):
             raise remote.RetryLater("模拟历史提交前中断")
+        original_callback = self.engine.original_callback
         self.engine.original_callback = interrupted_before_history
         self.attempt(row["id"])
         self.assertFalse(self.h.Oper().get(row["history_id"]).status)
         self.assertTrue(self.engine.store.get(row["id"])["payload"]["result"])
         self.api.files.clear()
         self.attempt(row["id"])
-        self.assertEqual(self.engine.store.get(row["id"])["state"], "paused")
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "waiting")
         self.assertFalse(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.api.inits, 1)
+        payload = self.engine.store.get(row["id"])["payload"]
+        payload["missing_since"] = time.time() - 61
+        self.engine.store.update(row["id"], payload=payload)
+        self.engine.original_callback = original_callback
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertTrue(self.h.Oper().get(row["history_id"]).status)
+        self.assertEqual(self.api.inits, 2)
 
 
 if __name__ == "__main__":

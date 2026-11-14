@@ -7,7 +7,7 @@ import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 class DirectV2Tests(unittest.TestCase):
@@ -33,7 +33,7 @@ class DirectV2Tests(unittest.TestCase):
         self.api.raw_path.side_effect = lambda _: self.visible
         self.api.raw_id.return_value = {"sha1": self.data["hashes"]["sha1"]}
         self.api.get_folder.return_value = types.SimpleNamespace(fileid="10", path="/library")
-        self.api.verify.return_value = types.SimpleNamespace(fileid="123", path=self.data["final_path"])
+        self.api.verify.side_effect = lambda file_id, path, _: types.SimpleNamespace(fileid=str(file_id), path=path)
 
     def prepare(self, force=False):
         return self.remote.prepare_direct(self.api, self.store, self.row, self.path, self.data, force)
@@ -61,35 +61,50 @@ class DirectV2Tests(unittest.TestCase):
         self.assertNotIn("write_intent", self.store.get(self.row["id"])["payload"])
         self.api.upload.assert_not_called()
 
-    def test_existing_target_is_not_adopted_even_with_same_hash(self):
+    def test_same_content_target_is_reused_with_or_without_saved_identity(self):
         self.visible = {"file_id": "123"}
-        with self.assertRaises(self.remote.PauseTask):
-            self.prepare(True)
+        for saved_id in (None, "999"):
+            with self.subTest(saved_id=saved_id):
+                self.data["remote_id"] = saved_id
+                self.assertEqual(self.prepare(True).fileid, "123")
+                self.assertEqual(self.store.get(self.row["id"])["payload"]["remote_id"], "123")
         self.api.instant.assert_not_called()
         self.api.upload.assert_not_called()
         self.api.get_folder.assert_not_called()
 
-    def test_lost_init_response_recovers_hash_without_reupload(self):
+    def test_lost_init_or_upload_response_recovers_without_reupload(self):
         def lost(*args):
             self.hit()
             raise self.remote.RetryLater("lost response")
-        self.api.instant.side_effect = lost
-        with self.assertRaises(self.remote.RetryLater):
-            self.prepare()
-        self.prepare()
-        self.assertEqual(self.api.instant.call_count, 1)
+        for stage in ("instant", "upload"):
+            with self.subTest(stage=stage):
+                self.visible = None
+                for key in ("remote_id", "write_intent", "instant_confirmed"):
+                    self.data.pop(key, None)
+                self.api.instant.reset_mock()
+                self.api.upload.reset_mock()
+                self.api.instant.side_effect = lost if stage == "instant" else self.remote.NotInstant("miss", {"bucket": "b"})
+                self.api.upload.side_effect = lost
+                with self.assertRaises(self.remote.RetryLater):
+                    self.prepare(True)
+                self.prepare(True)
+                self.assertEqual(self.api.instant.call_count, 1)
+                self.assertEqual(self.api.upload.call_count, int(stage == "upload"))
 
     def test_uncertain_init_with_missing_target_retries_instant(self):
         self.api.instant.side_effect = self.remote.RetryLater("lost response")
         with self.assertRaises(self.remote.RetryLater):
             self.prepare()
+        with self.assertRaises(self.remote.RetryLater):
+            self.prepare()
         self.api.instant.side_effect = self.hit
-        self.prepare()
+        with patch.object(self.remote.time, "time", return_value=self.data["missing_since"] + 61):
+            self.prepare()
         self.assertEqual(self.api.instant.call_count, 2)
         self.api.upload.assert_not_called()
 
     def test_force_retries_uncertain_init_after_target_check(self):
-        self.data.update(write_intent=True, upload_origin="limit")
+        self.data.update(write_intent=True, upload_origin="limit", missing_since=1)
         self.api.instant.side_effect = self.remote.NotInstant("miss", {"bucket": "b"})
         def upload(*args):
             self.visible = {"file_id": "123"}
@@ -100,11 +115,11 @@ class DirectV2Tests(unittest.TestCase):
         self.api.instant.assert_called_once()
         self.api.upload.assert_called_once()
 
-    def test_uncertain_target_appearing_before_retry_stops_submission(self):
+    def test_target_appearing_before_upload_is_reconciled(self):
         self.data["write_intent"] = True
         self.api.raw_path.side_effect = [None, {"file_id": "123"}]
-        with self.assertRaises(self.remote.PauseTask):
-            self.prepare(True)
+        self.data["missing_since"] = 1
+        self.assertEqual(self.prepare(True).fileid, "123")
         self.api.instant.assert_not_called()
 
     def test_unowned_recovery_requires_hash_or_exact_saved_upload_identity(self):
@@ -112,34 +127,63 @@ class DirectV2Tests(unittest.TestCase):
         self.visible = {"file_id": "123"}
         for info in ({}, {"sha1": "different"}, {"pick_code": "other"}):
             self.api.raw_id.return_value = info
-            with self.subTest(info=info), self.assertRaises(self.remote.PauseTask):
+            error = self.remote.PauseTask if info.get("sha1") else self.remote.RetryLater
+            with self.subTest(info=info), self.assertRaises(error):
                 self.prepare(True)
-        self.data["upload_session"] = {"pick_code": "owned"}
         self.api.raw_id.return_value = {"pick_code": "owned"}
-        self.prepare(True)
+        for identity in ({"upload_session": {"pick_code": "owned"}}, {"upload_pick_code": "owned"}):
+            self.data.pop("remote_id", None)
+            self.data.pop("upload_session", None)
+            self.data.update(identity)
+            self.prepare(True)
         self.api.upload.assert_not_called()
         self.api.instant.assert_not_called()
 
-    def test_confirmed_invisible_target_is_never_uploaded_twice(self):
+    def test_confirmed_invisible_target_waits_before_retrying(self):
         self.data.update(write_intent=True, instant_confirmed=True)
         with self.assertRaises(self.remote.RetryLater):
             self.prepare(True)
         self.api.instant.assert_not_called()
         self.api.upload.assert_not_called()
 
-    def test_saved_id_cannot_follow_a_replaced_target(self):
+    def test_different_content_target_is_not_adopted(self):
         self.data["remote_id"] = "123"
         self.visible = {"file_id": "999"}
+        self.api.raw_id.return_value = {"sha1": "different"}
         with self.assertRaises(self.remote.PauseTask):
             self.prepare()
         self.api.verify.assert_not_called()
 
-    def test_saved_upload_cannot_be_retargeted_to_recreated_directory(self):
+    def test_recreated_directory_reinitializes_upload(self):
         self.data.update(write_intent=True, target_folder_id="old", upload_session={"upload_id": "same"})
-        with self.assertRaises(self.remote.PauseTask):
-            self.prepare(True)
+        self.api.instant.side_effect = self.hit
+        self.prepare(True)
         self.api.upload.assert_not_called()
+        self.assertNotIn("upload_session", self.data)
+
+    def test_confirmed_missing_target_is_retried_only_after_grace_and_id_lookup(self):
+        self.data.update(remote_id="123", instant_confirmed=True, write_intent=True)
+        self.api.raw_id.return_value = None
+        with self.assertRaises(self.remote.RetryLater):
+            self.prepare()
         self.api.instant.assert_not_called()
+        self.api.instant.side_effect = self.hit
+        with patch.object(self.remote.time, "time", return_value=self.data["missing_since"] + 61):
+            self.prepare()
+        self.api.raw_id.assert_called_with("123")
+        self.assertEqual(self.api.instant.call_count, 1)
+
+    def test_metadata_only_source_changes_are_accepted_but_changed_content_is_not(self):
+        import os
+        hashes = self.data["hashes"]
+        original = hashes["fingerprint"]
+        os.utime(self.path, ns=(self.path.stat().st_atime_ns, original["mtime_ns"] + 1_000_000_000))
+        updated = self.remote.check_source(self.path, original, threading.Event(), hashes)
+        self.assertEqual(updated, self.remote.fingerprint(self.path))
+        self.assertEqual(hashes["fingerprint"], updated)
+        self.path.write_bytes(b"other")
+        with self.assertRaises(self.remote.PauseTask):
+            self.remote.check_source(self.path, updated, threading.Event(), hashes)
 
     def test_native_deletion_progress_survives_restart_and_is_not_repeated(self):
         self.data["native_deletions"] = [{"item": dict(type="file", fileid="42", path="/library/Film.mkv")}]

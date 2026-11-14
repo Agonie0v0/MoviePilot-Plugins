@@ -211,19 +211,29 @@ class QueueStore:
                 return None
             payload = json.loads(row["payload"])
             payload.setdefault("auto_attempts", row["attempts"])
-            if not manual:
+            if manual:
+                payload["upload_attempts"] = payload.get("upload_attempts", 0) + 1
+            else:
                 payload["auto_attempts"] = payload.get("auto_attempts", row["attempts"]) + 1
             db.execute("UPDATE jobs SET state=?, attempts=attempts+1, payload=?, updated=? WHERE id=?",
                        ("uploading" if manual else "running", json.dumps(payload), now, row["id"]))
             return self.decode(db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone())
 
-    def recover(self):
+    def recover(self, automatic_upload=False):
         with self.connect() as db:
             db.execute("UPDATE jobs SET state='waiting',next_at=?,ready=1 WHERE state='running'",
                        (time.time(),))
-            # Never resume sending file contents without a new manual action.
-            db.execute("UPDATE jobs SET state='paused',ready=1,message=? WHERE state='uploading'",
-                       ("强制上传被中断，请点强制上传继续；将先核对远端及已保存的上传进度",))
+            for row in db.execute("SELECT * FROM jobs WHERE state IN ('uploading','upload_queued')").fetchall():
+                data = json.loads(row["payload"])
+                automatic = data.get("upload_origin") == "limit"
+                if automatic:
+                    state = "upload_queued" if automatic_upload else "paused"
+                    message = "等待继续自动上传" if automatic_upload else "自动上传已关闭，任务已暂停"
+                elif row["state"] == "uploading":
+                    state, message = "paused", "上传被中断，请点强制上传继续"
+                else:
+                    continue
+                db.execute("UPDATE jobs SET state=?,ready=1,message=? WHERE id=?", (state, message, row["id"]))
 
     def command(self, key, action):
         """Do not race an in-flight upload or completion callback."""
@@ -239,11 +249,14 @@ class QueueStore:
                 payload = json.loads(row["payload"])
                 payload["wait_since"] = time.time()
                 payload["auto_attempts"] = 0
+                payload.pop("finalize_attempts", None)
                 db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), key))
             elif action == "upload" and row["state"] in ("queued", "waiting", "paused"):
                 state = "upload_queued"
                 payload = json.loads(row["payload"])
                 payload["upload_origin"] = "manual"
+                payload["upload_attempts"] = 0
+                payload.pop("finalize_attempts", None)
                 db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), key))
             elif action == "pause" and row["state"] in ("queued", "waiting", "upload_queued"):
                 state = "paused"

@@ -72,6 +72,24 @@ def hash_file(path, stop):
             "preid": prefix.hexdigest().upper()}
 
 
+def check_source(path, expected, stop, hashes=None):
+    try:
+        current = fingerprint(path)
+    except FileNotFoundError:
+        raise PauseTask("源文件不存在，已暂停") from None
+    if current == expected:
+        return current
+    if current["size"] != expected["size"]:
+        raise PauseTask("源文件内容已变化，已暂停")
+    if hashes:
+        refreshed = hash_file(path, stop)
+        if refreshed["sha1"] != hashes["sha1"]:
+            raise PauseTask("源文件内容已变化，已暂停")
+        hashes.update(refreshed)
+        current = refreshed["fingerprint"]
+    return current
+
+
 class OpenAPI:
     def __init__(self, backend, item_factory, stop, client=None):
         import httpx
@@ -325,21 +343,16 @@ class OpenAPI:
         return result.get("file_id")
 
     def upload(self, path, folder, hashes, init, payload, checkpoint):
-        """Manual multipart upload using MP's existing oss2 dependency.
-
-        Persist part receipts, never credentials. Retrying uses the same upload
-        ID, including an uncertain completion, instead of creating another file.
-        """
+        """Persist multipart receipts for retries without storing credentials."""
         import oss2
         from oss2.models import PartInfo
 
-        def check_source():
+        def check_upload_source():
             if self.stop.is_set():
                 raise RetryLater("插件正在停止，上传进度已保留")
-            if fingerprint(path) != hashes["fingerprint"]:
-                raise PauseTask("源文件在普通上传期间发生变化，已停止提交")
+            check_source(path, hashes["fingerprint"], self.stop, hashes)
 
-        check_source()
+        check_upload_source()
         saved = payload.get("upload_session")
         details = saved or init or {}
         if not all(details.get(k) for k in ("bucket", "object", "pick_code")):
@@ -360,11 +373,12 @@ class OpenAPI:
             endpoint = "https://" + endpoint[len("http://"):]
         auth = oss2.StsAuth(token["AccessKeyId"], token["AccessKeySecret"], token["SecurityToken"])
         bucket = oss2.Bucket(auth, endpoint, details["bucket"], connect_timeout=30)
+        stage = "初始化上传"
         try:
             if not saved:
                 upload_id = bucket.init_multipart_upload(details["object"],
                     params={"encoding-type": "url", "sequential": ""}).upload_id
-                # Stable part sizes allow a manual retry to resume from receipts.
+                # Stable part sizes let retries resume from saved receipts.
                 part_size = oss2.determine_part_size(hashes["fingerprint"]["size"], preferred_size=10 * 1024 * 1024)
                 saved = {"bucket": details["bucket"], "object": details["object"],
                          "pick_code": details["pick_code"], "upload_id": upload_id,
@@ -376,7 +390,7 @@ class OpenAPI:
             with open(path, "rb") as stream:
                 stream.seek(offset)
                 while offset < size:
-                    check_source()
+                    stage = "上传分片"
                     length = min(saved["part_size"], size - offset)
                     number = len(saved["parts"]) + 1
                     part = bucket.upload_part(saved["object"], saved["upload_id"], number,
@@ -384,10 +398,11 @@ class OpenAPI:
                     saved["parts"].append({"number": number, "etag": part.etag})
                     offset += length
                     checkpoint()
-            check_source()
-            # Persist before committing: after response loss retry this exact ID.
+            check_upload_source()
+            # Mark the commit first so retries reconcile its result before uploading.
             saved["completing"] = True
             checkpoint()
+            stage = "提交上传"
             result = bucket.complete_multipart_upload(saved["object"], saved["upload_id"],
                 [PartInfo(p["number"], p["etag"]) for p in saved["parts"]], headers={
                     "X-oss-callback": oss2.utils.b64encode_as_string(callback["callback"]),
@@ -405,54 +420,84 @@ class OpenAPI:
             checkpoint()
         except (RetryLater, PauseTask):
             raise
-        except Exception:
-            # SDK exception text can contain signed URLs or temporary credentials.
-            raise RetryLater("普通上传未完成，上传进度已保留；请手动重试") from None
+        except oss2.exceptions.OssError as error:
+            code = error.code
+            if code == "NoSuchUpload":
+                payload["upload_pick_code"] = details["pick_code"]
+                payload.pop("upload_session", None)
+                payload["write_intent"] = True
+                checkpoint()
+                raise RetryLater("上传会话已失效，稍后核对目标并重新上传") from None
+            if code == "SecurityTokenExpired":
+                raise RetryLater("上传凭证已过期，稍后刷新后继续") from None
+            # Only expose the SDK error code, never its signed URL or credentials.
+            code = code if code and code.isascii() and code.isalnum() else type(error).__name__
+            if code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+                raise PauseTask(f"115 上传授权不可用（{code}），请检查授权") from None
+            raise RetryLater(f"{stage}失败（{code}）") from None
+        except Exception as error:
+            raise RetryLater(f"{stage}失败（{type(error).__name__}），已保留进度") from None
+
+
+def resolve_target(api, data):
+    """Resolve identity once for uploads, native replay and final cleanup."""
+    existing = api.raw_path(data["final_path"])
+    if not existing:
+        return None
+    file_id = existing.get("file_id")
+    if not file_id:
+        raise RetryLater("目标文件信息尚未完整，稍后核对")
+    if str(file_id) != str(data.get("remote_id")):
+        info = api.raw_id(file_id) or {}
+        digest = info.get("sha1") or info.get("file_sha1")
+        pick_code = data.get("upload_session", {}).get("pick_code") or data.get("upload_pick_code")
+        same_upload = pick_code and str(info.get("pick_code", "")) == str(pick_code)
+        if digest and str(digest).upper() != data["hashes"]["sha1"]:
+            raise PauseTask("目标文件内容不同，请核对同名文件")
+        if not digest and not same_upload:
+            raise RetryLater("目标文件信息尚未完整，稍后核对")
+    item = api.verify(file_id, data["final_path"], data["hashes"])
+    data["remote_id"] = str(file_id)
+    data.pop("missing_since", None)
+    return item
 
 
 def prepare_direct(api, store, row, path, data, force, progress=None):
-    """Write once at the final path; fence conflicts and uncertain responses."""
+    """Reconcile the final target, then initialize or resume an upload."""
     final = PurePosixPath(data["final_path"])
     if any(part in (".mp115-staging", ".mp115-backups") for part in final.parts):
         raise PauseTask("已停用临时目录，请选择正式整理目标")
     if not store.reserve_target(row["id"], str(final)):
         raise PauseTask("另一个未结束任务占用相同正式目标，请先处理该任务")
     checkpoint = lambda: store.update(row["id"], payload=data)
-    existing = api.raw_path(final)
-    file_id = data.get("remote_id")
-    if existing:
-        if file_id:
-            if str(existing.get("file_id")) != str(file_id):
-                raise PauseTask("正式目标已被另一个文件占用，请人工核对")
-        else:
-            # The preflight proved absence before our persisted write intent.
-            # Require exact content evidence to recover a lost init/callback ID.
-            if not data.get("write_intent"):
-                raise PauseTask("正式目标已存在，已停止上传；请人工处理同名冲突")
-            file_id = existing.get("file_id")
-            info = api.raw_id(file_id) if file_id else None
-            digest = (info or {}).get("sha1") or (info or {}).get("file_sha1")
-            pick_code = data.get("upload_session", {}).get("pick_code")
-            same_upload = pick_code and str((info or {}).get("pick_code", "")) == str(pick_code)
-            if (digest and str(digest).upper() != data["hashes"]["sha1"]) or (not digest and not same_upload):
-                raise PauseTask("上传响应未确认，正式目标缺少匹配 SHA1 或上传标识，已停止重复上传")
-            data["remote_id"] = str(file_id)
-            checkpoint()
-        return api.verify(file_id, str(final), data["hashes"])
-    if file_id:
-        raise RetryLater("已提交上传结果，等待正式路径可见；不会重复上传")
-    if data.get("instant_confirmed") or data.get("upload_confirmed"):
-        raise RetryLater("已提交上传结果，等待正式文件可见；不会重复上传")
-    if data.get("write_intent") and not data.get("upload_session"):
-        # A delayed remote result can still appear after this check.
+    item = resolve_target(api, data)
+    if item:
+        checkpoint()
+        return item
+    session = data.get("upload_session") or {}
+    if (data.get("remote_id") or data.get("instant_confirmed") or data.get("upload_confirmed")
+            or session.get("completing") or (data.get("write_intent") and not session)):
+        if data.get("remote_id") and api.raw_id(data["remote_id"]):
+            raise RetryLater("上传结果已存在，等待目标路径刷新")
+        # Allow delayed 115 metadata to appear before starting another upload.
+        since = data.setdefault("missing_since", time.time())
+        checkpoint()
+        if time.time() - since < 60:
+            raise RetryLater("目标暂不可见，稍后核对上传结果")
+        for key in ("remote_id", "instant_confirmed", "upload_confirmed", "upload_session", "upload_pick_code", "write_intent", "missing_since"):
+            data.pop(key, None)
+        checkpoint()
         if progress:
-            progress("上次初始化结果未知；目标当前不存在，本轮重新尝试秒传")
+            progress("目标仍不存在，重新尝试上传")
     folder = api.get_folder(final.parent)
     if data.get("target_folder_id") and str(data["target_folder_id"]) != str(folder.fileid):
-        raise PauseTask("正式目标目录身份已变化，请人工核对上传进度")
+        data.pop("upload_session", None)
+        data.pop("upload_pick_code", None)
     data["target_folder_id"] = str(folder.fileid)
-    if api.raw_path(final):
-        raise PauseTask("上传前发现同名正式目标，已停止上传")
+    item = resolve_target(api, data)
+    if item:
+        checkpoint()
+        return item
     if data.get("upload_session"):
         if not force:
             raise PauseTask("有未完成的普通上传，请强制上传继续")
@@ -474,8 +519,10 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
             if progress:
                 progress("秒传未命中，转普通上传")
             # Check again immediately before multipart upload starts.
-            if api.raw_path(final):
-                raise PauseTask("普通上传前发现同名目标，已停止上传")
+            item = resolve_target(api, data)
+            if item:
+                checkpoint()
+                return item
             data["write_intent"] = True
             checkpoint()
             api.upload(path, folder, data["hashes"], error.upload_data, data, checkpoint)
@@ -483,6 +530,10 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
                 progress("普通上传已提交")
         except RateLimited:
             # A 429 / access-limit response definitively rejected the request.
+            data.pop("write_intent", None)
+            checkpoint()
+            raise
+        except PauseTask:
             data.pop("write_intent", None)
             checkpoint()
             raise
@@ -546,13 +597,12 @@ class DirectStorage:
             final = PurePosixPath(target_dir.path) / (new_name or Path(local_path).name)
             if final != self.final_path:
                 raise PauseTask("重试时整理目标发生变化，请人工处理")
-            if fingerprint(local_path) != self.hashes["fingerprint"]:
-                raise PauseTask("源文件在等待期间发生变化")
-            visible = self.api.raw_path(final)
-            if not visible or str(visible.get("file_id")) != str(self.item.fileid):
-                raise PauseTask("正式目标被删除或替换，请人工核对")
-            item = self.api.verify(self.item.fileid, str(final), self.hashes)
             payload = self.store.get(self.job["id"])["payload"]
+            check_source(local_path, self.hashes["fingerprint"], self.api.stop, self.hashes)
+            item = resolve_target(self.api, payload)
+            if not item:
+                raise RetryLater("目标暂不可见，稍后继续整理")
+            self.item = item
             payload["committed"] = True
             self.store.update(self.job["id"], payload=payload)
             self.materialized = True
@@ -567,7 +617,7 @@ class NativePlanStorage(DirectStorage):
     def __init__(self, api, store, job, item_factory, source_fileitem):
         data = job["payload"]
         super().__init__(api, store, job, data["final_path"], None,
-                         {"fingerprint": data["source_initial"]})
+                         data.get("hashes") or {"fingerprint": data["source_initial"]})
         self.item_factory = item_factory
         self.deletions = []
         self.upload_planned = False
@@ -630,9 +680,14 @@ class NativePlanStorage(DirectStorage):
 
     def upload(self, target_dir, local_path, new_name=None):
         final = PurePosixPath(str(target_dir.path).replace("\\", "/")) / (new_name or Path(local_path).name)
-        if final not in (self.final_path, self.stage_path) or fingerprint(local_path) != self.hashes["fingerprint"]:
+        if final not in (self.final_path, self.stage_path):
             self.error = PauseTask("整理路径或源文件发生变化，已停止覆盖")
             raise self.error
+        try:
+            check_source(local_path, self.hashes["fingerprint"], self.api.stop, self.hashes if "sha1" in self.hashes else None)
+        except (PauseTask, RetryLater) as error:
+            self.error = error
+            raise
         self.upload_planned = True
         item = self.item_factory(storage="u115", type="file", fileid="0", path=str(final),
                                  name=final.name, size=self.hashes["fingerprint"]["size"])

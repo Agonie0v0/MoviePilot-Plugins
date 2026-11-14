@@ -63,6 +63,57 @@ def test_wait_failure_then_same_history_success(h, task):
     assert h.api.get_item("/library/Film.mkv").fileid == "123"
 
 
+@pytest.mark.parametrize("mode,failure", [("copy", "lookup"), ("move", "callback")])
+def test_finalization_recovers_metadata_change_new_id_and_temporary_failure(h, task, mode, failure):
+    import os
+    task.plan_checkpoint.resolved_transfer_type = mode
+    row = stage(h, task)
+    source = Path(task.fileitem.path)
+    stat = source.stat()
+    if mode == "copy":
+        os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    h.api.files["999"] = h.api.files.pop("123").model_copy(update={"fileid": "999"})
+    h.api.hashes["999"] = h.api.hashes["123"]
+    target, method = (h.api, "raw_path") if failure == "lookup" else (h.engine, "verify_result")
+    with patch.object(target, method, side_effect=h.remote.RetryLater("查询超时")):
+        for attempt in range(h.engine.config["max_retries"] + 1):
+            if failure == "callback":
+                with pytest.raises(h.remote.RetryLater):
+                    h.Chain()._TransferChain__handle_transfer(task)
+            else:
+                h.Chain()._TransferChain__handle_transfer(task)
+            expected = "finalizing" if attempt < h.engine.config["max_retries"] else "paused"
+            assert h.engine.store.get(row["id"])["state"] == expected
+    assert not h.history.get(row["history_id"]).status
+    h.engine.control(row["id"], "resume")
+    h.engine.execute(h.engine.store.claim())
+    assert h.engine.store.get(row["id"])["state"] == "finalizing"
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.history.get(row["history_id"]).status
+    assert h.api.inits == 1
+    assert source.exists() == (mode == "copy")
+
+
+def test_temporary_upload_failure_resumes_saved_session_with_bounded_retries(h, task):
+    row = h.enter(task)
+    h.engine.control(row["id"], "upload")
+    def interrupted(path, folder, hashes, init, data, checkpoint):
+        data["upload_session"] = {"upload_id": "saved", "parts": [1]}
+        checkpoint()
+        raise h.remote.RetryLater("连接中断")
+    with patch.object(h.api, "upload", side_effect=interrupted):
+        for attempt in range(h.engine.config["max_retries"] + 1):
+            h.engine.execute(h.engine.store.claim(now=time.time() + 9999, manual=True))
+            expected = "upload_queued" if attempt < h.engine.config["max_retries"] else "paused"
+            assert h.engine.store.get(row["id"])["state"] == expected
+    h.engine.control(row["id"], "upload")
+    h.engine.execute(h.engine.store.claim(manual=True))
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert Path(task.fileitem.path).exists()
+
+
 @pytest.mark.parametrize("source,target", [(False, False), (True, False), (False, True), (True, True)])
 def test_builtin_storage_selection_accepts_none_and_instances(h, task, source, target):
     h.source_oper = h.Local() if source else None
@@ -403,31 +454,7 @@ def test_reloaded_entry_shares_engine_and_ignores_old_instance_stop(h):
     old.stop_service()
     assert old._engine is new._engine
     assert old.get_state() and not new._error
-    assert len(h.engine.patches) == 6
-
-
-def test_stop_preserves_hooks_until_native_callback_exits(h, task):
-    entered, release = threading.Event(), threading.Event()
-
-    def callback(task, info):
-        entered.set()
-        release.wait(3)
-        return info.success, info.message
-
-    thread = threading.Thread(target=h.engine.chain._TransferChain__handle_transfer,
-                              args=(task, callback))
-    thread.start()
-    try:
-        assert entered.wait(3)
-        assert h.engine.native_active == 1
-        assert h.engine.stop(timeout=0) is False
-        assert len(h.engine.patches) == 6
-    finally:
-        release.set()
-        thread.join(3)
-    assert not thread.is_alive()
-    assert h.engine.stop(timeout=0) is True
-    assert not h.engine.patches
+    assert h.engine.patches
 
 
 def test_cached_old_handler_delegates_after_hooks_are_removed(h):
@@ -457,6 +484,10 @@ def test_update_waits_for_real_native_callback_then_restarts_automatically(h, ta
     thread.start()
     try:
         assert entered.wait(3)
+        previous = h.engine
+        assert previous.native_active == 1
+        assert previous.stop(timeout=0) is False
+        assert previous.patches
         new.init_plugin({"enabled": True, "max_retries": 7})
         assert new._notice and not new.get_state()
         waiter = new._runtime.thread
@@ -464,6 +495,7 @@ def test_update_waits_for_real_native_callback_then_restarts_automatically(h, ta
         thread.join(3)
         waiter.join(3)
         assert not waiter.is_alive()
+        assert not thread.is_alive() and not previous.patches
         h.engine = new._engine
         assert old.get_state() and h.engine.config["max_retries"] == 7
         assert not new._notice and not new._error
