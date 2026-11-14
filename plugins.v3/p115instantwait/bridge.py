@@ -54,6 +54,7 @@ class InstantWaitEngine:
         self.patches = []
         self.live_tasks = {}
         self.context = threading.local()
+        self.runtime_lock = threading.RLock()
         self.native_lock = threading.Condition()
         self.native_active = 0
         self.extensions = {e.strip().lower().lstrip(".") for e in config["extensions"].split(",") if e.strip()}
@@ -160,9 +161,17 @@ class InstantWaitEngine:
 
         def wrapped_handle(chain, task, callback=None):
             previous_job = getattr(engine.context, "native_job", None)
-            engine.context.native_job = None
             with engine.native_lock:
-                engine.native_active += 1
+                stopping = engine.stop_event.is_set()
+                if stopping:
+                    engine.native_lock.wait_for(lambda: not engine.patches)
+                else:
+                    engine.native_active += 1
+            if stopping:
+                with engine.runtime_lock:
+                    current = getattr(TransferChain, "_TransferChain__handle_transfer")
+                return current(chain, task, callback)
+            engine.context.native_job = None
             try:
                 return original_handle(chain, task, callback)
             finally:
@@ -554,22 +563,22 @@ class InstantWaitEngine:
             result["items"].append(item)
         return result
 
-    def stop(self):
+    def stop(self, timeout=35):
         """Keep patches until upload workers and native executions have exited."""
         self.stop_event.set()
         self.wake.set()
         self.upload_wake.set()
-        deadline = time.monotonic() + 35
+        deadline = time.monotonic() + timeout
         for worker in (self.worker, self.upload_worker):
             if worker and worker.ident is not None:
                 worker.join(max(0, deadline - time.monotonic()))
                 if worker.is_alive():
-                    raise RuntimeError("后台上传仍在结束，暂不能重新初始化插件")
+                    return False
         with self.native_lock:
             while self.native_active and time.monotonic() < deadline:
                 self.native_lock.wait(max(0, deadline - time.monotonic()))
             if self.native_active:
-                raise RuntimeError("V3 正在完成整理，暂不能移除接管接口")
+                return False
         for name, own, original, replacement in reversed(self.patches):
             if getattr(TransferChain, name) is replacement:
                 if own:
@@ -577,9 +586,12 @@ class InstantWaitEngine:
                 else:
                     delattr(TransferChain, name)
         self.patches.clear()
+        with self.native_lock:
+            self.native_lock.notify_all()
         for task in self.live_tasks.values():
             self.original_finish(self.chain, task)
         self.live_tasks.clear()
+        return True
 
 
 class PreparedStepRunner:

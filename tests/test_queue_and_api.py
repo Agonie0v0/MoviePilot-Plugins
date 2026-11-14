@@ -123,6 +123,8 @@ class QueueTests(unittest.TestCase):
 
 class APITests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(remote, "_COOLDOWN_UNTIL", 0))
+        self.enterContext(patch.dict(remote._PATH_CACHE, clear=True))
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "A.mkv"
         self.path.write_bytes(b"test movie content")
@@ -210,6 +212,7 @@ class APITests(unittest.TestCase):
         for status, body in ((429, {}), (200, {"state": False, "code": 123,
                                                "message": "已达到当前访问上限"})):
             self.backend._limit_until = 0
+            remote._COOLDOWN_UNTIL = 0
             api = self.api([(status, body)])
             before = len(self.calls)
             with self.assertRaises(remote.RateLimited) as error:

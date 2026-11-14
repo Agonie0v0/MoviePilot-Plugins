@@ -64,7 +64,7 @@ class RecordSearchTests(unittest.TestCase):
                         and any(isinstance(t, ast.Name) and t.id == "DEFAULTS" for t in n.targets))
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
         cls.bases = []
-        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("search_records", "get_form", "init_plugin")]
+        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("search_records", "get_form", "_initialize")]
         namespace = dict(HTTPException=HTTPException, task_record=records.task_record, record_choices=ui.record_choices,
                          config_form=ui.config_form, record_search_model=ui.record_search_model, DEFAULTS=defaults,
                          logger=Mock())
@@ -72,6 +72,7 @@ class RecordSearchTests(unittest.TestCase):
         plugin = namespace[cls.name]()
         plugin.queue, plugin.get_data = lambda: self.db, lambda key: None
         plugin._error = ""
+        plugin._notice = ""
         return plugin
 
     def test_authenticated_api_and_initial_form_use_full_search(self):
@@ -91,7 +92,7 @@ class RecordSearchTests(unittest.TestCase):
             self.assertEqual(model[f"_records_{scope}_total"], 251)
         plugin.stop_service = Mock()
         plugin.update_config = Mock(return_value=True)
-        plugin.init_plugin({**model, "enabled": False})
+        plugin._initialize({**model, "enabled": False})
         saved = plugin.update_config.call_args.args[0]
         self.assertFalse(any(k.startswith("_records_") for k in saved))
         self.assertEqual(saved["history_ids"], [])

@@ -127,6 +127,106 @@ class MoviePilotTests(unittest.TestCase):
         self.h.close()
         self.temp.cleanup()
 
+    def test_reloaded_entry_shares_engine_and_ignores_old_instance_stop(self):
+        import sys
+        import types
+        old = self.attach_plugin_notifier()
+        old.get_data_path = Mock(return_value=self.root / "plugin")
+        old._engine = self.engine
+        old._runtime.owner = old
+        sys.modules.pop("instantwait_test.lifecycle", None)
+        new = self.attach_plugin_notifier()
+        new.get_data_path = old.get_data_path
+        with patch.dict(sys.modules, {"version": types.SimpleNamespace(APP_VERSION="v2.15.6")}), \
+                patch.object(threading.Thread, "start", lambda _: None):
+            new.init_plugin({"enabled": True})
+        self.engine = new._engine
+        old.stop_service()
+        self.assertIs(old._engine, new._engine)
+        self.assertTrue(old.get_state())
+        self.assertFalse(new._error)
+        self.assertEqual(len(self.engine.patches), 4)
+
+    def test_stop_preserves_hooks_until_native_callback_exits(self):
+        entered, release = threading.Event(), threading.Event()
+        path = self.root / "native.mkv"
+        path.write_bytes(b"video")
+        task = self.h.task(path, target="local", mode="copy")
+        task.target_path = self.root / "library"
+        task.target_directory.library_path = str(task.target_path)
+
+        def callback(task, info):
+            entered.set()
+            release.wait(3)
+            return info.success, info.message
+
+        thread = threading.Thread(target=self.h.chain._TransferChain__handle_transfer,
+                                  args=(task, callback))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertEqual(self.engine.native_active, 1)
+            self.assertFalse(self.engine.stop(timeout=0))
+            self.assertEqual(len(self.engine.patches), 4)
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(self.engine.stop(timeout=0))
+        self.assertFalse(self.engine.patches)
+
+    def test_cached_old_handler_delegates_after_hooks_are_removed(self):
+        old = self.h.chain._TransferChain__handle_transfer
+        self.engine.stop()
+        with patch.object(self.h.Chain, "_TransferChain__handle_transfer", return_value=(False, "current")) as current:
+            self.assertEqual(old("task"), (False, "current"))
+        current.assert_called_once_with(self.h.chain, "task", None)
+
+    def test_update_waits_for_real_native_callback_then_restarts_automatically(self):
+        import sys
+        import types
+        old = self.attach_plugin_notifier()
+        old._engine = self.engine
+        old._runtime.owner = old
+        new = self.attach_plugin_notifier()
+        new.get_data_path = Mock(return_value=self.root / "plugin")
+        entered, release = threading.Event(), threading.Event()
+        path = self.root / "updating.mkv"
+        path.write_bytes(b"video")
+        task = self.h.task(path, target="local", mode="copy")
+        task.target_path = self.root / "library"
+        task.target_directory.library_path = str(task.target_path)
+
+        def callback(task, info):
+            entered.set()
+            release.wait(3)
+            return info.success, info.message
+
+        thread = threading.Thread(target=self.h.chain._TransferChain__handle_transfer,
+                                  args=(task, callback))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            with patch.dict(sys.modules, {"version": types.SimpleNamespace(APP_VERSION="v2.15.6")}), \
+                    patch.object(self.h.bridge.InstantWaitEngine, "run", lambda *a, **kw: None):
+                new.init_plugin({"enabled": True, "max_retries": 7})
+                self.assertTrue(new._notice)
+                self.assertFalse(new.get_state())
+                waiter = new._runtime.thread
+                release.set()
+                thread.join(3)
+                waiter.join(3)
+                self.assertFalse(waiter.is_alive())
+            self.engine = new._engine
+            self.assertTrue(old.get_state())
+            self.assertEqual(self.engine.config["max_retries"], 7)
+            self.assertFalse(new._notice or new._error)
+            old.stop_service()
+            self.assertTrue(new.get_state())
+        finally:
+            release.set()
+            thread.join(3)
+
     def enroll(self, name="A.mkv", mode="copy", target="u115", download_hash=None):
         path = self.root / name
         path.write_bytes(b"test video content")
@@ -171,6 +271,7 @@ class MoviePilotTests(unittest.TestCase):
                 patch.object(self.h.schemas, "NotificationType", ns["NotificationType"], create=True):
             spec.loader.exec_module(entry)
         plugin = entry.P115InstantWait()
+        plugin._registered_plugin = Mock(return_value=None)
         plugin.systemmessage, plugin.chain = Mock(), Mock()
         self.engine.notify = plugin._notify
         plugin.get_data = Mock(return_value=None)

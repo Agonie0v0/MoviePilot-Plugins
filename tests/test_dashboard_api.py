@@ -1,6 +1,8 @@
 """Exercise the real dashboard endpoint without importing the MoviePilot host."""
 import ast
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
@@ -21,6 +23,8 @@ class DashboardApiTests(unittest.TestCase):
         namespace = {"Body": Body, "HTTPException": HTTPException, "logger": Mock()}
         exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
         self.plugin = namespace[cls.name]()
+        self.plugin._runtime = SimpleNamespace(lock=threading.RLock())
+        self.plugin._notice = ""
         self.plugin.list_tasks = self.plugin.control_task = self.plugin.search_records = Mock()
         self.plugin._engine = Mock()
         self.plugin._engine.stop_event.is_set.return_value = False

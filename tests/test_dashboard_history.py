@@ -65,6 +65,7 @@ class DashboardHistoryTests(unittest.TestCase):
         plugin = namespace[cls.name]()
         plugin.queue, plugin.get_state, plugin.get_data = lambda: self.db, lambda: False, lambda key: None
         plugin._error, plugin._engine = "", None
+        plugin._notice = ""
         self.assertEqual(len(plugin.list_tasks()), 50)
         self.assertEqual(plugin.get_page(), "page")
         args, kwargs = namespace["task_page"].call_args

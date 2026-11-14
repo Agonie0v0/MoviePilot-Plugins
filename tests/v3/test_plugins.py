@@ -388,6 +388,92 @@ def test_uninstall_restores_inherited_native_gate(h, task):
     assert h.finish_calls == [task.admission_task_id]
 
 
+def test_reloaded_entry_shares_engine_and_ignores_old_instance_stop(h):
+    old = h.plugin.P115InstantWait()
+    old._registered_plugin = Mock(return_value=None)
+    old._engine = h.engine
+    old._runtime.owner = old
+    p = load_plugin("p115instantwait")
+    # This test exercises entry reload; use the already isolated V3 host adapter.
+    p.InstantWaitEngine = h.bridge.InstantWaitEngine
+    new = p.P115InstantWait()
+    new.get_data_path = lambda: h.directory
+    new.init_plugin({"enabled": True})
+    h.engine = new._engine
+    old.stop_service()
+    assert old._engine is new._engine
+    assert old.get_state() and not new._error
+    assert len(h.engine.patches) == 6
+
+
+def test_stop_preserves_hooks_until_native_callback_exits(h, task):
+    entered, release = threading.Event(), threading.Event()
+
+    def callback(task, info):
+        entered.set()
+        release.wait(3)
+        return info.success, info.message
+
+    thread = threading.Thread(target=h.engine.chain._TransferChain__handle_transfer,
+                              args=(task, callback))
+    thread.start()
+    try:
+        assert entered.wait(3)
+        assert h.engine.native_active == 1
+        assert h.engine.stop(timeout=0) is False
+        assert len(h.engine.patches) == 6
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive()
+    assert h.engine.stop(timeout=0) is True
+    assert not h.engine.patches
+
+
+def test_cached_old_handler_delegates_after_hooks_are_removed(h):
+    old = h.engine.chain._TransferChain__handle_transfer
+    h.engine.stop()
+    with patch.object(h.Chain, "_TransferChain__handle_transfer", return_value=(False, "current")) as current:
+        assert old("task") == (False, "current")
+    current.assert_called_once_with(h.engine.chain, "task", None)
+
+
+def test_update_waits_for_real_native_callback_then_restarts_automatically(h, task):
+    old = h.plugin.P115InstantWait()
+    old._registered_plugin = Mock(return_value=None)
+    old._engine = h.engine
+    old._runtime.owner = old
+    new = h.plugin.P115InstantWait()
+    new.get_data_path = lambda: h.directory
+    entered, release = threading.Event(), threading.Event()
+
+    def callback(task, info):
+        entered.set()
+        release.wait(3)
+        return info.success, info.message
+
+    thread = threading.Thread(target=h.engine.chain._TransferChain__handle_transfer,
+                              args=(task, callback))
+    thread.start()
+    try:
+        assert entered.wait(3)
+        new.init_plugin({"enabled": True, "max_retries": 7})
+        assert new._notice and not new.get_state()
+        waiter = new._runtime.thread
+        release.set()
+        thread.join(3)
+        waiter.join(3)
+        assert not waiter.is_alive()
+        h.engine = new._engine
+        assert old.get_state() and h.engine.config["max_retries"] == 7
+        assert not new._notice and not new._error
+        old.stop_service()
+        assert new.get_state()
+    finally:
+        release.set()
+        thread.join(3)
+
+
 def test_api_response_models_preserve_reads_and_wrap_page_actions(h, task):
     row = h.enter(task)
     plugin = h.plugin.P115InstantWait()

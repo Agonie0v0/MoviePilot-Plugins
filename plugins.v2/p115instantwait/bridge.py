@@ -99,6 +99,9 @@ class InstantWaitEngine:
         self.worker = None
         self.upload_worker = None
         self.upload_wake = threading.Event()
+        self.runtime_lock = threading.RLock()
+        self.native_lock = threading.Condition()
+        self.native_active = 0
         self.extensions = {ext.strip().lower().lstrip(".") for ext in config["extensions"].split(",") if ext.strip()}
 
     def log_task(self, row, event, level="info", **details):
@@ -166,7 +169,7 @@ class InstantWaitEngine:
         handle = getattr(TransferChain, "_TransferChain__handle_transfer")
         engine = self
 
-        def wrapped_handle(chain, task, callback=None):
+        def handle_task(chain, task, callback=None):
             previous = getattr(engine.context, "task", None)
             engine.context.task = task
             engine.context.deferred = None
@@ -191,6 +194,24 @@ class InstantWaitEngine:
                     engine.wake.set()
                 engine.context.task = previous
                 engine.context.deferred = None
+
+        def wrapped_handle(chain, task, callback=None):
+            with engine.native_lock:
+                stopping = engine.stop_event.is_set()
+                if stopping:
+                    engine.native_lock.wait_for(lambda: not engine.patches)
+                else:
+                    engine.native_active += 1
+            if stopping:
+                with engine.runtime_lock:
+                    current = getattr(TransferChain, "_TransferChain__handle_transfer")
+                return current(chain, task, callback)
+            try:
+                return handle_task(chain, task, callback)
+            finally:
+                with engine.native_lock:
+                    engine.native_active -= 1
+                    engine.native_lock.notify_all()
 
         signature = inspect.signature(transfer)
 
@@ -313,17 +334,24 @@ class InstantWaitEngine:
                     delattr(cls, name)
         self.patches.clear()
 
-    def stop(self):
+    def stop(self, timeout=35):
         self.stop_event.set()
         self.wake.set()
         self.upload_wake.set()
-        deadline = time.monotonic() + 35
+        deadline = time.monotonic() + timeout
         for worker in (self.worker, self.upload_worker):
             if worker and worker.ident is not None:
                 worker.join(timeout=max(0, deadline - time.monotonic()))
             if worker and worker.is_alive():
-                raise RuntimeError("后台请求仍在结束，暂不能重新初始化插件")
+                return False
+        with self.native_lock:
+            if not self.native_lock.wait_for(lambda: not self.native_active,
+                                             timeout=max(0, deadline - time.monotonic())):
+                return False
         self.uninstall()
+        with self.native_lock:
+            self.native_lock.notify_all()
+        return True
 
     def waiting_view(self, task):
         # "waiting" is already a nonterminal MP JobManager state; it holds no execution lease.

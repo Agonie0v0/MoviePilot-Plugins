@@ -8,7 +8,8 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
 
-from .bridge import InstantWaitEngine
+from .bridge import InstantWaitEngine, TransferChain
+from .lifecycle import RuntimePlugin, shared_runtime
 from .store import QueueStore
 from .records import task_record
 from .ui import config_form, task_page, record_choices, record_search_model
@@ -34,7 +35,7 @@ DEFAULTS = {
 }
 
 
-class P115InstantWait(_PluginBase):
+class P115InstantWait(RuntimePlugin, _PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
@@ -47,12 +48,18 @@ class P115InstantWait(_PluginBase):
 
     def __init__(self):
         super().__init__()
-        self._engine = None
-        self._config = dict(DEFAULTS)
-        self._error = ""
+        self._runtime = shared_runtime(TransferChain, type(self).__name__, DEFAULTS, logger)
+        self._ticket = self._runtime.register(self._code_revision)
+        self._initialized = False
 
     def init_plugin(self, config=None):
-        self.stop_service()
+        self._runtime.configure(self, config)
+
+    def _registered_plugin(self):
+        from app.core.plugin import PluginManager
+        return PluginManager().running_plugins.get(type(self).__name__)
+
+    def _initialize(self, config=None):
         self._config = {**DEFAULTS, **{k: v for k, v in (config or {}).items() if not k.startswith("_records_")}}
         self._error = ""
         apply_action = self._config["apply_action"]
@@ -100,8 +107,9 @@ class P115InstantWait(_PluginBase):
                 raise ValueError("请配置需要接管的文件扩展名")
             runtime = {**self._config, "max_wait_hours": hours, "max_retries": int(retries), "retry_delays": delays}
             engine = InstantWaitEngine(self.get_data_path(), runtime, self._notify)
-            engine.install(before_start=(lambda: self._apply_actions(engine, selected, self._config["action"])) if apply_action else None)
+            engine.runtime_lock = self._runtime.lock
             self._engine = engine
+            engine.install(before_start=(lambda: self._apply_actions(engine, selected, self._config["action"])) if apply_action else None)
         except Exception as exc:
             self._error = str(exc)
             logger.error(f"【115秒传等待】{self._error}")
@@ -144,7 +152,8 @@ class P115InstantWait(_PluginBase):
         return True
 
     def get_state(self):
-        return bool(self._engine and not self._engine.stop_event.is_set())
+        engine = self._engine
+        return bool(engine and not engine.stop_event.is_set())
 
     @staticmethod
     def get_command():
@@ -163,7 +172,8 @@ class P115InstantWait(_PluginBase):
         ]
 
     def queue(self):
-        return self._engine.store if self._engine else QueueStore(Path(self.get_data_path()) / "queue.db")
+        engine = self._engine
+        return engine.store if engine else QueueStore(Path(self.get_data_path()) / "queue.db")
 
     def list_tasks(self):
         return [task_record(row) for row in self.queue().all(limit=50)]
@@ -177,51 +187,49 @@ class P115InstantWait(_PluginBase):
             "items": record_choices([task_record(row) for row in result["rows"]])}
 
     def control_task(self, task_id: str, action: str):
-        if not self.get_state():
-            raise HTTPException(status_code=409, detail="请先启用插件")
-        if action not in ("pause", "resume", "cancel", "upload"):
-            raise HTTPException(status_code=400, detail="不支持此操作")
-        try:
-            row = self._engine.control(task_id, action)
-            return {"success": True, "state": row["state"]}
-        except KeyError:
-            raise HTTPException(status_code=404, detail="任务不存在") from None
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from None
+        with self._runtime.lock:
+            if not self.get_state():
+                raise HTTPException(status_code=409, detail=self._notice or "请先启用插件")
+            if action not in ("pause", "resume", "cancel", "upload"):
+                raise HTTPException(status_code=400, detail="不支持此操作")
+            try:
+                row = self._engine.control(task_id, action)
+                return {"success": True, "state": row["state"]}
+            except KeyError:
+                raise HTTPException(status_code=404, detail="任务不存在") from None
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
 
     def get_form(self):
         model = {**DEFAULTS, "task_ids": [], "history_ids": []}
         for scope in ("tasks", "history"):
             model.update(record_search_model(scope, self.search_records(scope=scope)))
         return config_form([], self._error, self.get_data("last_batch_result"),
-                           history_result=self.get_data("last_history_cleanup")), model
+                           history_result=self.get_data("last_history_cleanup"), notice=self._notice), model
 
     def control_batch(self, action: str, keys: list[str] = Body(..., embed=True)):
-        if not self.get_state():
-            raise HTTPException(status_code=409, detail="请先启用插件")
-        if action not in ("resume", "upload"):
-            raise HTTPException(status_code=400, detail="不支持此批量操作")
-        try:
-            # IDs are the reviewed page snapshot, never an open-ended 'all'.
-            # control_many validates the list and rechecks each current state.
-            result = self._engine.control_many(keys, action)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
-        try:
-            self.save_data("last_batch_result", result)
-        except Exception:
-            logger.warning("【115秒传等待】批量操作结果保存失败，请核对队列状态与日志")
-            self._error = "批量操作已提交，但结果未能保存；请核对任务状态与日志。"
-            result["notice"] = self._error
-        return result
+        with self._runtime.lock:
+            if not self.get_state():
+                raise HTTPException(status_code=409, detail=self._notice or "请先启用插件")
+            if action not in ("resume", "upload"):
+                raise HTTPException(status_code=400, detail="不支持此批量操作")
+            try:
+                # IDs are the reviewed page snapshot, never an open-ended 'all'.
+                # control_many validates the list and rechecks each current state.
+                result = self._engine.control_many(keys, action)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            try:
+                self.save_data("last_batch_result", result)
+            except Exception:
+                logger.warning("【115秒传等待】批量操作结果保存失败，请核对队列状态与日志")
+                self._error = "批量操作已提交，但结果未能保存；请核对任务状态与日志。"
+                result["notice"] = self._error
+            return result
 
     def get_page(self):
+        engine = self._engine
         rows, summary = self.queue().dashboard()
         return task_page([task_record(row) for row in rows], self.get_state(), self._error, summary=summary,
-                         max_retries=int(self._engine.config["max_retries"]) if self._engine else None,
-                         batch_result=self.get_data("last_batch_result"))
-
-    def stop_service(self):
-        if self._engine:
-            self._engine.stop()
-            self._engine = None
+                         max_retries=int(engine.config["max_retries"]) if engine else None,
+                         batch_result=self.get_data("last_batch_result"), notice=self._notice)
