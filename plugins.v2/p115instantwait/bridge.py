@@ -22,7 +22,7 @@ from app.schemas.types import MediaType, SystemConfigKey
 
 from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited,
                      RetryLater, fingerprint, hash_file, prepare_direct, NativePlanStorage,
-                     apply_native_deletions, cooldown_until)
+                     apply_native_deletions, cooldown_until, check_source, resolve_target)
 from .store import QueueStore
 
 
@@ -99,6 +99,9 @@ class InstantWaitEngine:
         self.worker = None
         self.upload_worker = None
         self.upload_wake = threading.Event()
+        self.runtime_lock = threading.RLock()
+        self.native_lock = threading.Condition()
+        self.native_active = 0
         self.extensions = {ext.strip().lower().lstrip(".") for ext in config["extensions"].split(",") if ext.strip()}
 
     def log_task(self, row, event, level="info", **details):
@@ -166,7 +169,7 @@ class InstantWaitEngine:
         handle = getattr(TransferChain, "_TransferChain__handle_transfer")
         engine = self
 
-        def wrapped_handle(chain, task, callback=None):
+        def handle_task(chain, task, callback=None):
             previous = getattr(engine.context, "task", None)
             engine.context.task = task
             engine.context.deferred = None
@@ -191,6 +194,24 @@ class InstantWaitEngine:
                     engine.wake.set()
                 engine.context.task = previous
                 engine.context.deferred = None
+
+        def wrapped_handle(chain, task, callback=None):
+            with engine.native_lock:
+                stopping = engine.stop_event.is_set()
+                if stopping:
+                    engine.native_lock.wait_for(lambda: not engine.patches)
+                else:
+                    engine.native_active += 1
+            if stopping:
+                with engine.runtime_lock:
+                    current = getattr(TransferChain, "_TransferChain__handle_transfer")
+                return current(chain, task, callback)
+            try:
+                return handle_task(chain, task, callback)
+            finally:
+                with engine.native_lock:
+                    engine.native_active -= 1
+                    engine.native_lock.notify_all()
 
         signature = inspect.signature(transfer)
 
@@ -313,17 +334,24 @@ class InstantWaitEngine:
                     delattr(cls, name)
         self.patches.clear()
 
-    def stop(self):
+    def stop(self, timeout=35):
         self.stop_event.set()
         self.wake.set()
         self.upload_wake.set()
-        deadline = time.monotonic() + 35
+        deadline = time.monotonic() + timeout
         for worker in (self.worker, self.upload_worker):
             if worker and worker.ident is not None:
                 worker.join(timeout=max(0, deadline - time.monotonic()))
             if worker and worker.is_alive():
-                raise RuntimeError("后台请求仍在结束，暂不能重新初始化插件")
+                return False
+        with self.native_lock:
+            if not self.native_lock.wait_for(lambda: not self.native_active,
+                                             timeout=max(0, deadline - time.monotonic())):
+                return False
         self.uninstall()
+        with self.native_lock:
+            self.native_lock.notify_all()
+        return True
 
     def waiting_view(self, task):
         # "waiting" is already a nonterminal MP JobManager state; it holds no execution lease.
@@ -364,7 +392,7 @@ class InstantWaitEngine:
             history.update(oper._db, {"errmsg": message})
 
     def restore(self):
-        self.store.recover()
+        self.store.recover(automatic_upload=self.config.get("limit_action") == "upload")
         rows = self.store.all(active=True, limit=100000)
         # Restore all unfinished peers before running any completion callback.
         for row in rows:
@@ -447,10 +475,16 @@ class InstantWaitEngine:
                 self.log_task(row, "恢复整理结果", 说明="核对远端后继续原记录回写")
                 info = TransferInfo.model_validate(payload["result"])
                 api = OpenAPI(U115Pan(), FileItem, self.stop_event)
-                visible = api.raw_path(info.target_item.path)
-                if not visible or str(visible.get("file_id")) != str(payload["remote_id"]):
-                    raise PauseTask("已上传的目标文件被删除或替换，请人工核对")
-                api.verify(payload["remote_id"], info.target_item.path, payload["hashes"])
+                item = resolve_target(api, payload)
+                if not item:
+                    path = Path(task.fileitem.path)
+                    if not path.exists():
+                        raise RetryLater("目标暂不可见，稍后继续整理")
+                    payload["source_initial"] = check_source(path, payload["source_initial"], self.stop_event, payload["hashes"])
+                    item = prepare_direct(api, self.store, row, path, payload, manual,
+                                          lambda event: self.log_task(row, event))
+                info.target_item = item
+                self.store.update(key, payload=payload)
                 self.complete(row, task, info, api)
                 return
             limit = self.config["max_wait_hours"] * 3600
@@ -464,10 +498,7 @@ class InstantWaitEngine:
                 self.defer(row, "waiting", "等待超过设定期限" if expired else "自动重试次数已用完", limit_reached=True)
                 return
             path = Path(task.fileitem.path)
-            if not path.is_file():
-                raise PauseTask("源文件不存在，已暂停")
-            if fingerprint(path) != payload["source_initial"]:
-                raise PauseTask("源文件在等待期间发生变化，已暂停")
+            payload["source_initial"] = check_source(path, payload["source_initial"], self.stop_event, payload.get("hashes"))
             if not payload.get("hashes"):
                 self.log_task(row, "开始计算文件哈希")
                 payload["hashes"] = hash_file(path, self.stop_event)
@@ -492,7 +523,6 @@ class InstantWaitEngine:
             apply_native_deletions(api, self.store, row, FileItem)
             item = prepare_direct(api, self.store, row, path, payload, manual,
                                   lambda event: self.log_task(row, event))
-            file_id = item.fileid
             proxy = DirectStorage(api, self.store, row, str(final), item, payload["hashes"])
             args = task_kwargs(task)
             args.update(source_oper=DeferredSource(LocalStorage()), target_oper=proxy, preview=False)
@@ -504,11 +534,10 @@ class InstantWaitEngine:
                 info = info or TransferInfo(success=False, message="MP 未返回整理结果")
                 self.finish_failure(row, task, info)
                 return
-            if not info.target_item or str(info.target_item.fileid) != str(file_id):
-                raise PauseTask("MP 整理结果与秒传远端文件不一致")
-            api.verify(file_id, info.target_item.path, payload["hashes"])
-            # Persist the complete MP result before the native callback (or any cleanup).
             payload = self.store.get(key)["payload"]
+            if not info.target_item or str(info.target_item.fileid) != str(payload["remote_id"]):
+                raise PauseTask("MP 整理结果与秒传远端文件不一致")
+            # Persist the complete MP result before the native callback (or any cleanup).
             payload["result"] = info.model_dump(mode="json")
             self.store.update(key, payload=payload)
             self.complete(self.store.get(key), task, info, api)
@@ -519,6 +548,8 @@ class InstantWaitEngine:
             current_attempts = max(0, current["attempts"] - 1)
             if not manual:
                 data["auto_attempts"] = max(0, data.get("auto_attempts", 1) - 1)
+            else:
+                data["upload_attempts"] = max(0, data.get("upload_attempts", 1) - 1)
             state = "upload_queued" if manual else "waiting"
             message = str(error) + "；冷却结束后自动继续"
             self.store.update(key, state=state, attempts=current_attempts, payload=data,
@@ -543,10 +574,14 @@ class InstantWaitEngine:
         payload = self.store.get(row["id"])["payload"]
         limit = self.config["max_wait_hours"] * 3600
         deadline = payload.get("wait_since", row["created"]) + limit if limit else None
+        upload_retry = False
         if row["state"] == "uploading":
-            state = "paused"
-            source = "自动强制上传" if payload.get("upload_origin") == "limit" else "手动强制上传"
-            reason = f"{source}未完成：{reason}；可再次点强制上传核对并继续"
+            upload_retry = state == "waiting" and payload.get("upload_attempts", 1) <= self.config.get("max_retries", 3)
+            if self.stop_event.is_set():
+                upload_retry = payload.get("upload_origin") == "limit" and self.config.get("limit_action") == "upload"
+                payload["upload_attempts"] = max(0, payload.get("upload_attempts", 1) - 1)
+            state = "upload_queued" if upload_retry else "paused"
+            reason = f"上传暂未完成：{reason}" if upload_retry else f"上传已暂停：{reason}"
         elif state == "waiting":
             reached = ("等待超过设定期限" if deadline and now >= deadline else
                        "自动重试次数已用完" if payload.get("auto_attempts", row["attempts"]) >= self.config.get("max_retries", 3) + 1 else None)
@@ -555,11 +590,13 @@ class InstantWaitEngine:
                 reason = f"{reached or reason}，{'已安排自动强制上传' if state == 'upload_queued' else '请手动处理'}。最后结果：{reason}"
                 if state == "upload_queued":
                     payload["upload_origin"] = "limit"
+                    payload["upload_attempts"] = 0
         delays = self.config["retry_delays"]
-        base = delays[min(max(0, row["payload"].get("auto_attempts", row["attempts"]) - 1), len(delays) - 1)]
+        count = payload.get("upload_attempts", 1) if row["state"] == "uploading" else payload.get("auto_attempts", row["attempts"])
+        base = delays[min(max(0, count - 1), len(delays) - 1)]
         delay = base * random.uniform(0.9, 1.1)
         next_at = min(now + delay, deadline) if deadline and state == "waiting" else now + delay
-        if state == "upload_queued":
+        if state == "upload_queued" and not upload_retry:
             next_at = now
         message = (f"等待秒传：{reason}" if state == "waiting" else
                    f"等待强制上传：{reason}" if state == "upload_queued" else f"秒传等待已暂停：{reason}")
@@ -571,12 +608,13 @@ class InstantWaitEngine:
         self.store.update(row["id"], state=state, next_at=next_at, message=message, payload=payload)
         # Use the published snapshot: the upload worker may already have claimed it.
         saved = {**row, "state": state, "next_at": next_at, "message": message, "payload": payload}
-        self.log_task(saved, "等待下次重试" if state == "waiting" else "达到上限，转上传队列" if state == "upload_queued" else "任务暂停",
+        self.log_task(saved, "等待上传重试" if upload_retry else "等待下次重试" if state == "waiting" else "达到上限，转上传队列" if state == "upload_queued" else "任务暂停",
                       level="warning" if state == "paused" else "info", 原因=reason,
-                      下次重试=log_time(saved["next_at"]) if state == "waiting" else "无，等待上传调度" if state == "upload_queued" else "无，等待手动处理",
+                      下次重试=log_time(saved["next_at"]) if state == "waiting" or upload_retry else "无，等待上传调度" if state == "upload_queued" else "无，等待手动处理",
                       **({"间隔秒": round(next_at - now)} if state == "waiting" else {}))
         if state == "upload_queued":
-            self.notify_task(saved, manual=False)
+            if not upload_retry:
+                self.notify_task(saved, manual=False)
             self.upload_wake.set()
         elif state == "paused" and previous_state != "paused":
             self.notify_task(saved)
@@ -588,15 +626,16 @@ class InstantWaitEngine:
         # Native move removes the source before the success callback checks
         # whether any torrent media files still exist. Keep that ordering.
         path = Path(task.fileitem.path)
-        if path.exists() and fingerprint(path) != row["payload"]["source_initial"]:
-            raise PauseTask("源文件在完成确认前发生变化，已停止回写与清理")
+        data = row["payload"]
+        item = resolve_target(api, data)
+        if not item:
+            raise RetryLater("目标暂不可见，稍后继续整理")
+        info.target_item = item
+        if path.exists():
+            data["source_initial"] = check_source(path, data["source_initial"], self.stop_event, data["hashes"])
+        data["result"] = info.model_dump(mode="json")
+        self.store.update(key, payload=data)
         if task.transfer_type == "move" and path.exists():
-            visible = api.raw_path(info.target_item.path)
-            if not visible or str(visible.get("file_id")) != str(row["payload"]["remote_id"]):
-                raise PauseTask("源文件清理前远端目标被删除或替换，已暂停")
-            api.verify(row["payload"]["remote_id"], info.target_item.path, row["payload"]["hashes"])
-            if fingerprint(path) != row["payload"]["source_initial"]:
-                raise PauseTask("源文件在远端确认期间发生变化，已停止清理")
             LocalStorage().delete(task.fileitem)
             if path.exists():
                 raise RetryLater("远端已确认，等待移动模式源文件清理完成")

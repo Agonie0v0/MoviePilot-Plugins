@@ -18,6 +18,19 @@ def walk(nodes):
 
 
 class TaskActionTests(unittest.TestCase):
+    def test_update_notice_disables_actions_without_showing_plugin_error(self):
+        from tests.test_records import modules
+        task = dict(id="task", history_id=1, source="/film.mkv", target="/library/film.mkv",
+                    state="paused", attempts=1, next_at=0, message="等待处理")
+        for generation in ("v2", "v3"):
+            with self.subTest(generation=generation):
+                _, _, page_ui = modules(generation)
+                nodes = list(walk(page_ui.task_page([task], False, notice="等待任务结束后自动更新。")))
+                self.assertTrue(any(n.get("props", {}).get("role") == "status" for n in nodes))
+                self.assertFalse(any(n.get("props", {}).get("type") == "error" for n in nodes))
+                self.assertFalse(any(n.get("events", {}).get("click", {}).get("method") == "POST" for n in nodes))
+                self.assertFalse(any(n.get("text") == "插件已关闭" for n in nodes))
+
     def test_controls_match_queue_permissions_and_keep_reading_side_effect_free(self):
         expected = {"queued": {"pause", "upload", "cancel"}, "waiting": {"pause", "upload", "cancel"},
                     "paused": {"resume", "upload", "cancel"}, "upload_queued": {"pause", "cancel"},

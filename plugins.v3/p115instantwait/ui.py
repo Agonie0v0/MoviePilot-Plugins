@@ -497,7 +497,7 @@ def record_search_controls(scope):
     ]
 
 
-def config_form(tasks, error="", batch_result=None, history_result=None):
+def config_form(tasks, error="", batch_result=None, history_result=None, notice=""):
     content = [node("style", STYLES),
         box([box([icon("mdi-cloud-clock-outline", size=26)], "p115-brand-icon"),
              box([paragraph("115 秒传等待 / 参数设置", **{"class": "p115-eyebrow"}),
@@ -506,6 +506,8 @@ def config_form(tasks, error="", batch_result=None, history_result=None):
                             **{"class": "p115-copy p115-muted mt-2"})], "p115-header-main")], "p115-header"),
         box([toggle("enabled", "启用秒传等待", "后台处理视频，其他整理照常进行。"),
              toggle("notify", "推送任务通知", "首次等待、达到上限或异常时通知。")], "p115-switches")]
+    if notice:
+        content.append(node("VAlert", notice, type="info", variant="tonal", **{"class": "mb-4", "role": "status"}))
     if error:
         content.append(node("VAlert", error, title="插件需要检查", type="error", variant="tonal",
                             **{"class": "mb-5", "role": "alert"}))
@@ -690,10 +692,12 @@ def categories(task):
     return "attention" if state == "paused" else "ended"
 
 
-def task_row(task, enabled, now, max_retries):
+def task_row(task, enabled, now, max_retries, notice=""):
     status = task["state"]
     tone_key, icon_name = TONES.get(status, ("secondary", "mdi-file-video-outline"))
     label, value, tone = schedule_summary(task, enabled, now)
+    if notice and status in ACTIVE:
+        label, value, tone = "后续安排", "等待更新完成", "secondary"
     auto = task.get("auto_attempts", task["attempts"])
     budget = (f"自动尝试 {auto}/{max_retries + 1} 次"
               if max_retries is not None and status in ACTIVE else f"自动尝试 {auto} 次")
@@ -727,7 +731,7 @@ def task_row(task, enabled, now, max_retries):
     if status in ("running", "uploading", "finalizing"):
         details.append(paragraph("本轮执行中，结束后刷新查看结果。", **{"class": "p115-hint mb-3"}))
     elif status in ACTIVE and not enabled:
-        details.append(paragraph("请在配置页启用插件后继续处理。", **{"class": "p115-hint mb-3"}))
+        details.append(paragraph("更新完成后可继续操作。" if notice else "请在配置页启用插件后继续处理。", **{"class": "p115-hint mb-3"}))
     if status == "failed":
         details.append(paragraph("请根据失败原因，在 MP 重新发起整理。", **{"class": "p115-hint mb-3"}))
     path_cards = []
@@ -801,7 +805,7 @@ def bulk_tools(tasks, enabled):
     return disclosure("批量操作与记录管理", children, "mdi-playlist-edit")
 
 
-def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, summary=None):
+def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, summary=None, notice=""):
     now = time.time()
     refresh = node("VBtn", "刷新", variant="outlined", size="small",
                    **{"prepend-icon": "mdi-refresh", "class": "p115-refresh-btn", "style": "min-height:40px", "aria-label": "刷新任务状态"})
@@ -812,13 +816,15 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
         box([icon("mdi-cloud-clock-outline", size=26)], "p115-brand-icon"),
         box([paragraph("115 秒传等待 / 任务监控", **{"class": "p115-eyebrow"}),
              box([node("h2", "任务监控"),
-                  status_chip("running" if enabled else "cancelled", "后台运行中" if enabled else "插件已关闭")], "p115-heading")],
+                  status_chip("running" if enabled else "cancelled", "后台运行中" if enabled else "等待任务结束" if notice else "插件已关闭")], "p115-heading")],
             "p115-header-main"), refresh,
     ], "p115-header")]
+    if notice:
+        content.append(node("VAlert", notice, type="info", variant="tonal", **{"class": "mb-4", "role": "status"}))
     if error:
         content.append(node("VAlert", error, title="插件需要检查", type="error", variant="tonal",
                             **{"class": "mb-4", "role": "alert"}))
-    if not enabled:
+    if not enabled and not notice:
         content.append(node("VAlert", "请在配置页启用插件；关闭期间队列不会自动重试。",
                             type="info", variant="tonal", **{"class": "mb-4"}))
     groups = {group: [t for t in tasks if group in categories(t).split()]
@@ -866,7 +872,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
         rank = {"paused": 0, "failed": 1, "running": 2, "uploading": 2, "finalizing": 2, "upload_queued": 3, "queued": 4, "waiting": 4}
         ordered = sorted(tasks, key=lambda t: (rank.get(t["state"], 5),
                          t.get("next_at") or 0 if t["state"] in ("waiting", "queued") else -(t.get("updated") or 0)))
-        content.append(box([task_row(t, enabled, now, max_retries) for t in ordered], "p115-list", role="list",
+        content.append(box([task_row(t, enabled, now, max_retries, notice) for t in ordered], "p115-list", role="list",
                            **{"aria-label": "任务列表"}))
         empty_copy = {"waiting": "暂无等待任务", "attention": "没有需要处理的任务", "transfer": "暂无执行或上传任务", "ended": "暂无已结束记录"}
         for group, title in empty_copy.items():

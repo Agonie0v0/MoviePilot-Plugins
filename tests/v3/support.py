@@ -280,6 +280,7 @@ class Runner:
 
 class Fake115:
     def __init__(self, h):
+        self.stop = threading.Event()
         self.h, self.files, self.hit = h, {}, False
         self.hashes, self.folders, self.moves = {}, [], []
         self.deletes = []
@@ -309,7 +310,7 @@ class Fake115:
             raise self.h.remote.PauseTask("大小错误")
         return item.model_copy(update={"path": str(path)})
     def raw_id(self, file_id):
-        return {"sha1": self.hashes.get(str(file_id))}
+        return {"sha1": self.hashes.get(str(file_id))} if str(file_id) in self.files else None
 
     def instant(self, path, folder, name, hashes):
         self.inits += 1

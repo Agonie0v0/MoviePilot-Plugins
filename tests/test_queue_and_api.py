@@ -110,6 +110,17 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(self.db.claim())
         self.assertIsNone(self.db.claim(manual=True))
 
+    def test_automatic_upload_recovers_only_when_enabled_and_keeps_user_pause(self):
+        for state, enabled, expected in (("uploading", True, "upload_queued"),
+                                         ("uploading", False, "paused"), ("paused", True, "paused")):
+            with self.subTest(state=state, enabled=enabled):
+                row, _ = self.db.enqueue(f"{state}-{enabled}", {"upload_origin": "limit", "upload_session": {"parts": [1]}})
+                self.db.update(row["id"], state=state)
+                self.db.recover(automatic_upload=enabled)
+                recovered = self.db.get(row["id"])
+                self.assertEqual(recovered["state"], expected)
+                self.assertEqual(recovered["payload"]["upload_session"]["parts"], [1])
+
     def test_resume_resets_only_auto_counter_and_manual_claim_does_not_increment_it(self):
         row, _ = self.db.enqueue("A", {"auto_attempts": 4})
         self.db.update(row["id"], ready=1, attempts=7)
@@ -123,6 +134,8 @@ class QueueTests(unittest.TestCase):
 
 class APITests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(remote, "_COOLDOWN_UNTIL", 0))
+        self.enterContext(patch.dict(remote._PATH_CACHE, clear=True))
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "A.mkv"
         self.path.write_bytes(b"test movie content")
@@ -210,6 +223,7 @@ class APITests(unittest.TestCase):
         for status, body in ((429, {}), (200, {"state": False, "code": 123,
                                                "message": "已达到当前访问上限"})):
             self.backend._limit_until = 0
+            remote._COOLDOWN_UNTIL = 0
             api = self.api([(status, body)])
             before = len(self.calls)
             with self.assertRaises(remote.RateLimited) as error:
@@ -255,7 +269,8 @@ class APITests(unittest.TestCase):
     def test_get_info_accepts_single_object_and_array(self):
         info = {"file_id": "12", "file_category": "1", "size_byte": self.path.stat().st_size,
                 "sha1": self.hashes["sha1"]}
-        for data in (info, [info]):
+        without_hash = {k: v for k, v in info.items() if k != "sha1"}
+        for data in (info, [info], without_hash):
             api = self.api([(200, {"state": True, "code": 0, "data": data}),
                             (200, {"state": True, "code": 0, "data": data})])
             self.assertEqual(api.raw_path("/A.mkv")["file_id"], "12")
@@ -311,28 +326,30 @@ class APITests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(payload))
         self.assertNotIn("callback-url", json.dumps(payload))
 
-    def test_manual_retry_resumes_same_session_after_lost_complete_response(self):
+    def test_upload_errors_keep_actionable_codes_and_recover_expired_sessions(self):
         import oss2
         from unittest.mock import Mock
-        bucket = Mock()
-        bucket.init_multipart_upload.return_value.upload_id = "upload-1"
-        bucket.upload_part.return_value.etag = "receipt"
-        bucket.complete_multipart_upload.side_effect = RuntimeError("signed-url-secret")
-        payload = {}
-        with patch.object(oss2, "Bucket", return_value=bucket):
-            with self.assertRaises(remote.RetryLater) as exc:
-                self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
-                    {"bucket": "bucket", "object": "object", "pick_code": "pick"}, payload, lambda: None)
-            self.assertNotIn("signed-url-secret", str(exc.exception))
-            bucket.complete_multipart_upload.side_effect = None
-            bucket.complete_multipart_upload.return_value = SimpleNamespace(status=200,
-                resp=SimpleNamespace(response=SimpleNamespace(json=lambda: {"state": True})))
-            self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
-                                     None, payload, lambda: None)
-        self.assertEqual(bucket.init_multipart_upload.call_count, 1)
-        self.assertEqual(bucket.upload_part.call_count, 1)
-        self.assertEqual(bucket.complete_multipart_upload.call_count, 2)
-        self.assertEqual(bucket.complete_multipart_upload.call_args.args[1], "upload-1")
+        for code in ("NoSuchUpload", "SecurityTokenExpired", "CallbackFailed", "AccessDenied"):
+            with self.subTest(code=code):
+                bucket = Mock()
+                bucket.init_multipart_upload.return_value.upload_id = "upload-1"
+                bucket.upload_part.return_value.etag = "receipt"
+                bucket.complete_multipart_upload.side_effect = oss2.exceptions.OssError(
+                    403, {}, b"signed-url-secret", {"Code": code, "Message": "signed-url-secret"})
+                payload = {}
+                expected = remote.PauseTask if code == "AccessDenied" else remote.RetryLater
+                with patch.object(oss2, "Bucket", return_value=bucket), self.assertRaises(expected) as error:
+                    self.upload_api().upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                        {"bucket": "bucket", "object": "object", "pick_code": "pick"}, payload, lambda: None)
+                self.assertNotIn("signed-url-secret", str(error.exception))
+                self.assertEqual("upload_session" in payload, code != "NoSuchUpload")
+                if code == "SecurityTokenExpired":
+                    self.assertIn("凭证已过期", str(error.exception))
+                elif code == "NoSuchUpload":
+                    self.assertTrue(payload["write_intent"])
+                    self.assertEqual(payload["upload_pick_code"], "pick")
+                else:
+                    self.assertIn(code, str(error.exception))
 
     def test_source_change_during_upload_never_commits(self):
         import oss2

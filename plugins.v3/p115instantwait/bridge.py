@@ -20,7 +20,7 @@ from app.sdk.logging import logger
 
 from .remote import (NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited, RetryLater, fingerprint,
                      hash_file, prepare_direct, NativePlanStorage, DeferredSource,
-                     PlanningStepRunner, apply_native_deletions, cooldown_until)
+                     PlanningStepRunner, apply_native_deletions, cooldown_until, check_source, resolve_target)
 from .store import QueueStore
 
 
@@ -54,6 +54,7 @@ class InstantWaitEngine:
         self.patches = []
         self.live_tasks = {}
         self.context = threading.local()
+        self.runtime_lock = threading.RLock()
         self.native_lock = threading.Condition()
         self.native_active = 0
         self.extensions = {e.strip().lower().lstrip(".") for e in config["extensions"].split(",") if e.strip()}
@@ -133,8 +134,12 @@ class InstantWaitEngine:
             if owned and info.success:
                 try:
                     engine.verify_result(row, info)
+                except RetryLater as error:
+                    engine.defer(row, "finalizing", str(error))
+                    engine.context.retry_finalize = row["id"]
+                    raise
                 except Exception:
-                    engine.defer(row, "paused", "完成前校验失败，已阻止成功回写；请核对远端与 V3 整理队列")
+                    engine.defer(row, "paused", "完成前校验失败，请核对远端与 V3 整理队列")
                     raise
             result = original_callback(chain, task, info)
             if owned:
@@ -151,7 +156,7 @@ class InstantWaitEngine:
                     engine.log_task(engine.store.get(row["id"]), "整理成功")
                     engine.original_finish(chain, task)
                     engine.live_tasks.pop(row["id"], None)
-                elif row["payload"].get("prepared"):
+                elif row["payload"].get("prepared") and getattr(engine.context, "retry_finalize", None) != row["id"]:
                     engine.defer(row, "paused", info.message or "V3 完成整理失败，请人工核对")
                 elif engine.store.get(row["id"])["state"] == "failed":
                     engine.live_tasks.pop(row["id"], None)
@@ -160,9 +165,19 @@ class InstantWaitEngine:
 
         def wrapped_handle(chain, task, callback=None):
             previous_job = getattr(engine.context, "native_job", None)
-            engine.context.native_job = None
+            previous_retry = getattr(engine.context, "retry_finalize", None)
             with engine.native_lock:
-                engine.native_active += 1
+                stopping = engine.stop_event.is_set()
+                if stopping:
+                    engine.native_lock.wait_for(lambda: not engine.patches)
+                else:
+                    engine.native_active += 1
+            if stopping:
+                with engine.runtime_lock:
+                    current = getattr(TransferChain, "_TransferChain__handle_transfer")
+                return current(chain, task, callback)
+            engine.context.native_job = None
+            engine.context.retry_finalize = None
             try:
                 return original_handle(chain, task, callback)
             finally:
@@ -175,12 +190,13 @@ class InstantWaitEngine:
                             engine.wake.set()
                 finally:
                     engine.context.native_job = previous_job
+                    engine.context.retry_finalize = previous_retry
                     with engine.native_lock:
                         engine.native_active -= 1
                         engine.native_lock.notify_all()
 
         def wrapped_notify(chain, *, task, transferinfo, **kwargs):
-            if transferinfo.message == WAIT_MESSAGE:
+            if transferinfo.message == WAIT_MESSAGE or getattr(engine.context, "retry_finalize", None):
                 return
             return original_notify(chain, task=task, transferinfo=transferinfo, **kwargs)
 
@@ -274,7 +290,9 @@ class InstantWaitEngine:
                     self.store.update(row["id"], state="upload_queued" if data.pop("plan_force", False) else "waiting",
                                       payload=data, ready=1, next_at=0)
             except (PauseTask, RetryLater) as error:
-                self.defer(row, "paused", str(error))
+                self.defer(row, "paused" if isinstance(error, PauseTask) else "finalizing", str(error))
+                if isinstance(error, RetryLater):
+                    self.context.retry_finalize = row["id"]
                 return TransferInfo(success=False, fileitem=task.fileitem, message=str(error))
             finally:
                 api.close()
@@ -289,10 +307,10 @@ class InstantWaitEngine:
         api = OpenAPI(U115Pan(), FileItem, self.stop_event)
         try:
             data = row["payload"]
-            visible = api.raw_path(data["final_path"])
-            if not visible or str(visible.get("file_id")) != str(data["remote_id"]):
-                raise PauseTask("正式目标文件尚不可见或已被替换")
-            item = api.verify(data["remote_id"], data["final_path"], data["hashes"])
+            item = resolve_target(api, data)
+            if not item:
+                raise RetryLater("目标暂不可见，稍后继续整理")
+            self.store.update(row["id"], payload=data)
             source_path = Path(data["task"]["fileitem"]["path"])
             # A durable cross-storage move may have already deleted the source
             # before its success checkpoint response was lost. Require the exact
@@ -314,7 +332,9 @@ class InstantWaitEngine:
                 api.verify(data["remote_id"], info.target_item.path, data["hashes"])
             return info
         except (PauseTask, RetryLater) as error:
-            self.defer(row, "paused", str(error))
+            self.defer(row, "paused" if isinstance(error, PauseTask) else "finalizing", str(error))
+            if isinstance(error, RetryLater):
+                self.context.retry_finalize = row["id"]
             return TransferInfo(success=False, fileitem=task.fileitem, message=str(error),
                                 transfer_type=checkpoint.resolved_transfer_type)
         finally:
@@ -323,8 +343,9 @@ class InstantWaitEngine:
     def check_source(self, row):
         """Verify the original file before hashing, body upload, or native replay."""
         path = Path(row["payload"]["task"]["fileitem"]["path"])
-        if not path.is_file() or fingerprint(path) != row["payload"]["source_initial"]:
-            raise PauseTask("源文件不存在或发生变化，已暂停")
+        data = row["payload"]
+        data["source_initial"] = check_source(path, data["source_initial"], self.stop_event, data.get("hashes"))
+        self.store.update(row["id"], payload=data)
         return path
 
     def verify_result(self, row, info):
@@ -333,20 +354,21 @@ class InstantWaitEngine:
         if not info.target_item or str(info.target_item.fileid) != str(data["remote_id"]):
             raise PauseTask("V3 整理结果与远端正式文件不一致")
         path = Path(data["task"]["fileitem"]["path"])
-        if path.exists() and fingerprint(path) != data["source_initial"]:
-            raise PauseTask("源文件在完成确认前变化，已停止回写与清理")
+        if path.exists():
+            data["source_initial"] = check_source(path, data["source_initial"], self.stop_event, data["hashes"])
         api = OpenAPI(U115Pan(), FileItem, self.stop_event)
         try:
-            visible = api.raw_path(info.target_item.path)
-            if not visible or str(visible.get("file_id")) != str(data["remote_id"]):
-                raise PauseTask("远端目标已删除或替换，请人工核对")
-            api.verify(data["remote_id"], info.target_item.path, data["hashes"])
+            item = resolve_target(api, data)
+            if not item:
+                raise RetryLater("目标暂不可见，稍后继续整理")
+            info.target_item = item
+            self.store.update(row["id"], payload=data)
         finally:
             api.close()
 
     def restore(self):
         """Recover plugin jobs without replaying V2 internal task snapshots."""
-        self.store.recover()
+        self.store.recover(automatic_upload=self.config.get("limit_action") == "upload")
         for row in self.store.all(active=True, limit=100000):
             if row["payload"].get("host_generation") != 3:
                 self.store.update(row["id"], state="paused", message="V2 遗留任务已保留；请先在 V2 完成或取消，再在 V3 重新整理")
@@ -402,6 +424,10 @@ class InstantWaitEngine:
                 raise PauseTask("旧版暂存任务仅可取消，请重新整理")
             if data.get("host_generation") != 3:
                 raise PauseTask("V2 遗留任务需要先在 V2 完成或取消")
+            if data.get("prepared"):
+                self.store.update(key, state="finalizing", next_at=0, message="等待 V3 继续完成整理")
+                self.request_finalize(self.store.get(key))
+                return
             if not force:
                 expired = self.config["max_wait_hours"] and time.time() >= data["wait_since"] + self.config["max_wait_hours"] * 3600
                 if expired or data.get("auto_attempts", row["attempts"]) > self.config["max_retries"] + 1:
@@ -437,6 +463,8 @@ class InstantWaitEngine:
             current_attempts = max(0, current["attempts"] - 1)
             if not force:
                 data["auto_attempts"] = max(0, data.get("auto_attempts", 1) - 1)
+            else:
+                data["upload_attempts"] = max(0, data.get("upload_attempts", 1) - 1)
             state = "upload_queued" if force else "waiting"
             message = str(error) + "；冷却结束后自动继续"
             self.store.update(key, state=state, attempts=current_attempts, payload=data,
@@ -486,12 +514,22 @@ class InstantWaitEngine:
                     self.request_finalize(row)
 
     def defer(self, row, state, reason, limit_reached=False):
-        """Only count/time limits opt into force upload; all guard failures pause."""
+        """Retry temporary failures without replaying completed native work."""
         data = self.store.get(row["id"])["payload"]
         now = time.time()
         deadline = data.get("wait_since", row["created"]) + self.config["max_wait_hours"] * 3600 if self.config["max_wait_hours"] else None
-        if row["state"] == "uploading":
-            state, reason = "paused", f"强制上传未完成：{reason}；请手动核对并继续"
+        upload_retry = False
+        if state == "finalizing":
+            data["finalize_attempts"] = data.get("finalize_attempts", 0) + 1
+            if data["finalize_attempts"] > self.config["max_retries"]:
+                state = "paused"
+        elif row["state"] == "uploading":
+            upload_retry = state == "waiting" and data.get("upload_attempts", 1) <= self.config["max_retries"]
+            if self.stop_event.is_set():
+                upload_retry = data.get("upload_origin") == "limit" and self.config.get("limit_action") == "upload"
+                data["upload_attempts"] = max(0, data.get("upload_attempts", 1) - 1)
+            state = "upload_queued" if upload_retry else "paused"
+            reason = f"上传暂未完成：{reason}" if upload_retry else f"上传已暂停：{reason}"
         elif state == "waiting":
             reached = "等待超过设定期限" if deadline and now >= deadline else "自动重试次数已用完" if data.get("auto_attempts", row["attempts"]) >= self.config["max_retries"] + 1 else None
             if reached or limit_reached:
@@ -499,16 +537,18 @@ class InstantWaitEngine:
                 reason = f"{reached or reason}；最后结果：{reason}"
                 if state == "upload_queued":
                     data["upload_origin"] = "limit"
+                    data["upload_attempts"] = 0
         delays = self.config["retry_delays"]
-        delay = delays[min(max(0, data.get("auto_attempts", row["attempts"]) - 1), len(delays) - 1)] * random.uniform(.9, 1.1)
+        count = data.get("upload_attempts", 1) if row["state"] == "uploading" else data.get("auto_attempts", row["attempts"])
+        delay = delays[min(max(0, count - 1), len(delays) - 1)] * random.uniform(.9, 1.1)
         next_at = min(now + delay, deadline) if deadline and state == "waiting" else now + delay
-        if state == "upload_queued":
+        if state == "upload_queued" and not upload_retry:
             next_at = now
         self.store.update(row["id"], state=state, next_at=next_at, message=reason, payload=data)
         saved = {**row, "state": state, "next_at": next_at, "message": reason, "payload": data}
         self.log_task(saved, "任务状态变化", level="warning" if state == "paused" else "info", 状态=state, 原因=reason,
-                      下次重试=log_time(next_at) if state == "waiting" else "无")
-        if state in ("paused", "upload_queued") or (state == "waiting" and data.get("auto_attempts", row["attempts"]) == 1):
+                      下次重试=log_time(next_at) if state in ("waiting", "finalizing") or upload_retry else "无")
+        if state == "paused" or (state == "upload_queued" and not upload_retry) or (state == "waiting" and data.get("auto_attempts", row["attempts"]) == 1):
             self.notify_task(saved, manual=state == "paused")
         self.upload_wake.set()
 
@@ -554,22 +594,22 @@ class InstantWaitEngine:
             result["items"].append(item)
         return result
 
-    def stop(self):
+    def stop(self, timeout=35):
         """Keep patches until upload workers and native executions have exited."""
         self.stop_event.set()
         self.wake.set()
         self.upload_wake.set()
-        deadline = time.monotonic() + 35
+        deadline = time.monotonic() + timeout
         for worker in (self.worker, self.upload_worker):
             if worker and worker.ident is not None:
                 worker.join(max(0, deadline - time.monotonic()))
                 if worker.is_alive():
-                    raise RuntimeError("后台上传仍在结束，暂不能重新初始化插件")
+                    return False
         with self.native_lock:
             while self.native_active and time.monotonic() < deadline:
                 self.native_lock.wait(max(0, deadline - time.monotonic()))
             if self.native_active:
-                raise RuntimeError("V3 正在完成整理，暂不能移除接管接口")
+                return False
         for name, own, original, replacement in reversed(self.patches):
             if getattr(TransferChain, name) is replacement:
                 if own:
@@ -577,9 +617,12 @@ class InstantWaitEngine:
                 else:
                     delattr(TransferChain, name)
         self.patches.clear()
+        with self.native_lock:
+            self.native_lock.notify_all()
         for task in self.live_tasks.values():
             self.original_finish(self.chain, task)
         self.live_tasks.clear()
+        return True
 
 
 class PreparedStepRunner:
