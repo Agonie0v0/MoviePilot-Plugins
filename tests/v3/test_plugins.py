@@ -38,6 +38,19 @@ def stage(h, task):
     return h.engine.store.get(row["id"])
 
 
+def test_install_preflight_failure_stays_disabled_and_can_be_retried(h):
+    plugin = h.plugin.P115InstantWait()
+    plugin.get_data_path = lambda: h.directory
+    h.engine.stop()
+    with patch.object(h.Chain, "_TransferChain__execute_host_transfer_plan", lambda self, task: None):
+        plugin.init_plugin({"enabled": True})
+    assert plugin._error and not plugin.get_state()
+    assert plugin._engine is None
+    plugin.init_plugin({"enabled": True})
+    h.engine = plugin._engine
+    assert plugin.get_state() and not plugin._error
+
+
 def test_wait_failure_then_same_history_success(h, task):
     row = h.enter(task)
     assert row["ready"] and row["history_id"]

@@ -108,8 +108,8 @@ class P115InstantWait(RuntimePlugin, _PluginBase):
             runtime = {**self._config, "max_wait_hours": hours, "max_retries": int(retries), "retry_delays": delays}
             engine = InstantWaitEngine(self.get_data_path(), runtime, self._notify)
             engine.runtime_lock = self._runtime.lock
-            self._engine = engine
             engine.install(before_start=(lambda: self._apply_actions(engine, selected, self._config["action"])) if apply_action else None)
+            self._engine = engine
         except Exception as exc:
             self._error = str(exc)
             logger.error(f"【115秒传等待】{self._error}")

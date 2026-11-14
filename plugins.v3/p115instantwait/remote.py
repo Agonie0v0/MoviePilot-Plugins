@@ -429,6 +429,9 @@ class OpenAPI:
                 checkpoint()
                 raise RetryLater("上传会话已失效，稍后核对目标并重新上传") from None
             if code == "SecurityTokenExpired":
+                if saved:
+                    saved.pop("completing", None)
+                    checkpoint()
                 raise RetryLater("上传凭证已过期，稍后刷新后继续") from None
             # Only expose the SDK error code, never its signed URL or credentials.
             code = code if code and code.isascii() and code.isalnum() else type(error).__name__

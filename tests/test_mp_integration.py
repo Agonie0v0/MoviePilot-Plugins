@@ -155,6 +155,24 @@ class MoviePilotTests(unittest.TestCase):
             self.assertEqual(old("task"), (False, "current"))
         current.assert_called_once_with(self.h.chain, "task", None)
 
+    def test_install_preflight_failure_stays_disabled_and_can_be_retried(self):
+        import sys
+        import types
+        plugin = self.attach_plugin_notifier()
+        plugin.get_data_path = Mock(return_value=self.root / "plugin")
+        self.engine.stop()
+        with patch.dict(sys.modules, {"version": types.SimpleNamespace(APP_VERSION="v2.15.6")}):
+            with patch.object(self.h.Chain, "transfer", lambda self: None):
+                plugin.init_plugin({"enabled": True})
+            self.assertTrue(plugin._error)
+            self.assertFalse(plugin.get_state())
+            self.assertIsNone(plugin._engine)
+            with patch.object(threading.Thread, "start", lambda _: None):
+                plugin.init_plugin({"enabled": True})
+        self.engine = plugin._engine
+        self.assertTrue(plugin.get_state())
+        self.assertFalse(plugin._error)
+
     def test_update_waits_for_real_native_callback_then_restarts_automatically(self):
         import sys
         import types

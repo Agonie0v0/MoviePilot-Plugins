@@ -185,6 +185,43 @@ class DirectV2Tests(unittest.TestCase):
         with self.assertRaises(self.remote.PauseTask):
             self.remote.check_source(self.path, updated, threading.Event(), hashes)
 
+    def test_expired_commit_token_refreshes_without_uploading_parts_again(self):
+        import oss2
+        uploader = self.remote.OpenAPI(Mock(), Mock(), threading.Event())
+        self.addCleanup(uploader.close)
+        uploader.request = Mock(side_effect=lambda method, endpoint, **kwargs: {
+            "endpoint": "https://oss.example", "AccessKeyId": "id",
+            "AccessKeySecret": "secret", "SecurityToken": "token"
+        } if endpoint.endswith("get_token") else {
+            "callback": {"callback": "callback-url", "callback_var": "vars"}
+        })
+        self.api.upload.side_effect = uploader.upload
+        self.api.instant.side_effect = self.remote.NotInstant("miss", {
+            "bucket": "bucket", "object": "object", "pick_code": "pick"
+        })
+        bucket = Mock()
+        bucket.init_multipart_upload.return_value.upload_id = "saved-upload"
+        bucket.upload_part.return_value.etag = "saved-part"
+
+        def complete(*args, **kwargs):
+            if bucket.complete_multipart_upload.call_count == 1:
+                raise oss2.exceptions.OssError(403, {}, b"", {"Code": "SecurityTokenExpired"})
+            self.visible = {"file_id": "123"}
+            return types.SimpleNamespace(status=200, resp=types.SimpleNamespace(
+                response=types.SimpleNamespace(json=lambda: {"state": True, "data": {"file_id": "123"}})))
+
+        bucket.complete_multipart_upload.side_effect = complete
+        with patch.object(oss2, "Bucket", return_value=bucket):
+            with self.assertRaises(self.remote.RetryLater):
+                self.prepare(True)
+            self.data = self.store.get(self.row["id"])["payload"]
+            self.assertEqual(self.prepare(True).fileid, "123")
+        self.assertEqual(bucket.init_multipart_upload.call_count, 1)
+        self.assertEqual(bucket.upload_part.call_count, 1)
+        self.assertEqual(bucket.complete_multipart_upload.call_count, 2)
+        self.assertTrue(all(call.args[1] == "saved-upload" for call in bucket.complete_multipart_upload.call_args_list))
+        self.assertEqual(sum(call.args[1].endswith("get_token") for call in uploader.request.call_args_list), 2)
+
     def test_native_deletion_progress_survives_restart_and_is_not_repeated(self):
         self.data["native_deletions"] = [{"item": dict(type="file", fileid="42", path="/library/Film.mkv")}]
         self.store.update(self.row["id"], payload=self.data)
