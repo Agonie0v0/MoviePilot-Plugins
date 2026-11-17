@@ -1372,6 +1372,42 @@ class MoviePilotTests(unittest.TestCase):
         self.assertTrue(self.h.Oper().get(row["history_id"]).status)
         self.assertEqual(self.api.inits, 2)
 
+    def test_native_latest_defers_old_version_deletion_until_upload_succeeds(self):
+        task = self.enroll()
+        task.target_directory.overwrite_mode = "latest"
+        row = self.engine.store.all()[0]
+        self.api.files["old"] = self.h.FileItem(storage="u115", type="file", fileid="old",
+            path="/library/A.Old.mkv", name="A.Old.mkv", extension="mkv", size=10)
+        self.api.hit = False
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "waiting")
+        self.assertEqual(self.api.deletes, [])
+        self.assertIn("old", self.api.files)
+
+        self.api.hit = True
+        self.attempt(row["id"])
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertEqual(self.api.deletes, ["old"])
+        self.assertNotIn("old", self.api.files)
+
+    def test_expired_upload_token_does_not_exhaust_upload_retry_budget(self):
+        self.engine.config["max_retries"] = 1
+        self.enroll()
+        row = self.engine.store.all()[0]
+        self.engine.store.command(row["id"], "upload")
+        self.api.hit = False
+        with patch.object(self.api, "upload", side_effect=remote.TokenExpired("上传凭证已过期")):
+            for _ in range(3):
+                self.engine.store.update(row["id"], next_at=0)
+                self.engine.execute(self.engine.store.claim(manual=True))
+                current = self.engine.store.get(row["id"])
+                self.assertEqual(current["state"], "upload_queued")
+                self.assertEqual(current["payload"].get("upload_attempts", 0), 0)
+        self.engine.store.update(row["id"], next_at=0)
+        self.engine.execute(self.engine.store.claim(manual=True))
+        self.assertEqual(self.engine.store.get(row["id"])["state"], "completed")
+        self.assertEqual(self.api.uploads, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,9 +1,10 @@
-import time
-import hashlib
 import copy
+import hashlib
 import json
+import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -131,11 +132,27 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(claimed["payload"]["auto_attempts"], 0)
         self.assertEqual(claimed["attempts"], 8)
 
+    def test_reopen_ready_store_skips_write_lock(self):
+        self.db.enqueue("A", {})
+        holder = sqlite3.connect(self.db.path, timeout=0.1)
+        holder.isolation_level = None
+        try:
+            holder.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            readonly_view = store.QueueStore(self.db.path)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertEqual(readonly_view.dashboard()[1]["total"], 1)
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+
 
 class APITests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(remote, "_COOLDOWN_UNTIL", 0))
         self.enterContext(patch.dict(remote._PATH_CACHE, clear=True))
+        self.enterContext(patch.dict(remote._AUTH_FAILURES, clear=True))
+        self.enterContext(patch.object(remote, "_LAST_REQUEST_AT", 0.0))
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "A.mkv"
         self.path.write_bytes(b"test movie content")
@@ -157,6 +174,8 @@ class APITests(unittest.TestCase):
             reply = next(replies)
             if isinstance(reply, Exception):
                 raise reply
+            if isinstance(reply, httpx.Response):
+                return reply
             status, body = reply
             return httpx.Response(status, json=body)
         api = remote.OpenAPI(self.backend, lambda **kw: SimpleNamespace(**kw), NoSleep(),
@@ -404,6 +423,134 @@ class APITests(unittest.TestCase):
         stop.set()
         with self.assertRaises(remote.RetryLater):
             reader.read()
+
+    def test_upload_init_preserves_directory_cache_and_reuses_local_path_cache(self):
+        api = self.api([
+            (200, {"state": True, "data": {"file_id": "10", "file_category": "0", "file_name": "library"}}),
+            (200, {"state": True, "code": 0, "data": {"status": 1, "bucket": "oss"}}),
+            (200, {"state": True, "data": {"file_id": "12", "file_category": "1", "file_name": "A.mkv"}}),
+        ])
+        self.assertEqual(api.raw_path("/library")["file_id"], "10")
+        with self.assertRaises(remote.NotInstant):
+            api.instant(self.path, SimpleNamespace(fileid="10"), "A.mkv", self.hashes)
+        self.assertIn((id(self.backend), "/library"), remote._PATH_CACHE)
+        self.assertEqual(api.raw_path("/library/A.mkv")["file_id"], "12")
+        self.assertEqual(api.raw_path("/library/A.mkv")["file_id"], "12")
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.calls[0].headers["User-Agent"], "W115Storage/2.0")
+
+        self.backend.session = SimpleNamespace(headers={"User-Agent": "CustomMP115/9.9"})
+        api_custom = self.api([(200, {"state": True, "data": {"file_id": "99", "file_category": "1"}})])
+        self.assertEqual(api_custom.raw_id("99")["file_id"], "99")
+        self.assertEqual(self.calls[-1].headers["User-Agent"], "CustomMP115/9.9")
+
+    def test_risk_control_error_field_non_json_403_and_auth_circuit_breaker(self):
+        api = self.api([(200, {"state": False, "code": 999, "error": "操作太快，请稍后再试"})])
+        with self.assertRaises(remote.RateLimited):
+            api.raw_id("12")
+
+        self.backend._limit_until = 0
+        remote._COOLDOWN_UNTIL = 0
+        api = self.api([httpx.Response(403, text="<html>403 Forbidden</html>")])
+        before = time.time()
+        with self.assertRaises(remote.RateLimited) as exc:
+            api.raw_id("12")
+        self.assertTrue(250 <= exc.exception.until - before <= 350)
+
+        self.backend._limit_until = 0
+        remote._COOLDOWN_UNTIL = 0
+        remote._AUTH_FAILURES.clear()
+        api = self.api([(200, {"state": False, "code": 40140125, "message": "invalid token"})])
+        with self.assertRaises(remote.PauseTask):
+            api.raw_id("12")
+        with self.assertRaises(remote.PauseTask):
+            api.raw_id("12")
+        self.assertEqual(len(self.calls), 3)
+
+        class EmptyTokenBackend:
+            base_url = "https://proapi.115.com"
+            _limit_lock = threading.Lock()
+            _limit_until = 0
+            limit_sleep_seconds = 3600
+
+            def __init__(self):
+                self.reads = 0
+
+            @property
+            def access_token(self):
+                self.reads += 1
+                return ""
+
+        empty_backend = EmptyTokenBackend()
+        empty_api = remote.OpenAPI(
+            empty_backend,
+            lambda **kw: SimpleNamespace(**kw),
+            NoSleep(),
+            httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={}))),
+        )
+        self.clients.append(empty_api)
+        with self.assertRaises(remote.PauseTask):
+            empty_api.raw_id("12")
+        with self.assertRaises(remote.PauseTask):
+            empty_api.raw_id("12")
+        self.assertEqual(empty_backend.reads, 1)
+
+    def test_zero_byte_source_file_pauses_before_upload(self):
+        empty_path = Path(self.temp.name) / "empty.mkv"
+        empty_path.write_bytes(b"")
+        with self.assertRaises(remote.PauseTask):
+            remote.hash_file(empty_path, NoSleep())
+        with self.assertRaises(remote.PauseTask):
+            remote.check_source(empty_path, {"size": 0, "mtime_ns": 0, "device": 0, "inode": 0}, NoSleep())
+
+    def test_large_file_part_sizing_and_in_loop_sts_refresh(self):
+        import oss2
+        from unittest.mock import Mock
+
+        part_80gb = remote.preferred_part_size(80 * 1024 ** 3)
+        self.assertGreaterEqual(part_80gb, 10 * 1024 ** 2)
+        self.assertLessEqual(part_80gb, 1024 ** 3)
+        self.assertLess((80 * 1024 ** 3) // part_80gb, 1000)
+
+        api = self.api([
+            (200, {"state": True, "data": {
+                "endpoint": "http://oss.example", "AccessKeyId": "id1", "AccessKeySecret": "sec1",
+                "SecurityToken": "tok1"}}),
+            (200, {"state": True, "data": {"callback": {"callback": "cb-url", "callback_var": "cb-var"}}}),
+            (200, {"state": True, "data": {
+                "endpoint": "http://oss.example", "AccessKeyId": "id2", "AccessKeySecret": "sec2",
+                "SecurityToken": "tok2"}}),
+        ])
+        bucket = Mock()
+        bucket.init_multipart_upload.return_value.upload_id = "upload-sts"
+        attempts, received, expired_once = [], {}, False
+
+        def upload_part(key, upload_id, number, data):
+            nonlocal expired_once
+            attempts.append(number)
+            block = data.read()
+            if number == 2 and not expired_once:
+                expired_once = True
+                raise oss2.exceptions.OssError(403, {}, b"x", {"Code": "SecurityTokenExpired", "Message": "expired"})
+            received[number] = block
+            return SimpleNamespace(etag=f"etag-{number}")
+
+        bucket.upload_part.side_effect = upload_part
+        bucket.complete_multipart_upload.return_value = SimpleNamespace(
+            status=200, resp=SimpleNamespace(response=SimpleNamespace(json=lambda: {"state": True, "data": {"file_id": "555"}}))
+        )
+        payload = {}
+        with patch.object(oss2, "Bucket", return_value=bucket), patch.object(oss2, "determine_part_size", return_value=8):
+            api.upload(self.path, SimpleNamespace(fileid="10"), self.hashes,
+                       {"bucket": "bucket", "object": "object", "pick_code": "pick"}, payload, lambda: None)
+
+        self.assertEqual(attempts, [1, 2, 2, 3])
+        self.assertEqual(b"".join(received[k] for k in sorted(received)), self.path.read_bytes())
+        self.assertEqual([r.url.path for r in self.calls],
+                         ["/open/upload/get_token", "/open/upload/resume", "/open/upload/get_token"])
+        self.assertTrue(payload["upload_confirmed"])
+        self.assertEqual(payload["remote_id"], "555")
+        bucket.complete_multipart_upload.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from app.schemas.file import FileItem
 from app.schemas.transfer import TransferInfo
 from app.sdk.logging import logger
 
-from .remote import (NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited, RetryLater, fingerprint,
+from .remote import (NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited, RetryLater, TokenExpired, fingerprint,
                      hash_file, prepare_direct, NativePlanStorage, DeferredSource,
                      PlanningStepRunner, apply_native_deletions, cooldown_until, check_source, resolve_target)
 from .store import QueueStore
@@ -57,7 +57,22 @@ class InstantWaitEngine:
         self.runtime_lock = threading.RLock()
         self.native_lock = threading.Condition()
         self.native_active = 0
+        self._u115 = None
+        self._client = None
+        self._client_lock = threading.Lock()
         self.extensions = {e.strip().lower().lstrip(".") for e in config["extensions"].split(",") if e.strip()}
+
+    def _backend(self):
+        self._u115 = U115Pan()
+        return self._u115
+
+    def _open_api(self):
+        import httpx
+        with self._client_lock:
+            if self._client is None:
+                self._client = httpx.Client(timeout=30, follow_redirects=False)
+            client = self._client
+        return OpenAPI(self._backend(), FileItem, self.stop_event, client, False)
 
     def log_task(self, row, event, level="info", **details):
         """Correlate all queue transitions with the original native history ID."""
@@ -264,7 +279,7 @@ class InstantWaitEngine:
             return TransferInfo(success=False, fileitem=task.fileitem, message="旧版暂存任务已暂停")
         if (not row["payload"].get("prepared") and not row["payload"].get("native_plan")
                 and not row["payload"].get("write_intent")):
-            api = OpenAPI(U115Pan(), FileItem, self.stop_event)
+            api = self._open_api()
             try:
                 self.check_source(row)
                 planner = NativePlanStorage(api, self.store, row, FileItem,
@@ -304,7 +319,7 @@ class InstantWaitEngine:
                                 message=WAIT_MESSAGE, need_notify=False)
         if row["state"] != "finalizing":
             return TransferInfo(success=False, fileitem=task.fileitem, message="已暂停，需在插件中手动恢复整理")
-        api = OpenAPI(U115Pan(), FileItem, self.stop_event)
+        api = self._open_api()
         try:
             data = row["payload"]
             item = resolve_target(api, data)
@@ -356,7 +371,7 @@ class InstantWaitEngine:
         path = Path(data["task"]["fileitem"]["path"])
         if path.exists():
             data["source_initial"] = check_source(path, data["source_initial"], self.stop_event, data["hashes"])
-        api = OpenAPI(U115Pan(), FileItem, self.stop_event)
+        api = self._open_api()
         try:
             item = resolve_target(api, data)
             if not item:
@@ -389,6 +404,16 @@ class InstantWaitEngine:
             else:
                 self.store.update(row["id"], state="paused", message="原 V3 整理记录或持久任务不存在，请核对后重新整理")
 
+    def _cooldown_deadline(self):
+        raw_until = getattr(self._backend(), "_limit_until", 0)
+        limit_until = float(raw_until) if isinstance(raw_until, (int, float)) else 0.0
+        return max(limit_until, cooldown_until())
+
+    def active_cooldown_until(self):
+        """Return active 115 risk-control cooldown timestamp for UI visibility, or 0."""
+        until = self._cooldown_deadline()
+        return until if until > time.time() else 0.0
+
     def run(self, manual=False):
         """Upload in two independent workers; native replay only finalizes."""
         wake = self.upload_wake if manual else self.wake
@@ -399,7 +424,7 @@ class InstantWaitEngine:
                 # Do not claim every due task while MP's shared 115 cooldown
                 # is active. This prevents a large queue from immediately
                 # replaying the same risk-control request after cooldown.
-                until = max(float(getattr(U115Pan(), "_limit_until", 0) or 0), cooldown_until())
+                until = self._cooldown_deadline()
                 delay = until - time.time()
                 if delay > 0:
                     wake.wait(min(delay, 60))
@@ -408,6 +433,8 @@ class InstantWaitEngine:
                 row = self.store.claim(manual=manual)
                 if row:
                     self.execute(row)
+                    if until > 0 and 0 <= time.time() - until < 300:
+                        self.stop_event.wait(random.uniform(1.0, 2.5))
                     continue
             except Exception:
                 logger.error("【115秒传等待】V3 调度异常，队列仍保留")
@@ -449,10 +476,13 @@ class InstantWaitEngine:
                 if data["hashes"]["fingerprint"] != data["source_initial"]:
                     raise PauseTask("源文件在计算哈希前发生变化")
                 self.store.update(key, payload=data)
-            api = OpenAPI(U115Pan(), FileItem, self.stop_event)
-            apply_native_deletions(api, self.store, row, FileItem)
-            item = prepare_direct(api, self.store, row, path, data, force,
+            api = self._open_api()
+            apply_native_deletions(api, self.store, self.store.get(key), FileItem, only_same_path=True)
+            data = self.store.get(key)["payload"]
+            item = prepare_direct(api, self.store, self.store.get(key), path, data, force,
                                   lambda event: self.log_task(row, event))
+            apply_native_deletions(api, self.store, self.store.get(key), FileItem)
+            data = self.store.get(key)["payload"]
             data.update(remote_id=str(item.fileid), prepared=True)
             self.store.update(key, state="finalizing", payload=data, next_at=0, message="远端文件已确认，等待 V3 完成原整理记录")
             self.request_finalize(self.store.get(key))
@@ -470,9 +500,31 @@ class InstantWaitEngine:
             self.store.update(key, state=state, attempts=current_attempts, payload=data,
                               next_at=error.until, message=message)
             self.log_task(self.store.get(key), "115风控冷却", level="warning", 原因=message)
+        except TokenExpired as error:
+            if force:
+                current = self.store.get(key)
+                data = current["payload"]
+                current_attempts = max(0, current["attempts"] - 1)
+                data["upload_attempts"] = max(0, data.get("upload_attempts", 1) - 1)
+                message = str(error) + "；将自动刷新凭证后继续"
+                self.store.update(key, state="upload_queued", attempts=current_attempts, payload=data,
+                                  next_at=time.time() + 2, message=message)
+                self.log_task(self.store.get(key), "上传凭证过期刷新", level="warning", 原因=message)
+                self.upload_wake.set()
+            else:
+                self.defer(row, "waiting", str(error))
         except PauseTask as error:
             self.defer(row, "paused", str(error))
-        except (NotInstant, RetryLater) as error:
+        except NotInstant as error:
+            self.defer(row, "waiting", str(error))
+        except RetryLater as error:
+            current = self.store.get(key)
+            saved_data = current["payload"]
+            if not force and (saved_data.get("instant_confirmed") or saved_data.get("upload_confirmed")):
+                current_attempts = max(0, current["attempts"] - 1)
+                saved_data["auto_attempts"] = max(0, saved_data.get("auto_attempts", 1) - 1)
+                self.store.update(key, attempts=current_attempts, payload=saved_data)
+                row = {**current, "attempts": current_attempts, "payload": saved_data}
             self.defer(row, "waiting", str(error))
         except Exception:
             self.defer(row, "waiting", "后台整理异常，已保留源文件及队列")
@@ -531,7 +583,9 @@ class InstantWaitEngine:
             state = "upload_queued" if upload_retry else "paused"
             reason = f"上传暂未完成：{reason}" if upload_retry else f"上传已暂停：{reason}"
         elif state == "waiting":
-            reached = "等待超过设定期限" if deadline and now >= deadline else "自动重试次数已用完" if data.get("auto_attempts", row["attempts"]) >= self.config["max_retries"] + 1 else None
+            confirmed = bool(data.get("instant_confirmed") or data.get("upload_confirmed"))
+            reached = ("等待超过设定期限" if (deadline and now >= deadline and not confirmed) else
+                       "自动重试次数已用完" if (not confirmed and data.get("auto_attempts", row["attempts"]) >= self.config["max_retries"] + 1) else None)
             if reached or limit_reached:
                 state = "upload_queued" if self.config.get("limit_action", "manual") == "upload" else "paused"
                 reason = f"{reached or reason}；最后结果：{reason}"
@@ -622,6 +676,11 @@ class InstantWaitEngine:
         for task in self.live_tasks.values():
             self.original_finish(self.chain, task)
         self.live_tasks.clear()
+        with self._client_lock:
+            client, self._client = self._client, None
+        if client is not None:
+            client.close()
+        self._u115 = None
         return True
 
 

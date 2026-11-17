@@ -1,10 +1,13 @@
 """Whole-queue lookup, bounded pages, and selection safety in native forms."""
 import ast
+from datetime import datetime
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -127,6 +130,130 @@ global.window = {MoviePilotAPI:{get:async(path,{params})=>{
 })().catch(e=>{console.error(e);process.exit(1)});
 """
         result = subprocess.run([shutil.which("node"), "-e", script], input=json.dumps(data), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_form_batch_and_history_clear_endpoints(self):
+        tree = ast.parse((PLUGIN / "__init__.py").read_text(encoding="utf-8"))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+        cls.bases = []
+        keep = ("search_records", "form_control_batch", "form_clear_history", "get_api", "get_state", "queue")
+        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in keep]
+        namespace = dict(HTTPException=HTTPException, Body=__import__("fastapi").Body, datetime=datetime,
+                         Path=Path, QueueStore=store.QueueStore, logger=Mock())
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), "entry_form", "exec"), namespace)
+        plugin = namespace[cls.name]()
+        plugin._runtime = SimpleNamespace(lock=threading.RLock())
+        plugin._notice = plugin._error = ""
+        plugin.get_data_path = lambda: self.temp.name
+        plugin.save_data = Mock()
+        plugin.list_tasks = plugin.control_task = plugin.control_batch = Mock()
+        plugin._engine = SimpleNamespace(
+            stop_event=SimpleNamespace(is_set=lambda: False),
+            store=self.db,
+            control_many=lambda keys, action: {
+                "action": action, "at": "now", "accepted": len(keys), "skipped": 0, "failed": 0, "items": []
+            },
+        )
+        app = FastAPI()
+        for route in plugin.get_api():
+            app.add_api_route(route["path"], route["endpoint"], methods=route["methods"])
+        client = TestClient(app)
+
+        batch_res = client.post("/form/tasks/pause", json={"keys": ["paused-0"]})
+        self.assertEqual(batch_res.status_code, 200)
+        self.assertEqual(batch_res.json()["accepted"], 1)
+        plugin.save_data.assert_called_once()
+        self.assertEqual(client.post("/form/tasks/bad", json={"keys": ["paused-0"]}).status_code, 400)
+
+        clear_sel = client.post("/form/history/clear", json={"mode": "selected", "keys": ["completed-0"]})
+        self.assertEqual(clear_sel.status_code, 200)
+        self.assertEqual(clear_sel.json()["deleted"], 1)
+        self.assertIsNone(self.db.get("completed-0"))
+
+        self.assertEqual(client.post("/form/history/clear", json={"mode": "filtered", "states": ["completed"], "days": 0.5}).status_code, 400)
+        clear_flt = client.post("/form/history/clear", json={"mode": "filtered", "states": ["completed"], "days": 0})
+        self.assertEqual(clear_flt.status_code, 200)
+        self.assertEqual(clear_flt.json()["deleted"], 250)
+        self.assertIsNotNone(self.db.get("paused-0"))
+
+        plugin._engine = None
+        self.assertEqual(client.post("/form/tasks/resume", json={"keys": ["paused-0"]}).status_code, 409)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to execute native form handlers")
+    def test_form_select_and_inline_execution_handlers(self):
+        task_model = {
+            **ui.record_search_model("tasks", dict(items=[
+                {"title": "A", "value": "t1", "props": {"disabled": False}},
+                {"title": "B", "value": "t2", "props": {"disabled": True}},
+                {"title": "C", "value": "t3", "props": {"disabled": False}},
+            ], total=3, page=1, pages=1)),
+            "enabled": True, "task_ids": [], "action": "upload", "apply_action": True,
+        }
+        hist_model = {
+            **ui.record_search_model("history", dict(items=[{"title": "H1", "value": "h1", "props": {"disabled": False}}], total=1, page=1, pages=1)),
+            "history_mode": "selected", "history_ids": ["h1"], "history_states": ["completed"], "history_days": 30, "cleanup_history": True,
+        }
+        payload = dict(
+            selectAll=ui.record_select_handler("tasks", True),
+            clearSel=ui.record_select_handler("tasks", False),
+            execBatch=ui.form_batch_exec_handler(),
+            clearHist=ui.form_history_clear_handler(False),
+            cancelClear=ui.form_history_clear_handler(True),
+            taskModel=task_model,
+            histModel=hist_model,
+        )
+        script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const d = JSON.parse(fs.readFileSync(0, 'utf8'));
+const compile = (src) => new Function('model', 'with(model){return (' + src + ')()}');
+
+let calls = [];
+global.window = {MoviePilotAPI: {
+  post: async (path, body) => {
+    calls.push(['POST', path, body]);
+    if (path.startsWith('plugin/P115InstantWait/form/tasks/')) {
+      return {success: true, message: '', data: {action: 'upload', accepted: 2, skipped: 0, failed: 0, items: [{name: 'A', message: 'ok'}]}};
+    }
+    return {deleted: 1, skipped: 0, items: []};
+  },
+  get: async (path, opts) => {
+    calls.push(['GET', path, opts.params]);
+    return {items: [], total: 0, page: 1, pages: 1};
+  }
+}};
+
+(async () => {
+  const tm = d.taskModel;
+  compile(d.selectAll)(tm);
+  assert.deepEqual(tm.task_ids, ['t1', 't3']);
+  await compile(d.execBatch)(tm);
+  assert.deepEqual(tm.task_ids, []);
+  assert.equal(tm.apply_action, false);
+  assert.ok(tm._records_tasks_exec_message.includes('接受 2'));
+  assert.equal(tm._records_tasks_total, 0);
+  assert.equal(tm._records_tasks_exec_busy, false);
+
+  compile(d.selectAll)(tm);
+  compile(d.clearSel)(tm);
+  assert.deepEqual(tm.task_ids, []);
+
+  const hm = d.histModel;
+  await compile(d.clearHist)(hm);
+  assert.equal(hm._records_history_confirm_clear, true);
+  assert.equal(calls.filter(c => c[1].includes('/history/clear')).length, 0);
+  compile(d.cancelClear)(hm);
+  assert.equal(hm._records_history_confirm_clear, false);
+  await compile(d.clearHist)(hm);
+  await compile(d.clearHist)(hm);
+  assert.equal(hm._records_history_confirm_clear, false);
+  assert.deepEqual(hm.history_ids, []);
+  assert.equal(hm.cleanup_history, false);
+  assert.ok(hm._records_history_exec_message.includes('删除 1'));
+  assert.equal(calls.filter(c => c[1].includes('/history/clear')).length, 1);
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+        result = subprocess.run([shutil.which("node"), "-e", script], input=json.dumps(payload), text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
 

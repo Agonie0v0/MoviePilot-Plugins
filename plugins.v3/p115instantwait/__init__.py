@@ -57,6 +57,8 @@ class QueueTask(BaseModel):
     updated: float | None = None
     transfer_method: str = "unknown"
     result_message: str = ""
+    size: int | None = None
+    upload_progress: dict | None = None
 
 
 class ControlResult(BaseModel):
@@ -106,11 +108,27 @@ class BatchResponse(BaseModel):
     data: BatchResult
 
 
+class HistoryClearResult(BaseModel):
+    kind: str
+    status: str
+    deleted: int
+    skipped: int
+    items: list[str]
+    at: str = ""
+    notice: str = ""
+
+
+class HistoryClearResponse(BaseModel):
+    success: bool
+    message: str = ""
+    data: HistoryClearResult
+
+
 class P115InstantWait(RuntimePlugin, _PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "1.3.4"
+    plugin_version = "1.3.5"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -122,6 +140,8 @@ class P115InstantWait(RuntimePlugin, _PluginBase):
         self._runtime = shared_runtime(TransferChain, type(self).__name__, DEFAULTS, logger)
         self._ticket = self._runtime.register(self._code_revision)
         self._initialized = False
+        self._offline_store = None
+        self._offline_store_path = None
 
     def init_plugin(self, config=None):
         self._runtime.configure(self, config)
@@ -228,21 +248,55 @@ class P115InstantWait(RuntimePlugin, _PluginBase):
         return []
 
     def get_api(self):
-        return [
+        deps = []
+        try:
+            import importlib
+            from fastapi import Depends
+            for mod_name in ("app.api.dependencies.auth", "app.api.deps", "app.db.user_oper"):
+                try:
+                    mod = importlib.import_module(mod_name)
+                except ImportError:
+                    continue
+                checker = (getattr(mod, "get_current_active_superuser_async", None)
+                           or getattr(mod, "get_current_active_superuser", None))
+                if callable(checker):
+                    deps = [Depends(checker)]
+                    break
+        except ImportError:
+            pass
+        routes = [
             {"path": "/tasks", "endpoint": self.list_tasks, "methods": ["GET"],
-             "auth": "bear", "summary": "查看秒传等待队列", "response_model": list[QueueTask]},
+             "auth": "bear", "summary": "查看秒传等待队列", "response_model": list[QueueTask],
+             **({"dependencies": list(deps)} if deps else {})},
             {"path": "/records", "endpoint": self.search_records, "methods": ["GET"],
-             "auth": "bear", "summary": "全库搜索任务与历史，每页50条", "response_model": RecordSearchResponse},
+             "auth": "bear", "summary": "全库搜索任务与历史，每页50条", "response_model": RecordSearchResponse,
+             **({"dependencies": list(deps)} if deps else {})},
             {"path": "/batch/{action}", "endpoint": self.control_batch, "methods": ["POST"],
-             "auth": "bear", "summary": "批量恢复等待或安排强制上传", "response_model": BatchResponse},
+             "auth": "bear", "summary": "批量恢复等待或安排强制上传", "response_model": BatchResponse,
+             **({"dependencies": list(deps)} if deps else {})},
             {"path": "/tasks/{task_id}/{action}", "endpoint": self.control_task,
              "methods": ["POST"], "auth": "bear", "summary": "暂停、继续等待、强制上传或取消任务",
-             "response_model": ControlResponse},
+             "response_model": ControlResponse, **({"dependencies": list(deps)} if deps else {})},
         ]
+        if hasattr(self, "form_control_batch"):
+            routes.append({"path": "/form/tasks/{action}", "endpoint": self.form_control_batch,
+                           "methods": ["POST"], "auth": "bear", "summary": "配置页原地执行批量任务操作",
+                           "response_model": BatchResponse, **({"dependencies": list(deps)} if deps else {})})
+        if hasattr(self, "form_clear_history"):
+            routes.append({"path": "/form/history/clear", "endpoint": self.form_clear_history,
+                           "methods": ["POST"], "auth": "bear", "summary": "配置页原地清理已结束记录",
+                           "response_model": HistoryClearResponse, **({"dependencies": list(deps)} if deps else {})})
+        return routes
 
     def queue(self):
         engine = self._engine
-        return engine.store if engine else QueueStore(Path(self.get_data_path()) / "queue.db")
+        if engine:
+            return engine.store
+        path = str(Path(self.get_data_path()) / "queue.db")
+        if getattr(self, "_offline_store", None) is None or getattr(self, "_offline_store_path", None) != path:
+            self._offline_store = QueueStore(path)
+            self._offline_store_path = path
+        return self._offline_store
 
     def list_tasks(self):
         return [task_record(row) for row in self.queue().all(limit=50)]
@@ -296,9 +350,49 @@ class P115InstantWait(RuntimePlugin, _PluginBase):
                 result["notice"] = self._error
             return {"success": True, "message": "", "data": result}
 
+    def form_control_batch(self, action: str, keys: list[str] = Body(..., embed=True)):
+        with self._runtime.lock:
+            if not self.get_state():
+                raise HTTPException(status_code=409, detail=self._notice or "请先启用插件")
+            if action not in ("pause", "resume", "upload", "cancel"):
+                raise HTTPException(status_code=400, detail="不支持此批量操作")
+            try:
+                result = self._engine.control_many(keys, action)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            try:
+                self.save_data("last_batch_result", result)
+            except Exception:
+                logger.warning("【115秒传等待】批量操作结果保存失败，请核对队列状态与日志")
+                self._error = "批量操作已提交，但结果未能保存；请核对任务状态与日志。"
+                result["notice"] = self._error
+            return {"success": True, "message": "", "data": result}
+
+    def form_clear_history(
+        self,
+        mode: str = Body("selected"),
+        keys: list[str] = Body(default=[]),
+        states: list[str] = Body(default=["completed"]),
+        days: int | float = Body(30),
+    ):
+        with self._runtime.lock:
+            try:
+                result = self.queue().clear_history(mode=mode, keys=keys, states=states, days=days)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            result = {**result, "at": datetime.now().astimezone().isoformat(timespec="seconds")}
+            try:
+                self.save_data("last_history_cleanup", result)
+            except Exception:
+                logger.warning("【115秒传等待】清理结果保存失败，请查看日志")
+                result["notice"] = "清理已完成，但结果记录未能保存。"
+            return {"success": True, "message": "", "data": result}
+
     def get_page(self):
         engine = self._engine
         rows, summary = self.queue().dashboard()
+        cooldown_at = engine.active_cooldown_until() if engine and hasattr(engine, "active_cooldown_until") else 0.0
         return task_page([task_record(row) for row in rows], self.get_state(), self._error, summary=summary,
                          max_retries=int(engine.config["max_retries"]) if engine else None,
-                         batch_result=self.get_data("last_batch_result"), notice=self._notice)
+                         batch_result=self.get_data("last_batch_result"), notice=self._notice,
+                         cooldown_until=cooldown_at)

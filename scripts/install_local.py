@@ -31,7 +31,9 @@ def main():
     if not isinstance(installed, list):
         raise SystemExit("已安装插件配置格式异常，未修改配置")
     if destination.exists():
-        backup = plugin_root / ("_p115instantwait_backup_" + datetime.now().strftime("%Y%m%d%H%M%S%f"))
+        backup_root = Path(getattr(settings, "TEMP_PATH", None) or (settings.ROOT_PATH.parent / "plugin_backups")).resolve()
+        backup_root.mkdir(parents=True, exist_ok=True)
+        backup = backup_root / ("p115instantwait_backup_" + datetime.now().strftime("%Y%m%d%H%M%S%f"))
         shutil.copytree(destination, backup)
         print(f"现有插件源码备份：{backup}")
     destination.mkdir(parents=True, exist_ok=True)

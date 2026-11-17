@@ -8,6 +8,29 @@ from pathlib import Path, PurePosixPath
 _REQUEST_LOCK = threading.Lock()
 _COOLDOWN_UNTIL = 0.0
 _PATH_CACHE = {}
+_AUTH_FAILURES = {}
+_LAST_REQUEST_AT = 0.0
+_PART_SIZE_STEPS = (
+    10 * 1024 * 1024,
+    16 * 1024 * 1024,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
+)
+
+
+def preferred_part_size(file_size):
+    """Select an adaptive OSS part size targeting ~96 parts for large files."""
+    if file_size <= 0:
+        return _PART_SIZE_STEPS[0]
+    target = max(1024 * 1024, (file_size + 95) // 96)
+    for step in _PART_SIZE_STEPS:
+        if target <= step:
+            return step
+    return _PART_SIZE_STEPS[-1]
 
 
 def cooldown_until():
@@ -15,6 +38,10 @@ def cooldown_until():
 
 
 class RetryLater(Exception):
+    pass
+
+
+class TokenExpired(RetryLater):
     pass
 
 
@@ -53,6 +80,8 @@ def fingerprint(path):
 
 def hash_file(path, stop):
     before = fingerprint(path)
+    if before["size"] <= 0:
+        raise PauseTask("源文件大小为 0 字节，已暂停")
     whole, prefix = hashlib.sha1(), hashlib.sha1()
     remaining = 128 * 1024 * 1024
     with open(path, "rb") as stream:
@@ -77,6 +106,8 @@ def check_source(path, expected, stop, hashes=None):
         current = fingerprint(path)
     except FileNotFoundError:
         raise PauseTask("源文件不存在，已暂停") from None
+    if current["size"] <= 0:
+        raise PauseTask("源文件大小为 0 字节，已暂停")
     if current == expected:
         return current
     if current["size"] != expected["size"]:
@@ -91,15 +122,20 @@ def check_source(path, expected, stop, hashes=None):
 
 
 class OpenAPI:
-    def __init__(self, backend, item_factory, stop, client=None):
+    def __init__(self, backend, item_factory, stop, client=None, close_client=True):
         import httpx
         self.backend, self.item_factory, self.stop = backend, item_factory, stop
         self.client = client or httpx.Client(timeout=30, follow_redirects=False)
+        self._close_client = close_client
+        self._allow_negative_cache = True
         self._path_cache, self._id_cache = {}, {}
         self._last_request = 0
 
     def close(self):
-        self.client.close()
+        self._path_cache.clear()
+        self._id_cache.clear()
+        if self._close_client:
+            self.client.close()
 
     def request(self, method, endpoint, *, data=None, params=None, missing=False):
         # Every task creates a fresh OpenAPI object. Serialize those clients so
@@ -110,20 +146,30 @@ class OpenAPI:
 
     def _request_locked(self, method, endpoint, *, data=None, params=None, missing=False):
         import httpx
-        if method.upper() == "POST" and endpoint != "/open/folder/get_info":
+        global _LAST_REQUEST_AT
+        if endpoint == "/open/ufile/delete":
             _PATH_CACHE.clear()
             self._path_cache.clear()
             self._id_cache.clear()
+        elif endpoint == "/open/folder/add":
+            self._path_cache.clear()
+            self._id_cache.clear()
 
-        def cooldown(reason, start=False):
+        def cooldown(reason, start=False, seconds=None):
             global _COOLDOWN_UNTIL
             lock = getattr(self.backend, "_limit_lock", None)
             if lock is None:
                 raise PauseTask("115 风控保护不可用：宿主未提供共享冷却锁，请检查 MoviePilot 版本")
             with lock:
-                until = getattr(self.backend, "_limit_until", 0)
+                raw_until = getattr(self.backend, "_limit_until", 0)
+                until = float(raw_until) if isinstance(raw_until, (int, float)) else 0.0
                 if start:
-                    until = max(until, time.time() + getattr(self.backend, "limit_sleep_seconds", 3600))
+                    if seconds is not None:
+                        duration = float(seconds)
+                    else:
+                        raw_sleep = getattr(self.backend, "limit_sleep_seconds", 3600)
+                        duration = float(raw_sleep) if isinstance(raw_sleep, (int, float)) else 3600.0
+                    until = max(until, time.time() + duration)
                     self.backend._limit_until = until
             until = max(until, _COOLDOWN_UNTIL)
             if until > time.time():
@@ -131,8 +177,15 @@ class OpenAPI:
                 raise RateLimited(f"115 风控：{reason}；接口 {endpoint}，冷却至 " +
                                   time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)), until)
             _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, until)
+            return until
 
-        cooldown("MoviePilot 共享冷却中")
+        recent_until = cooldown("MoviePilot 共享冷却中")
+        if recent_until > 0:
+            since_cooldown = time.time() - recent_until
+            if 0 <= since_cooldown < 300 and _LAST_REQUEST_AT > 0:
+                gap = time.monotonic() - _LAST_REQUEST_AT
+                if gap < 1.5 and hasattr(self.stop, "wait"):
+                    self.stop.wait(1.5 - gap)
         limiter = getattr(self.backend, "_api_limiter", None)
         if limiter is not None:
             limiter.acquire()
@@ -140,19 +193,45 @@ class OpenAPI:
         if stats is not None:
             stats.record()
         cooldown("MoviePilot 共享冷却中")
+        backend_key = id(self.backend)
+        now_mono = time.monotonic()
+        if len(_AUTH_FAILURES) > 64:
+            for k in [k for k, v in _AUTH_FAILURES.items() if v[0] <= now_mono]:
+                _AUTH_FAILURES.pop(k, None)
+        failure = _AUTH_FAILURES.get(backend_key)
+        if failure and failure[0] > now_mono and failure[1] is None:
+            raise PauseTask("内置 115 授权失效，请重新授权后恢复任务")
         token = self.backend.access_token
         if not token:
+            _AUTH_FAILURES[backend_key] = (now_mono + 60.0, None)
             raise PauseTask("内置 115 授权失效，请重新授权后恢复任务")
+        if failure and failure[0] > now_mono and failure[1] == token:
+            raise PauseTask("内置 115 授权失效，请重新授权后恢复任务")
+        session = getattr(self.backend, "session", None)
+        headers_map = getattr(session, "headers", None)
+        ua = headers_map.get("User-Agent") if hasattr(headers_map, "get") else None
+        user_agent = ua if isinstance(ua, str) and ua.strip() else "W115Storage/2.0"
+        _LAST_REQUEST_AT = time.monotonic()
         try:
             resp = self.client.request(method, self.backend.base_url + endpoint,
                 data=data, params=params, headers={"Authorization": f"Bearer {token}",
-                    "User-Agent": "MoviePilot-P115InstantWait/0.1",
+                    "User-Agent": user_agent,
+                    "Accept-Encoding": "gzip, deflate",
                     "Content-Type": "application/x-www-form-urlencoded"})
         except httpx.TimeoutException:
             raise RetryLater(f"115 请求超时（{endpoint}）") from None
         except httpx.RequestError:
             raise RetryLater(f"115 网络连接失败（{endpoint}）") from None
-        if resp.status_code in (401, 403):
+        if resp.status_code == 401:
+            _AUTH_FAILURES[backend_key] = (time.monotonic() + 60.0, token)
+            raise PauseTask(f"115 授权或访问权限异常（HTTP {resp.status_code}，{endpoint}），请检查授权")
+        if resp.status_code == 403:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                cooldown("访问被拦截（HTTP 403）", start=True, seconds=300)
             raise PauseTask(f"115 授权或访问权限异常（HTTP {resp.status_code}，{endpoint}），请检查授权")
         if resp.status_code == 429:
             cooldown("请求限流（HTTP 429）", start=True)
@@ -168,15 +247,21 @@ class OpenAPI:
             raise RetryLater(f"115 接口响应格式异常（{endpoint}）")
         code = result.get("code", 0 if result.get("state") else -1)
         if missing and code in (20004, 430004):
+            _AUTH_FAILURES.pop(backend_key, None)
             return None
         if code != 0 or result.get("state") is False:
-            message = result.get("message")
-            if isinstance(message, str) and "已达到当前访问上限" in message:
-                cooldown(f"已达到当前访问上限（代码 {code}）", start=True)
+            texts = [str(result[k]) for k in ("message", "error", "msg", "err_msg") if isinstance(result.get(k), str)]
+            joined = " ".join(texts)
+            if any(marker in joined for marker in ("已达到当前访问上限", "访问上限", "操作太快", "访问频率", "请求过于频繁", "触发风控")) or code in (911, 40140117):
+                cooldown(f"触发访问频控（代码 {code if isinstance(code, int) else '未知'}）", start=True)
+            if isinstance(code, int) and 40140100 <= code <= 40140199:
+                _AUTH_FAILURES[backend_key] = (time.monotonic() + 60.0, token)
+                raise PauseTask(f"115 登录授权异常（{endpoint}，代码 {code}），请重新授权后恢复任务")
             # The remote message can contain credentials or signed URLs. Only
             # expose the known risk-control message above, plus the error code.
             code = code if isinstance(code, int) else "未知"
             raise RetryLater(f"115 接口返回业务错误（{endpoint}，代码 {code}）")
+        _AUTH_FAILURES.pop(backend_key, None)
         return result.get("data")
 
     @staticmethod
@@ -194,15 +279,27 @@ class OpenAPI:
 
     def raw_path(self, path):
         key = str(path).replace("\\", "/")
+        if key in self._path_cache:
+            cached_local = self._path_cache[key]
+            if cached_local is not None or self._allow_negative_cache:
+                return cached_local
         cache_key = (id(self.backend), key)
         cached = _PATH_CACHE.get(cache_key)
         if cached and cached[0] > time.monotonic():
+            self._path_cache[key] = cached[1]
             return cached[1]
         value = self.one_info(self.request("POST", "/open/folder/get_info",
             data={"path": key}, missing=True))
         if value and str(value.get("file_category")) == "0":
-            _PATH_CACHE[cache_key] = (time.monotonic() + 300.0, value)
-        self._path_cache[key] = value
+            now_mono = time.monotonic()
+            if len(_PATH_CACHE) >= 2048:
+                for expired_key in [k for k, v in _PATH_CACHE.items() if v[0] <= now_mono]:
+                    _PATH_CACHE.pop(expired_key, None)
+                if len(_PATH_CACHE) >= 2048:
+                    _PATH_CACHE.pop(next(iter(_PATH_CACHE)), None)
+            _PATH_CACHE[cache_key] = (now_mono + 300.0, value)
+        if value is not None or self._allow_negative_cache:
+            self._path_cache[key] = value
         return value
 
     def raw_id(self, file_id):
@@ -273,6 +370,7 @@ class OpenAPI:
             raise
         if not info or not info.get("file_id"):
             raise RetryLater("115 创建目录后尚未返回目录 ID")
+        _PATH_CACHE.pop((id(self.backend), p.as_posix()), None)
         return self.item_factory(storage="u115", type="dir", path=p.as_posix(),
                                  fileid=str(info["file_id"]), name=p.name)
 
@@ -309,38 +407,47 @@ class OpenAPI:
     def instant(self, path, folder, name, hashes):
         data = {"file_name": name, "file_size": hashes["fingerprint"]["size"],
                 "target": f"U_1_{folder.fileid}", "fileid": hashes["sha1"], "preid": hashes["preid"]}
-        result = self.request("POST", "/open/upload/init", data=data)
-        if not isinstance(result, dict):
-            raise RetryLater("115 上传初始化响应不完整")
-        if result.get("code") in (700, 701) and result.get("sign_check"):
-            try:
-                start, end = map(int, result["sign_check"].split("-"))
-            except (ValueError, TypeError):
-                raise PauseTask("115 二次校验区间格式异常") from None
-            if not 0 <= start <= end < hashes["fingerprint"]["size"]:
-                raise PauseTask("115 二次校验区间越界")
-            sha = hashlib.sha1()
-            remaining = end - start + 1
-            with open(path, "rb") as stream:
-                stream.seek(start)
-                while remaining:
-                    if self.stop.is_set():
-                        raise RetryLater("插件正在停止")
-                    block = stream.read(min(1024 * 1024, remaining))
-                    if not block:
-                        raise PauseTask("源文件无法满足二次校验")
-                    sha.update(block)
-                    remaining -= len(block)
-            data.update(pick_code=result.get("pick_code"), sign_key=result.get("sign_key"),
-                        sign_val=sha.hexdigest().upper())
-            verified = self.request("POST", "/open/upload/init", data=data)
-            if not isinstance(verified, dict):
-                raise RetryLater("115 二次校验响应不完整")
-            # The second response may omit bucket/object/callback from the first.
-            result = {**result, **verified}
-        if result.get("status") != 2:
-            raise NotInstant("未命中秒传，等待下次重试", result)
-        return result.get("file_id")
+        try:
+            result = self.request("POST", "/open/upload/init", data=data)
+            if not isinstance(result, dict):
+                raise RetryLater("115 上传初始化响应不完整")
+            if result.get("code") in (700, 701) and result.get("sign_check"):
+                try:
+                    start, end = map(int, result["sign_check"].split("-"))
+                except (ValueError, TypeError):
+                    raise PauseTask("115 二次校验区间格式异常") from None
+                if not 0 <= start <= end < hashes["fingerprint"]["size"]:
+                    raise PauseTask("115 二次校验区间越界")
+                sha = hashlib.sha1()
+                remaining = end - start + 1
+                with open(path, "rb") as stream:
+                    stream.seek(start)
+                    while remaining:
+                        if self.stop.is_set():
+                            raise RetryLater("插件正在停止")
+                        block = stream.read(min(1024 * 1024, remaining))
+                        if not block:
+                            raise PauseTask("源文件无法满足二次校验")
+                        sha.update(block)
+                        remaining -= len(block)
+                data.update(pick_code=result.get("pick_code"), sign_key=result.get("sign_key"),
+                            sign_val=sha.hexdigest().upper())
+                verified = self.request("POST", "/open/upload/init", data=data)
+                if not isinstance(verified, dict):
+                    raise RetryLater("115 二次校验响应不完整")
+                # The second response may omit bucket/object/callback from the first.
+                result = {**result, **verified}
+            if result.get("status") != 2:
+                raise NotInstant("未命中秒传，等待下次重试", result)
+            self._path_cache.clear()
+            self._id_cache.clear()
+            return result.get("file_id")
+        except NotInstant:
+            raise
+        except Exception:
+            self._path_cache.clear()
+            self._id_cache.clear()
+            raise
 
     def upload(self, path, folder, hashes, init, payload, checkpoint):
         """Persist multipart receipts for retries without storing credentials."""
@@ -352,34 +459,38 @@ class OpenAPI:
                 raise RetryLater("插件正在停止，上传进度已保留")
             check_source(path, hashes["fingerprint"], self.stop, hashes)
 
+        def open_bucket():
+            token = self.request("GET", "/open/upload/get_token")
+            if not isinstance(token, dict) or not all(token.get(k) for k in
+                    ("endpoint", "AccessKeyId", "AccessKeySecret", "SecurityToken")):
+                raise PauseTask("115 未返回完整的普通上传凭证")
+            # Force TLS even when the credential endpoint is returned as http://.
+            endpoint = token["endpoint"]
+            if endpoint.startswith("http://"):
+                endpoint = "https://" + endpoint[len("http://"):]
+            auth = oss2.StsAuth(token["AccessKeyId"], token["AccessKeySecret"], token["SecurityToken"])
+            return oss2.Bucket(auth, endpoint, details["bucket"], connect_timeout=30), time.monotonic()
+
         check_upload_source()
         saved = payload.get("upload_session")
         details = saved or init or {}
         if not all(details.get(k) for k in ("bucket", "object", "pick_code")):
             raise PauseTask("115 普通上传参数不完整，请检查授权后重试")
-        token = self.request("GET", "/open/upload/get_token")
-        if not isinstance(token, dict) or not all(token.get(k) for k in
-                ("endpoint", "AccessKeyId", "AccessKeySecret", "SecurityToken")):
-            raise PauseTask("115 未返回完整的普通上传凭证")
+        bucket, token_at = open_bucket()
         resumed = self.request("POST", "/open/upload/resume", data={
             "file_size": hashes["fingerprint"]["size"], "target": f"U_1_{folder.fileid}",
             "fileid": hashes["sha1"], "pick_code": details["pick_code"]})
         callback = (resumed or {}).get("callback") or (init or {}).get("callback")
         if not isinstance(callback, dict) or not all(callback.get(k) for k in ("callback", "callback_var")):
             raise PauseTask("115 未返回上传完成回调参数，未发送文件内容")
-        # Force TLS even when the credential endpoint is returned as http://.
-        endpoint = token["endpoint"]
-        if endpoint.startswith("http://"):
-            endpoint = "https://" + endpoint[len("http://"):]
-        auth = oss2.StsAuth(token["AccessKeyId"], token["AccessKeySecret"], token["SecurityToken"])
-        bucket = oss2.Bucket(auth, endpoint, details["bucket"], connect_timeout=30)
         stage = "初始化上传"
         try:
             if not saved:
                 upload_id = bucket.init_multipart_upload(details["object"],
                     params={"encoding-type": "url", "sequential": ""}).upload_id
                 # Stable part sizes let retries resume from saved receipts.
-                part_size = oss2.determine_part_size(hashes["fingerprint"]["size"], preferred_size=10 * 1024 * 1024)
+                part_size = oss2.determine_part_size(hashes["fingerprint"]["size"],
+                    preferred_size=preferred_part_size(hashes["fingerprint"]["size"]))
                 saved = {"bucket": details["bucket"], "object": details["object"],
                          "pick_code": details["pick_code"], "upload_id": upload_id,
                          "part_size": part_size, "parts": []}
@@ -391,10 +502,20 @@ class OpenAPI:
                 stream.seek(offset)
                 while offset < size:
                     stage = "上传分片"
+                    if time.monotonic() - token_at >= 2700:
+                        bucket, token_at = open_bucket()
                     length = min(saved["part_size"], size - offset)
                     number = len(saved["parts"]) + 1
-                    part = bucket.upload_part(saved["object"], saved["upload_id"], number,
-                        data=oss2.SizedFileAdapter(StoppableReader(stream, self.stop), length))
+                    try:
+                        part = bucket.upload_part(saved["object"], saved["upload_id"], number,
+                            data=oss2.SizedFileAdapter(StoppableReader(stream, self.stop), length))
+                    except oss2.exceptions.OssError as part_err:
+                        if part_err.code != "SecurityTokenExpired":
+                            raise
+                        bucket, token_at = open_bucket()
+                        stream.seek(offset)
+                        part = bucket.upload_part(saved["object"], saved["upload_id"], number,
+                            data=oss2.SizedFileAdapter(StoppableReader(stream, self.stop), length))
                     saved["parts"].append({"number": number, "etag": part.etag})
                     offset += length
                     checkpoint()
@@ -418,9 +539,15 @@ class OpenAPI:
             if isinstance(result_data, dict) and str(result_data.get("file_id", "")).isdigit():
                 payload["remote_id"] = str(result_data["file_id"])
             checkpoint()
+            self._path_cache.clear()
+            self._id_cache.clear()
         except (RetryLater, PauseTask):
+            self._path_cache.clear()
+            self._id_cache.clear()
             raise
         except oss2.exceptions.OssError as error:
+            self._path_cache.clear()
+            self._id_cache.clear()
             code = error.code
             if code == "NoSuchUpload":
                 payload["upload_pick_code"] = details["pick_code"]
@@ -432,13 +559,15 @@ class OpenAPI:
                 if saved:
                     saved.pop("completing", None)
                     checkpoint()
-                raise RetryLater("上传凭证已过期，稍后刷新后继续") from None
+                raise TokenExpired("上传凭证已过期，稍后刷新后继续") from None
             # Only expose the SDK error code, never its signed URL or credentials.
             code = code if code and code.isascii() and code.isalnum() else type(error).__name__
             if code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
                 raise PauseTask(f"115 上传授权不可用（{code}），请检查授权") from None
             raise RetryLater(f"{stage}失败（{code}）") from None
         except Exception as error:
+            self._path_cache.clear()
+            self._id_cache.clear()
             raise RetryLater(f"{stage}失败（{type(error).__name__}），已保留进度") from None
 
 
@@ -472,12 +601,17 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
         raise PauseTask("已停用临时目录，请选择正式整理目标")
     if not store.reserve_target(row["id"], str(final)):
         raise PauseTask("另一个未结束任务占用相同正式目标，请先处理该任务")
+    session = data.get("upload_session") or {}
+    if hasattr(api, "_allow_negative_cache"):
+        api._allow_negative_cache = not (
+            data.get("write_intent") or data.get("instant_confirmed")
+            or data.get("upload_confirmed") or session.get("completing")
+        )
     checkpoint = lambda: store.update(row["id"], payload=data)
     item = resolve_target(api, data)
     if item:
         checkpoint()
         return item
-    session = data.get("upload_session") or {}
     if (data.get("remote_id") or data.get("instant_confirmed") or data.get("upload_confirmed")
             or session.get("completing") or (data.get("write_intent") and not session)):
         if data.get("remote_id") and api.raw_id(data["remote_id"]):
@@ -511,6 +645,7 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
     else:
         data["write_intent"] = True
         checkpoint()
+        miss_error = None
         try:
             file_id = api.instant(path, folder, final.name, data["hashes"])
         except NotInstant as error:
@@ -519,18 +654,7 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
             checkpoint()
             if not force:
                 raise
-            if progress:
-                progress("秒传未命中，转普通上传")
-            # Check again immediately before multipart upload starts.
-            item = resolve_target(api, data)
-            if item:
-                checkpoint()
-                return item
-            data["write_intent"] = True
-            checkpoint()
-            api.upload(path, folder, data["hashes"], error.upload_data, data, checkpoint)
-            if progress:
-                progress("普通上传已提交")
+            miss_error = error
         except RateLimited:
             # A 429 / access-limit response definitively rejected the request.
             data.pop("write_intent", None)
@@ -539,6 +663,8 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
         except PauseTask:
             data.pop("write_intent", None)
             checkpoint()
+            raise
+        except TokenExpired:
             raise
         except RetryLater as error:
             raise RetryLater(f"115 秒传初始化未确认（{error}）；目标可能延迟出现，本次不会重复提交") from error
@@ -549,6 +675,43 @@ def prepare_direct(api, store, row, path, data, force, progress=None):
             checkpoint()
             if progress:
                 progress("秒传命中")
+            if hasattr(api, "_allow_negative_cache"):
+                api._allow_negative_cache = False
+            if file_id:
+                try:
+                    item = resolve_target(api, data)
+                except RateLimited:
+                    raise
+                except RetryLater:
+                    item = None
+                if item:
+                    checkpoint()
+                    return item
+                stop = getattr(api, "stop", None)
+                if stop is not None and hasattr(stop, "wait"):
+                    stop.wait(1.5)
+                cache = getattr(api, "_path_cache", None)
+                if isinstance(cache, dict):
+                    cache.clear()
+        if miss_error is not None:
+            if progress:
+                progress("秒传未命中，转普通上传")
+            # Check again immediately before multipart upload starts.
+            item = resolve_target(api, data)
+            if item:
+                checkpoint()
+                return item
+            data["write_intent"] = True
+            checkpoint()
+            try:
+                api.upload(path, folder, data["hashes"], miss_error.upload_data, data, checkpoint)
+            except (RateLimited, TokenExpired, PauseTask):
+                if not data.get("upload_session") and not data.get("upload_confirmed"):
+                    data.pop("write_intent", None)
+                    checkpoint()
+                raise
+            if progress:
+                progress("普通上传已提交")
     # Reconcile the final path, including callbacks that don't return a file ID.
     return prepare_direct(api, store, row, path, data, force, progress)
 
@@ -658,17 +821,20 @@ class NativePlanStorage(DirectStorage):
                                  name=final.name, size=self.hashes["fingerprint"]["size"])
 
 
-def apply_native_deletions(api, store, row, item_factory):
+def apply_native_deletions(api, store, row, item_factory, *, only_same_path=False):
     """Reconcile the persisted MP decision before writing the final filename."""
     data = row["payload"]
-    if any(part in (".mp115-staging", ".mp115-backups") for part in PurePosixPath(data["final_path"]).parts):
+    final = PurePosixPath(data["final_path"])
+    if any(part in (".mp115-staging", ".mp115-backups") for part in final.parts):
         raise PauseTask("已停用临时目录，请选择正式整理目标")
-    if not store.reserve_target(row["id"], str(PurePosixPath(data["final_path"]))):
+    if not store.reserve_target(row["id"], str(final)):
         raise PauseTask("另一个未结束任务占用相同正式目标")
     for saved in data.get("native_deletions", []):
         if saved.get("deleted"):
             continue
         item = item_factory(**saved["item"])
+        if only_same_path and PurePosixPath(str(item.path).replace("\\", "/")) != final:
+            continue
         api.delete(item)
         saved["deleted"] = True
         store.update(row["id"], payload=data)

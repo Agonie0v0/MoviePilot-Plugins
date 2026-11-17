@@ -81,3 +81,37 @@ class TaskActionTests(unittest.TestCase):
         radios = [n["props"] for n in nodes if n["component"] == "input"]
         self.assertEqual(sum(r["checked"] for r in radios), 1)
         self.assertEqual({r["value"] for r in radios}, {"all", "waiting", "attention", "transfer", "ended"})
+
+    def test_cooldown_banner_density_toggle_and_confirm_layout(self):
+        import json
+        from tests.test_records import modules
+        now = time.time()
+        tasks = [
+            dict(id=f"p{i}", history_id=i, source=f"/downloads/Series.S01/Ep0{i}.mkv",
+                 target=f"/library/Ep0{i}.mkv", state="paused", attempts=2, next_at=now + 600,
+                 size=2 * 1024 ** 3, message="达到上限")
+            for i in (1, 2)
+        ] + [
+            dict(id="w1", history_id=3, source="/downloads/Series.S01/Ep03.mkv",
+                 target="/library/Ep03.mkv", state="waiting", attempts=1, next_at=now + 600,
+                 size=1024 ** 3, message="等待重试")
+        ]
+        for generation in ("v2", "v3"):
+            with self.subTest(generation=generation):
+                _, _, page_ui = modules(generation)
+                self.assertNotIn("-92px", page_ui.STYLES)
+                self.assertIn("p115-reveal", page_ui.STYLES)
+                self.assertIn("p115-shimmer", page_ui.STYLES)
+                page = page_ui.task_page(tasks, True, max_retries=3, cooldown_until=now + 600)
+                nodes = list(walk(page))
+                dumped = json.dumps(page, ensure_ascii=False)
+                self.assertTrue(any(n.get("props", {}).get("class") == "p115-cooldown-banner" for n in nodes))
+                self.assertIn("风控冷却至", dumped)
+                self.assertTrue(any(n.get("props", {}).get("class") == "p115-density-toggle" for n in nodes))
+                self.assertTrue(any(n.get("props", {}).get("class") == "p115-quick-bulk" for n in nodes))
+                self.assertEqual(len([n for n in nodes if n["component"] == "input"]), 5)
+                disabled_nodes = list(walk(page_ui.task_page(tasks, False, cooldown_until=now + 600)))
+                self.assertFalse(any(n.get("props", {}).get("class") == "p115-cooldown-banner" for n in disabled_nodes))
+                label, value, _ = page_ui.schedule_summary({"state": "waiting", "next_at": now + 900}, True, now)
+                self.assertEqual(label, "下次重试 · MP 时间")
+                self.assertIn("分钟后", value)

@@ -69,3 +69,41 @@ class RecordTests(unittest.TestCase):
             for value in (None, "bad timestamp", float("nan"), float("inf")):
                 with self.subTest(generation=generation, value=value):
                     self.assertEqual(ui.record_time(value), "未记录")
+
+    def test_size_and_multipart_upload_progress_rendering(self):
+        size = 100 * 1024 * 1024
+        part_size = 20 * 1024 * 1024
+        for generation in ("v2", "v3"):
+            records, store, ui = modules(generation)
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as temp:
+                db = store.QueueStore(Path(temp) / "queue.db")
+                payload = {
+                    "task": {"fileitem": {"path": "/downloads/Show.S01/Ep01.mkv", "size": size}},
+                    "final_path": "/library/Show/Ep01.mkv",
+                    "upload_session": {"part_size": part_size, "parts": [{"number": 1, "etag": "a"}, {"number": 2, "etag": "b"}]},
+                }
+                row, _ = db.enqueue("local:/downloads/Show.S01/Ep01.mkv", payload)
+                db.update(row["id"], state="uploading")
+                record = records.task_record(db.get(row["id"]))
+                self.assertEqual(record["size"], size)
+                self.assertEqual(record["upload_progress"]["percent"], 40)
+                self.assertEqual((record["upload_progress"]["done_parts"], record["upload_progress"]["total_parts"]), (2, 5))
+                html = json.dumps(ui.task_page([record], True, summary={
+                    "states": {"completed": 20}, "methods": {"instant": 19, "upload": 1}, "total": 21, "next_at": None,
+                }), ensure_ascii=False)
+                self.assertIn("100.0 MB", html)
+                self.assertIn("Show.S01", html)
+                self.assertIn("分片上传进度 · 40%", html)
+                self.assertIn("40.0 MB / 100.0 MB · 2/5 片", html)
+                self.assertIn("秒传率 95%", html)
+                self.assertIn("p115-ratio-bar", html)
+
+                payload["upload_session"]["completing"] = True
+                db.update(row["id"], payload=payload)
+                completing_record = records.task_record(db.get(row["id"]))
+                self.assertEqual(completing_record["upload_progress"]["percent"], 99)
+                self.assertIn("正在提交上传合并", json.dumps(ui.task_page([completing_record], True), ensure_ascii=False))
+
+                db.update(row["id"], state="completed")
+                done_record = records.task_record(db.get(row["id"]))
+                self.assertIsNone(done_record["upload_progress"])

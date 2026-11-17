@@ -21,7 +21,7 @@ from app.schemas import FileItem, TransferInfo, TransferTask
 from app.schemas.types import MediaType, SystemConfigKey
 
 from .remote import (DeferredSource, NotInstant, OpenAPI, PauseTask, DirectStorage, RateLimited,
-                     RetryLater, fingerprint, hash_file, prepare_direct, NativePlanStorage,
+                     RetryLater, TokenExpired, fingerprint, hash_file, prepare_direct, NativePlanStorage,
                      apply_native_deletions, cooldown_until, check_source, resolve_target)
 from .store import QueueStore
 
@@ -102,7 +102,22 @@ class InstantWaitEngine:
         self.runtime_lock = threading.RLock()
         self.native_lock = threading.Condition()
         self.native_active = 0
+        self._u115 = None
+        self._client = None
+        self._client_lock = threading.Lock()
         self.extensions = {ext.strip().lower().lstrip(".") for ext in config["extensions"].split(",") if ext.strip()}
+
+    def _backend(self):
+        self._u115 = U115Pan()
+        return self._u115
+
+    def _open_api(self):
+        import httpx
+        with self._client_lock:
+            if self._client is None:
+                self._client = httpx.Client(timeout=30, follow_redirects=False)
+            client = self._client
+        return OpenAPI(self._backend(), FileItem, self.stop_event, client, False)
 
     def log_task(self, row, event, level="info", **details):
         payload = row["payload"]
@@ -351,6 +366,11 @@ class InstantWaitEngine:
         self.uninstall()
         with self.native_lock:
             self.native_lock.notify_all()
+        with self._client_lock:
+            client, self._client = self._client, None
+        if client is not None:
+            client.close()
+        self._u115 = None
         return True
 
     def waiting_view(self, task):
@@ -434,6 +454,16 @@ class InstantWaitEngine:
         for batch in active_batches:
             self.chain._TransferChain__close_scrape_batch(batch)
 
+    def _cooldown_deadline(self):
+        raw_until = getattr(self._backend(), "_limit_until", 0)
+        limit_until = float(raw_until) if isinstance(raw_until, (int, float)) else 0.0
+        return max(limit_until, cooldown_until())
+
+    def active_cooldown_until(self):
+        """Return active 115 risk-control cooldown timestamp for UI visibility, or 0."""
+        until = self._cooldown_deadline()
+        return until if until > time.time() else 0.0
+
     def run(self, manual=False):
         wake = self.upload_wake if manual else self.wake
         while not self.stop_event.is_set():
@@ -442,7 +472,7 @@ class InstantWaitEngine:
                 # is active. Claiming first made a large queue repeatedly
                 # enter execute(), producing a risk-control storm in logs and
                 # needlessly churning each task's retry state.
-                until = max(float(getattr(U115Pan(), "_limit_until", 0) or 0), cooldown_until())
+                until = self._cooldown_deadline()
                 delay = until - time.time()
                 if delay > 0:
                     wake.wait(min(delay, 60))
@@ -454,6 +484,8 @@ class InstantWaitEngine:
                     wake.clear()
                     continue
                 self.execute(row)
+                if until > 0 and 0 <= time.time() - until < 300:
+                    self.stop_event.wait(random.uniform(1.0, 2.5))
             except Exception:
                 logger.error("【115秒传等待】调度异常，队列仍保留，稍后重试")
                 self.stop_event.wait(5)
@@ -474,7 +506,7 @@ class InstantWaitEngine:
             if payload.get("result"):
                 self.log_task(row, "恢复整理结果", 说明="核对远端后继续原记录回写")
                 info = TransferInfo.model_validate(payload["result"])
-                api = OpenAPI(U115Pan(), FileItem, self.stop_event)
+                api = self._open_api()
                 item = resolve_target(api, payload)
                 if not item:
                     path = Path(task.fileitem.path)
@@ -505,7 +537,7 @@ class InstantWaitEngine:
                 if payload["hashes"]["fingerprint"] != payload["source_initial"]:
                     raise PauseTask("源文件在开始计算哈希前发生变化，已暂停")
                 self.store.update(key, payload=payload)
-            api = OpenAPI(U115Pan(), FileItem, self.stop_event)
+            api = self._open_api()
             final = PurePosixPath(payload["final_path"])
             if not payload.get("native_plan") and not payload.get("remote_id") and not payload.get("write_intent"):
                 planner = NativePlanStorage(api, self.store, row, FileItem)
@@ -520,9 +552,12 @@ class InstantWaitEngine:
                 payload["native_plan"] = True
                 payload["native_deletions"] = [{"item": item.model_dump(mode="json")} for item in planner.deletions]
                 self.store.update(key, payload=payload)
-            apply_native_deletions(api, self.store, row, FileItem)
-            item = prepare_direct(api, self.store, row, path, payload, manual,
+            apply_native_deletions(api, self.store, self.store.get(key), FileItem, only_same_path=True)
+            payload = self.store.get(key)["payload"]
+            item = prepare_direct(api, self.store, self.store.get(key), path, payload, manual,
                                   lambda event: self.log_task(row, event))
+            apply_native_deletions(api, self.store, self.store.get(key), FileItem)
+            payload = self.store.get(key)["payload"]
             proxy = DirectStorage(api, self.store, row, str(final), item, payload["hashes"])
             args = task_kwargs(task)
             args.update(source_oper=DeferredSource(LocalStorage()), target_oper=proxy, preview=False)
@@ -555,11 +590,31 @@ class InstantWaitEngine:
             self.store.update(key, state=state, attempts=current_attempts, payload=data,
                               next_at=error.until, message=message)
             self.log_task(self.store.get(key), "115风控冷却", level="warning", 原因=message)
+        except TokenExpired as error:
+            if manual:
+                current = self.store.get(key)
+                data = current["payload"]
+                current_attempts = max(0, current["attempts"] - 1)
+                data["upload_attempts"] = max(0, data.get("upload_attempts", 1) - 1)
+                message = str(error) + "；将自动刷新凭证后继续"
+                self.store.update(key, state="upload_queued", attempts=current_attempts, payload=data,
+                                  next_at=time.time() + 2, message=message)
+                self.log_task(self.store.get(key), "上传凭证过期刷新", level="warning", 原因=message)
+                self.upload_wake.set()
+            else:
+                self.defer(row, "waiting", str(error))
         except PauseTask as exc:
             self.defer(row, "paused", str(exc))
         except NotInstant as exc:
             self.defer(row, "waiting", str(exc))
         except RetryLater as exc:
+            current = self.store.get(key)
+            saved_data = current["payload"]
+            if not manual and (saved_data.get("instant_confirmed") or saved_data.get("upload_confirmed")):
+                current_attempts = max(0, current["attempts"] - 1)
+                saved_data["auto_attempts"] = max(0, saved_data.get("auto_attempts", 1) - 1)
+                self.store.update(key, attempts=current_attempts, payload=saved_data)
+                row = {**current, "attempts": current_attempts, "payload": saved_data}
             self.defer(row, "waiting", str(exc))
         except Exception:
             self.defer(row, "waiting", "后台整理异常，保留任务后重试")
@@ -583,8 +638,9 @@ class InstantWaitEngine:
             state = "upload_queued" if upload_retry else "paused"
             reason = f"上传暂未完成：{reason}" if upload_retry else f"上传已暂停：{reason}"
         elif state == "waiting":
-            reached = ("等待超过设定期限" if deadline and now >= deadline else
-                       "自动重试次数已用完" if payload.get("auto_attempts", row["attempts"]) >= self.config.get("max_retries", 3) + 1 else None)
+            confirmed = bool(payload.get("instant_confirmed") or payload.get("upload_confirmed"))
+            reached = ("等待超过设定期限" if (deadline and now >= deadline and not confirmed) else
+                       "自动重试次数已用完" if (not confirmed and payload.get("auto_attempts", row["attempts"]) >= self.config.get("max_retries", 3) + 1) else None)
             if reached or limit_reached:
                 state = "upload_queued" if self.config.get("limit_action", "manual") == "upload" else "paused"
                 reason = f"{reached or reason}，{'已安排自动强制上传' if state == 'upload_queued' else '请手动处理'}。最后结果：{reason}"

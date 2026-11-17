@@ -25,7 +25,10 @@ ACTION_HINT = "继续等待会重置自动尝试次数和时限；强制上传�
 STYLES = """
 @keyframes p115-spin{to{transform:rotate(360deg)}}
 @keyframes p115-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.55;transform:scale(.92)}}
+@keyframes p115-reveal{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+@keyframes p115-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 .p115-ui{
+  --p115-ease:cubic-bezier(.22,1,.36,1);
   --p115-line:rgba(var(--v-theme-on-surface),.09);
   --p115-line-strong:rgba(var(--v-theme-on-surface),.14);
   --p115-muted:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 68%,rgb(var(--v-theme-surface)));
@@ -125,6 +128,7 @@ STYLES = """
 }
 .p115-ui details[open]>summary::after{transform:rotate(90deg);background:rgba(var(--v-theme-primary),.12);color:rgb(var(--v-theme-primary))}
 .p115-ui .p115-disclosure-body{padding:16px 18px 18px}
+.p115-ui .p115-disclosure[open]>.p115-disclosure-body,.p115-ui .p115-task-details[open]>.p115-task-body,.p115-ui .p115-confirm[open]>.p115-confirm-body{animation:p115-reveal .18s var(--p115-ease)}
 .p115-ui summary:focus-visible,.p115-ui button:focus-visible,.p115-ui input:focus-visible{outline:2px solid rgb(var(--v-theme-primary));outline-offset:3px;border-radius:6px}
 .p115-ui .p115-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}
 .p115-ui .p115-metric{
@@ -232,9 +236,9 @@ STYLES = """
 .p115-ui .p115-task:has(.p115-task-details[open]) .p115-task-context{display:none}
 .p115-ui .p115-row-actions{display:flex;align-items:flex-start;flex-wrap:wrap;gap:8px;flex-shrink:0}
 .p115-ui .p115-row-actions>.v-btn{min-width:84px}
-.p115-ui .p115-row-actions:has(.p115-confirm[open]){flex-basis:100%;max-width:100%;margin-left:54px;margin-top:4px}
-.p115-ui .p115-row-actions .p115-confirm[open]{flex:1 1 calc(100% - 92px);width:auto}
-.p115-ui .p115-row-actions .p115-confirm-body{margin-left:-92px}
+.p115-ui .p115-row-actions:has(.p115-confirm[open]){flex-basis:100%;width:100%;max-width:100%;margin-left:0;padding-left:54px;margin-top:4px}
+.p115-ui .p115-row-actions .p115-confirm[open]{flex:1 1 100%;width:100%}
+.p115-ui .p115-row-actions .p115-confirm-body{margin-left:0;width:100%}
 .p115-ui .v-btn{letter-spacing:0;border-radius:8px}
 .p115-ui .p115-row-actions .v-btn{min-height:36px;font-weight:600}
 .p115-ui .p115-confirm{min-width:0;font-size:13px}
@@ -289,8 +293,62 @@ STYLES = """
 .p115-ui .p115-path-label{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--p115-muted);margin-bottom:4px}
 .p115-ui .p115-path{
   display:block;font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size:12px;
-  line-height:1.65;overflow-wrap:anywhere;white-space:pre-wrap;user-select:text;margin:0
+  line-height:1.65;overflow-wrap:anywhere;white-space:pre-wrap;user-select:all;cursor:pointer;margin:0
 }
+.p115-ui .p115-cooldown-banner{
+  display:flex;align-items:center;gap:12px;padding:12px 16px;margin-bottom:16px;border-radius:13px;
+  border:1px solid rgba(var(--v-theme-warning),.36);
+  background:linear-gradient(90deg,rgba(var(--v-theme-warning),.14) 0%,rgba(var(--v-theme-warning),.04) 70%);
+  box-shadow:var(--p115-shadow-sm);animation:p115-reveal .2s var(--p115-ease)
+}
+.p115-ui .p115-cooldown-banner .v-icon{color:rgb(var(--v-theme-warning));flex-shrink:0;animation:p115-pulse 2s ease-in-out infinite}
+.p115-ui .p115-progress{margin-top:9px}
+.p115-ui .p115-progress-head{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
+  font-size:11.5px;font-weight:620;color:var(--p115-muted);font-variant-numeric:tabular-nums;margin-bottom:5px
+}
+.p115-ui .p115-progress-track{
+  position:relative;height:6px;border-radius:999px;background:rgba(var(--v-theme-on-surface),.09);overflow:hidden
+}
+.p115-ui .p115-progress-fill{
+  height:100%;border-radius:999px;min-width:6px;
+  background:linear-gradient(90deg,rgb(var(--v-theme-primary)) 0%,rgb(var(--v-theme-info)) 100%);
+  transition:width .3s var(--p115-ease)
+}
+.p115-ui .p115-task[data-state=uploading] .p115-progress-fill{
+  background:linear-gradient(90deg,rgb(var(--v-theme-primary)) 0%,rgb(var(--v-theme-info)) 50%,rgb(var(--v-theme-primary)) 100%);
+  background-size:200% 100%;animation:p115-shimmer 2.2s linear infinite
+}
+.p115-ui .p115-ratio-bar{
+  display:flex;height:4px;border-radius:999px;overflow:hidden;gap:2px;margin:0 0 8px;
+  background:rgba(var(--v-theme-on-surface),.07)
+}
+.p115-ui .p115-ratio-instant{background:rgb(var(--v-theme-success));border-radius:999px}
+.p115-ui .p115-ratio-upload{background:rgb(var(--v-theme-primary));border-radius:999px}
+.p115-ui .p115-toolbar-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.p115-ui .p115-density-toggle>summary{
+  display:inline-flex;align-items:center;gap:5px;padding:6px 11px;min-height:34px;border-radius:9px;
+  border:1px solid var(--p115-line-strong);background:var(--p115-well);color:var(--p115-muted);
+  font-size:12.5px;font-weight:600;cursor:pointer;list-style:none;user-select:none;transition:all .15s ease
+}
+.p115-ui .p115-density-toggle[open]>summary{
+  color:rgb(var(--v-theme-primary));background:rgba(var(--v-theme-primary),.12);border-color:rgba(var(--v-theme-primary),.28)
+}
+.p115-ui .p115-quick-bulk{
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
+  padding:10px 14px;margin-bottom:12px;border-radius:12px;
+  border:1px solid rgba(var(--v-theme-primary),.2);background:rgba(var(--v-theme-primary),.05)
+}
+.p115-ui .p115-inline-tools{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.p115-ui .p115-exec-bar{
+  display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:14px;padding:12px 14px;
+  border-radius:11px;border:1px solid var(--p115-line-strong);background:var(--p115-well)
+}
+.p115-ui:has(.p115-density-toggle[open]) .p115-list{gap:6px}
+.p115-ui:has(.p115-density-toggle[open]) .p115-task{padding:9px 14px 9px 16px}
+.p115-ui:has(.p115-density-toggle[open]) .p115-task-icon{width:32px;height:32px;border-radius:9px}
+.p115-ui:has(.p115-density-toggle[open]) .p115-task-context{display:none}
+.p115-ui:has(.p115-density-toggle[open]) .p115-task-details>summary{top:9px}
 .p115-ui .p115-times{display:flex;flex-wrap:wrap;gap:8px 12px;font-size:12px;color:var(--p115-muted);font-variant-numeric:tabular-nums;margin:12px 0}
 .p115-ui .p115-time-pill{
   display:inline-flex;align-items:center;padding:4px 10px;border-radius:7px;
@@ -351,7 +409,7 @@ STYLES = """
   .p115-ui .p115-task-icon{display:none}
   .p115-ui .p115-task-main{flex-basis:100%}
   .p115-ui .p115-task-name{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
-  .p115-ui .p115-row-actions,.p115-ui .p115-row-actions:has(.p115-confirm[open]){margin-left:0}
+  .p115-ui .p115-row-actions,.p115-ui .p115-row-actions:has(.p115-confirm[open]){margin-left:0;padding-left:0}
   .p115-ui .p115-filter,.p115-ui .p115-row-actions .v-btn,.p115-ui .p115-confirm>summary,.p115-ui .p115-task-details>summary{min-height:44px}
   .p115-ui .p115-task-meta{gap:6px 8px}
   .p115-ui .p115-row{padding-right:0}
@@ -390,6 +448,37 @@ def icon(name, **props):
 
 def filename(path):
     return PurePosixPath(str(path).replace("\\", "/")).name
+
+
+def parent_label(path):
+    """Return immediate parent directory name for disambiguating episodes/remuxes."""
+    name = PurePosixPath(str(path or "").replace("\\", "/")).parent.name
+    return name if name and name not in (".", "/") else ""
+
+
+def format_bytes(size):
+    """Format byte size using compact IEC units for UI pills and progress."""
+    if not isinstance(size, (int, float)) or isinstance(size, bool) or size < 0:
+        return ""
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return ""
+
+
+def format_eta(seconds):
+    """Render positive remaining seconds as a compact Chinese duration label."""
+    sec = max(1, int(seconds))
+    if sec < 60:
+        return f"{sec} 秒后"
+    if sec < 3600:
+        return f"{sec // 60} 分钟后"
+    if sec < 86400:
+        hours, rem_min = sec // 3600, (sec % 3600) // 60
+        return f"{hours} 小时 {rem_min} 分后" if rem_min else f"{hours} 小时后"
+    return f"{sec // 86400} 天后"
 
 
 def disclosure(title, children, icon_name=None, opened=False, **props):
@@ -441,7 +530,11 @@ def record_choices(tasks):
 
 
 def record_search_model(scope, result):
-    values = dict(query="", state="", applied_query="", applied_state="", busy=False, error="", **result)
+    values = dict(
+        query="", state="", applied_query="", applied_state="", busy=False, error="",
+        exec_busy=False, exec_error="", exec_message="", exec_items=[], confirm_clear=False,
+        **result,
+    )
     return {f"_records_{scope}_{key}": value for key, value in values.items()}
 
 
@@ -453,7 +546,7 @@ def record_search_handler(scope, direction=0):
     return """async () => {
         const p = PREFIX;
         if (model[p+'busy']) return;
-        model[p+'busy'] = true; model[p+'error'] = '';
+        model[p+'busy'] = true; model[p+'error'] = ''; model[p+'confirm_clear'] = false;
         model[SELECTION] = []; model[FLAG] = false;
         const query = model[p+'query'] || '', state = model[p+'state'] || '';
         const same = query === model[p+'applied_query'] && state === model[p+'applied_state'];
@@ -471,6 +564,88 @@ def record_search_handler(scope, direction=0):
                 ? '当前前端不支持查询，请更新 MoviePilot 前端' : '查询失败，请检查连接后重试';
         } finally { model[p+'busy'] = false; }
     }""".replace("PREFIX", repr(prefix)).replace("SELECTION", repr(selection)).replace("FLAG", repr(flag)).replace("DIRECTION", str(direction)).replace("SCOPE", repr(scope))
+
+
+def record_select_handler(scope, select_all=True):
+    prefix = f"_records_{scope}_"
+    selection = "task_ids" if scope == "tasks" else "history_ids"
+    return """() => {
+        const p = PREFIX;
+        model[p+'confirm_clear'] = false;
+        if (!SELECT_ALL) { model[SELECTION] = []; return; }
+        const items = Array.isArray(model[p+'items']) ? model[p+'items'] : [];
+        model[SELECTION] = items.filter((item) => !(item.props && item.props.disabled)).map((item) => item.value);
+    }""".replace("PREFIX", repr(prefix)).replace("SELECTION", repr(selection)).replace("SELECT_ALL", "true" if select_all else "false")
+
+
+def form_batch_exec_handler():
+    return """async () => {
+        const p = '_records_tasks_';
+        if (model[p+'exec_busy'] || model[p+'busy']) return;
+        model[p+'exec_error'] = ''; model[p+'exec_message'] = ''; model[p+'exec_items'] = [];
+        if (!model.enabled) { model[p+'exec_error'] = '请先开启上方「启用秒传等待」后再执行任务操作'; return; }
+        const keys = Array.isArray(model.task_ids) ? model.task_ids : [];
+        if (!keys.length) { model[p+'exec_error'] = '请先勾选至少一个任务'; return; }
+        model[p+'exec_busy'] = true;
+        try {
+            if (!window.MoviePilotAPI) throw new Error('当前前端不支持此操作，请更新 MoviePilot 前端');
+            const action = model.action || 'pause';
+            const raw = await window.MoviePilotAPI.post('plugin/P115InstantWait/form/tasks/' + action, {keys});
+            if (raw && raw.success === false) throw new Error(raw.message || '批量操作未完成');
+            const res = raw && raw.data && raw.data.accepted !== undefined ? raw.data : raw;
+            const names = {upload: '强制上传', resume: '继续等待', pause: '暂停', cancel: '取消任务'};
+            let msg = (names[res?.action || action] || '批量操作') + '已提交：接受 ' + (res?.accepted ?? 0) + ' · 跳过 ' + (res?.skipped ?? 0) + ' · 异常 ' + (res?.failed ?? 0);
+            if (res?.notice) msg += '（' + res.notice + '）';
+            model[p+'exec_message'] = msg;
+            model[p+'exec_items'] = Array.isArray(res?.items) ? res.items.slice(0, 12).map((i) => i.name + '：' + i.message) : [];
+            model.task_ids = []; model.apply_action = false;
+            try {
+                const query = model[p+'applied_query'] || '', state = model[p+'applied_state'] || '', page = model[p+'page'] || 1;
+                const data = await window.MoviePilotAPI.get('plugin/P115InstantWait/records', {params: {scope: 'tasks', query, state, page}});
+                for (const key of ['items','total','page','pages']) model[p+key] = data[key];
+            } catch (_) {}
+        } catch (error) {
+            const detail = error.response?.data?.detail;
+            model[p+'exec_error'] = typeof detail === 'string' ? detail : (error?.message && !window.MoviePilotAPI ? error.message : error?.message || '操作失败，请检查连接后重试');
+        } finally { model[p+'exec_busy'] = false; }
+    }"""
+
+
+def form_history_clear_handler(cancel_confirm=False):
+    if cancel_confirm:
+        return "() => { model._records_history_confirm_clear = false; }"
+    return """async () => {
+        const p = '_records_history_';
+        if (model[p+'exec_busy'] || model[p+'busy']) return;
+        model[p+'exec_error'] = ''; model[p+'exec_message'] = ''; model[p+'exec_items'] = [];
+        const mode = model.history_mode || 'selected';
+        const keys = Array.isArray(model.history_ids) ? model.history_ids : [];
+        const states = Array.isArray(model.history_states) ? model.history_states : [];
+        if (mode === 'selected' && !keys.length) { model[p+'exec_error'] = '请先选择至少一条要清理的记录'; return; }
+        if (mode === 'filtered' && !states.length) { model[p+'exec_error'] = '请先选择至少一种要清理的状态'; return; }
+        if (!model[p+'confirm_clear']) { model[p+'confirm_clear'] = true; return; }
+        model[p+'confirm_clear'] = false; model[p+'exec_busy'] = true;
+        try {
+            if (!window.MoviePilotAPI) throw new Error('当前前端不支持此操作，请更新 MoviePilot 前端');
+            const raw = await window.MoviePilotAPI.post('plugin/P115InstantWait/form/history/clear',
+                {mode, keys, states, days: Number(model.history_days ?? 30)});
+            if (raw && raw.success === false) throw new Error(raw.message || '清理未完成');
+            const res = raw && raw.data && raw.data.deleted !== undefined ? raw.data : raw;
+            let msg = '清理已完成：删除 ' + (res?.deleted ?? 0) + ' · 跳过 ' + (res?.skipped ?? 0);
+            if (res?.notice) msg += '（' + res.notice + '）';
+            model[p+'exec_message'] = msg;
+            model[p+'exec_items'] = Array.isArray(res?.items) ? res.items.slice(0, 12) : [];
+            model.history_ids = []; model.cleanup_history = false;
+            try {
+                const query = model[p+'applied_query'] || '', state = model[p+'applied_state'] || '', page = model[p+'page'] || 1;
+                const data = await window.MoviePilotAPI.get('plugin/P115InstantWait/records', {params: {scope: 'history', query, state, page}});
+                for (const key of ['items','total','page','pages']) model[p+key] = data[key];
+            } catch (_) {}
+        } catch (error) {
+            const detail = error.response?.data?.detail;
+            model[p+'exec_error'] = typeof detail === 'string' ? detail : (error?.message || '清理失败，请检查参数后重试');
+        } finally { model[p+'exec_busy'] = false; }
+    }"""
 
 
 def record_search_controls(scope):
@@ -531,13 +706,20 @@ def config_form(tasks, error="", batch_result=None, history_result=None, notice=
     ])
 
     batch_children = [
-        paragraph("多选任务，保存配置时统一执行。单个任务也可在详情页直接处理。",
+        paragraph("支持全选本页后原地立即执行，无需保存重载插件；单个任务也可在监控页直接处理。",
                   **{"class": "p115-copy p115-muted mb-4"}),
         *record_search_controls("tasks"),
         field("VSelect", "task_ids", "选择本页任务", "可多选当前页任务；执行中的任务不可选。查找更早任务请使用上方全库搜索或翻页。",
               items="{{ _records_tasks_items }}", multiple=True, chips=True, clearable=True,
               **{"item-title": "title", "item-value": "value", "closable-chips": True,
                  "disabled": "{{ _records_tasks_busy || !_records_tasks_items.length }}", "no-data-text": "没有匹配的任务"}),
+        box([
+            node("VBtn", "全选本页可选", variant="outlined", size="small",
+                 **{"onClick": record_select_handler("tasks", True), "disabled": "{{ _records_tasks_busy || !_records_tasks_items.length }}"}),
+            node("VBtn", "清空已选", variant="text", size="small",
+                 **{"onClick": record_select_handler("tasks", False), "disabled": "{{ !task_ids || !task_ids.length }}"}),
+            node("span", **{"class": "p115-hint", "textContent": "{{ '已选 ' + (task_ids ? task_ids.length : 0) + ' 项' }}"}),
+        ], "p115-inline-tools mt-2"),
         box([field("VSelect", "action", "对所选任务执行", "状态不支持的任务会跳过；继续等待仅适用于已暂停任务。",
                    items=[{"title": "暂停自动重试", "value": "pause"},
                           {"title": "继续等待秒传", "value": "resume"},
@@ -545,10 +727,21 @@ def config_form(tasks, error="", batch_result=None, history_result=None, notice=
                           {"title": "取消任务", "value": "cancel"}],
                    **{"disabled": "{{ !task_ids || !task_ids.length }}"})], "mt-5"),
         note(ACTION_HINT),
-        node("VCheckbox", model="apply_action", label="保存时对所选任务执行一次",
+        box([
+            node("VBtn", "立即执行所选操作", variant="tonal", color="primary",
+                 **{"prepend-icon": "mdi-play-circle-outline", "onClick": form_batch_exec_handler(),
+                    "loading": "{{ _records_tasks_exec_busy }}",
+                    "disabled": "{{ _records_tasks_exec_busy || !enabled || !task_ids || !task_ids.length }}"}),
+            paragraph("原地提交后立即刷新本页列表，无需保存或重启插件。", **{"class": "p115-hint"}),
+        ], "p115-exec-bar"),
+        node("VAlert", type="success", variant="tonal", **{"show": "{{ !!_records_tasks_exec_message }}", "text": "{{ _records_tasks_exec_message }}", "class": "mt-3"}),
+        node("p", **{"class": "p115-hint mt-2", "show": "{{ _records_tasks_exec_items && _records_tasks_exec_items.length }}",
+                      "textContent": "{{ (_records_tasks_exec_items || []).join('；') }}"}),
+        node("VAlert", type="error", variant="tonal", **{"show": "{{ !!_records_tasks_exec_error }}", "text": "{{ _records_tasks_exec_error }}", "class": "mt-3"}),
+        node("VCheckbox", model="apply_action", label="或：保存配置时对所选任务执行一次",
              **{"color": "primary", "class": "mt-3", "hide-details": True,
                 "disabled": "{{ !enabled || !task_ids || !task_ids.length }}"}),
-        paragraph("需启用插件；执行后自动清空选择，重新打开配置可查看结果。", **{"class": "p115-hint"}),
+        paragraph("需启用插件；执行后自动清空选择，重新打开配置也可查看历史摘要。", **{"class": "p115-hint"}),
     ]
     if batch_result:
         actions = {"upload": "强制上传", "resume": "继续等待", "pause": "暂停重试", "cancel": "取消任务"}
@@ -570,7 +763,14 @@ def config_form(tasks, error="", batch_result=None, history_result=None, notice=
              field("VSelect", "history_ids", "选择本页已结束记录", "全库查询结果，每页 50 条；只清理本页勾选的记录。",
                    items="{{ _records_history_items }}", multiple=True, chips=True, clearable=True,
                    **{"item-title": "title", "item-value": "value", "closable-chips": True,
-                      "disabled": "{{ _records_history_busy || !_records_history_items.length }}", "no-data-text": "没有匹配的记录"})],
+                      "disabled": "{{ _records_history_busy || !_records_history_items.length }}", "no-data-text": "没有匹配的记录"}),
+             box([
+                 node("VBtn", "全选本页记录", variant="outlined", size="small",
+                      **{"onClick": record_select_handler("history", True), "disabled": "{{ _records_history_busy || !_records_history_items.length }}"}),
+                 node("VBtn", "清空已选", variant="text", size="small",
+                      **{"onClick": record_select_handler("history", False), "disabled": "{{ !history_ids || !history_ids.length }}"}),
+                 node("span", **{"class": "p115-hint", "textContent": "{{ '已选 ' + (history_ids ? history_ids.length : 0) + ' 条' }}"}),
+             ], "p115-inline-tools mt-2")],
             "mt-5", show="{{ history_mode === 'selected' }}"),
         box([
             field("VSelect", "history_states", "清理哪些状态", "只匹配勾选的结束状态。",
@@ -579,7 +779,26 @@ def config_form(tasks, error="", batch_result=None, history_result=None, notice=
             field("VTextField", "history_days", "保留最近记录", "按结束时间计算；0 清理全部匹配记录。",
                   type="number", suffix="天", min=0, max=36500, step=1, inputmode="numeric"),
         ], "p115-fields mt-5", show="{{ history_mode === 'filtered' }}"),
-        node("VCheckbox", model="cleanup_history", label="保存时清理一次（插件记录不可恢复）",
+        box([
+            node("VBtn", "立即清理所选记录", variant="tonal", color="warning",
+                 **{"prepend-icon": "mdi-broom", "onClick": form_history_clear_handler(False),
+                    "loading": "{{ _records_history_exec_busy }}",
+                    "disabled": "{{ _records_history_exec_busy || (history_mode === 'selected' ? (!history_ids || !history_ids.length) : (!history_states || !history_states.length)) }}"}),
+            paragraph("仅清理插件记录，二次确认后原地完成并刷新列表。", **{"class": "p115-hint"}),
+        ], "p115-exec-bar", show="{{ !_records_history_confirm_clear }}"),
+        box([
+            node("VBtn", "确认永久删除插件记录", variant="tonal", color="error",
+                 **{"prepend-icon": "mdi-delete-outline", "onClick": form_history_clear_handler(False),
+                    "loading": "{{ _records_history_exec_busy }}"}),
+            node("VBtn", "取消", variant="outlined",
+                 **{"onClick": form_history_clear_handler(True), "disabled": "{{ _records_history_exec_busy }}"}),
+            paragraph("将清理所选插件记录（不影响本地与 115 文件），确认后不可恢复。", **{"class": "p115-hint"}),
+        ], "p115-exec-bar", show="{{ !!_records_history_confirm_clear }}"),
+        node("VAlert", type="success", variant="tonal", **{"show": "{{ !!_records_history_exec_message }}", "text": "{{ _records_history_exec_message }}", "class": "mt-3"}),
+        node("p", **{"class": "p115-hint mt-2", "show": "{{ _records_history_exec_items && _records_history_exec_items.length }}",
+                      "textContent": "{{ (_records_history_exec_items || []).join('；') }}"}),
+        node("VAlert", type="error", variant="tonal", **{"show": "{{ !!_records_history_exec_error }}", "text": "{{ _records_history_exec_error }}", "class": "mt-3"}),
+        node("VCheckbox", model="cleanup_history", label="或：保存配置时清理一次（插件记录不可恢复）",
              **{"color": "warning", "hide-details": True, "class": "mt-3",
                 "disabled": "{{ history_mode === 'selected' ? (!history_ids || !history_ids.length) : (!history_states || !history_states.length) }}"}),
         paragraph("插件关闭时也可清理；执行后自动取消勾选。", **{"class": "p115-hint"}),
@@ -620,8 +839,10 @@ def tone_style(tone, background=False):
     return style
 
 
-def status_chip(state, label=None):
-    tone, name = TONES.get(state, ("secondary", "mdi-circle-outline"))
+def status_chip(state, label=None, tone_override=None, icon_override=None):
+    default_tone, default_icon = TONES.get(state, ("secondary", "mdi-circle-outline"))
+    tone = tone_override or default_tone
+    name = icon_override or default_icon
     return node("VChip", content=[icon(name, size=16, **{"class": "mr-1"}),
                                  node("span", label or LABELS.get(state, state))],
                 variant="flat", size="small",
@@ -647,7 +868,10 @@ def schedule_summary(task, enabled, now):
     next_at = task.get("next_at") or 0
     if next_at <= now:
         return "下次尝试", "已到时间 · 待调度", "primary"
-    return "下次重试 · MP 时间", datetime.fromtimestamp(next_at).strftime("%m-%d %H:%M:%S"), "primary"
+    next_dt = datetime.fromtimestamp(next_at).astimezone()
+    now_dt = datetime.fromtimestamp(now).astimezone()
+    clock = next_dt.strftime("%H:%M:%S" if next_dt.date() == now_dt.date() else "%m-%d %H:%M")
+    return "下次重试 · MP 时间", f"{format_eta(next_at - now)} · {clock}", "primary"
 
 
 def record_time(value, compact=False):
@@ -703,8 +927,14 @@ def task_row(task, enabled, now, max_retries, notice=""):
               if max_retries is not None and status in ACTIVE else f"自动尝试 {auto} 次")
     result = latest_result(task)
     meta = [status_chip(status),
-            node("span", f"#{task['history_id']}" if task['history_id'] else "记录待生成", **{"class": "p115-meta-pill"}),
-            node("span", budget, **{"class": "p115-meta-pill"})]
+            node("span", f"#{task['history_id']}" if task['history_id'] else "记录待生成", **{"class": "p115-meta-pill"})]
+    folder_name = parent_label(task.get("source"))
+    if folder_name:
+        meta.append(node("span", folder_name, **{"class": "p115-meta-pill", "title": "所在目录：" + folder_name}))
+    size_text = format_bytes(task.get("size"))
+    if size_text:
+        meta.append(node("span", size_text, **{"class": "p115-meta-pill", "title": "源文件大小"}))
+    meta.append(node("span", budget, **{"class": "p115-meta-pill"}))
     if status in ACTIVE:
         meta.append(node("span", value, **{"class": "p115-meta-pill", "style": tone_style(tone), "title": label}))
     else:
@@ -712,6 +942,23 @@ def task_row(task, enabled, now, max_retries, notice=""):
                          **{"class": "p115-meta-pill", "title": record_time(task.get("updated"))}))
     main = [node("div", filename(task["source"]), **{"class": "p115-task-name", "title": filename(task["source"])}),
             box(meta, "p115-task-meta")]
+    progress = task.get("upload_progress")
+    if progress:
+        total_parts = progress.get("total_parts", 0)
+        done_parts = progress.get("done_parts", 0)
+        if total_parts > 0:
+            percent = progress.get("percent", 0)
+            left_text = "正在提交上传合并…" if progress.get("completing") else f"分片上传进度 · {percent}%"
+            right_text = f"{format_bytes(progress.get('uploaded_bytes'))} / {format_bytes(progress.get('total_bytes'))} · {done_parts}/{total_parts} 片"
+            bar_width = f"width:{max(2, min(100, percent))}%"
+        else:
+            left_text = "已有断点续传分片"
+            right_text = f"已保存 {done_parts} 片"
+            bar_width = "width:15%"
+        main.append(box([
+            box([node("span", left_text), node("span", right_text)], "p115-progress-head"),
+            box([box([], "p115-progress-fill", style=bar_width)], "p115-progress-track"),
+        ], "p115-progress"))
     if status in ("paused", "failed", "completed"):
         main.append(paragraph(result, **{"class": "p115-task-context", "title": result}))
     actions = []
@@ -736,9 +983,9 @@ def task_row(task, enabled, now, max_retries, notice=""):
         details.append(paragraph("请根据失败原因，在 MP 重新发起整理。", **{"class": "p115-hint mb-3"}))
     path_cards = []
     for title, path, path_icon in (
-        ("本地源文件", task["source"], "mdi-folder-outline"),
-        ("115 目标文件", task["target"], "mdi-cloud-outline"),
-        ("任务 ID · 可在 MP 日志中搜索", task["id"], "mdi-identifier"),
+        ("本地源文件 · 单击全选", task["source"], "mdi-folder-outline"),
+        ("115 目标文件 · 单击全选", task["target"], "mdi-cloud-outline"),
+        ("任务 ID · 单击全选搜日志", task["id"], "mdi-identifier"),
     ):
         path_cards.append(box([
             box([icon(path_icon, size=15), node("span", title)], "p115-path-label"),
@@ -761,13 +1008,20 @@ def task_row(task, enabled, now, max_retries, notice=""):
         "p115-task", role="listitem", **{"data-category": categories(task), "data-state": status, "data-tone": tone_key})
 
 
-def metric(title, count, caption, tone, name, attention=False):
-    return box([
+def metric(title, count, caption, tone, name, attention=False, ratio=None):
+    children = [
         box([node("span", title),
              box([icon(name, size=17, style=tone_style(tone))], "p115-metric-icon")], "p115-metric-label"),
         node("div", str(count), **{"class": "p115-metric-value", "style": tone_style(tone)}),
-        paragraph(caption, **{"class": "p115-metric-caption"}),
-    ], "p115-metric" + (" p115-metric-attention" if attention and count else ""), **{"data-tone": tone})
+    ]
+    if ratio:
+        instant_pct, upload_pct = ratio
+        children.append(box([
+            box([], "p115-ratio-instant", style=f"width:{instant_pct}%"),
+            box([], "p115-ratio-upload", style=f"width:{upload_pct}%"),
+        ], "p115-ratio-bar"))
+    children.append(paragraph(caption, **{"class": "p115-metric-caption"}))
+    return box(children, "p115-metric" + (" p115-metric-attention" if attention and count else ""), **{"data-tone": tone})
 
 
 def batch_feedback(result):
@@ -780,7 +1034,9 @@ def batch_feedback(result):
     ], "mdi-playlist-check", opened=bool(result["failed"] or result["skipped"]))
 
 
-def bulk_tools(tasks, enabled):
+def batch_confirmations(tasks, enabled, min_count=1):
+    if not enabled:
+        return []
     paused = [t["id"] for t in tasks if t["state"] == "paused"]
     uploadable = [t["id"] for t in tasks if t["state"] in ("queued", "waiting", "paused")]
     controls = []
@@ -788,13 +1044,19 @@ def bulk_tools(tasks, enabled):
         ("resume", paused, "批量继续等待", "重置这些暂停任务的自动尝试次数和等待时限，继续只尝试秒传。请先确认暂停原因已处理。"),
         ("upload", uploadable, "批量强制上传", "这些任务将先试秒传，未命中则上传正文。上次请求结果未知时，目标当前不存在也可能延迟出现，请先核对目标，避免重复。"),
     ):
+        if len(keys) < min_count:
+            continue
         keys = keys[:200]
         button = node("VBtn", f"确认{title} {len(keys)} 项", variant="tonal", color="primary", size="small",
                       style=tone_style("primary"))
         button["events"] = {"click": {"api": f"plugin/P115InstantWait/batch/{action}",
                                        "method": "POST", "params": {"keys": keys}}}
-        if keys and enabled:
-            controls.append(confirmation(f"{title} · {len(keys)} 项…", explanation, button))
+        controls.append(confirmation(f"{title} · {len(keys)} 项…", explanation, button))
+    return controls
+
+
+def bulk_tools(tasks, enabled):
+    controls = batch_confirmations(tasks, enabled, min_count=1)
     children = [paragraph("作用于本页显示的适用任务（每次最多 200 项），不随状态筛选变化。提交时会检查最新状态；不适用项跳过，新入队任务不包含在内。",
                           **{"class": "p115-hint"})]
     if controls:
@@ -805,20 +1067,37 @@ def bulk_tools(tasks, enabled):
     return disclosure("批量操作与记录管理", children, "mdi-playlist-edit")
 
 
-def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, summary=None, notice=""):
+def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, summary=None, notice="", cooldown_until=0.0):
     now = time.time()
+    cooling = bool(enabled and cooldown_until and cooldown_until > now)
     refresh = node("VBtn", "刷新", variant="outlined", size="small",
                    **{"prepend-icon": "mdi-refresh", "class": "p115-refresh-btn", "style": "min-height:40px", "aria-label": "刷新任务状态"})
     # Native page API returns the standard envelope required by PageRender;
     # /tasks intentionally stays a bare list for existing plugin API clients.
     refresh["events"] = {"click": {"api": "plugin/page/P115InstantWait", "method": "GET"}}
+    if cooling:
+        cooldown_clock = datetime.fromtimestamp(cooldown_until).astimezone().strftime("%H:%M:%S")
+        header_chip = status_chip("paused", f"风控冷却至 {cooldown_clock}", tone_override="warning", icon_override="mdi-shield-alert-outline")
+    else:
+        header_chip = status_chip("running" if enabled else "cancelled",
+                                  "后台运行中" if enabled else "等待任务结束" if notice else "插件已关闭")
     content = [node("style", STYLES), box([
         box([icon("mdi-cloud-clock-outline", size=26)], "p115-brand-icon"),
         box([paragraph("115 秒传等待 / 任务监控", **{"class": "p115-eyebrow"}),
-             box([node("h2", "任务监控"),
-                  status_chip("running" if enabled else "cancelled", "后台运行中" if enabled else "等待任务结束" if notice else "插件已关闭")], "p115-heading")],
+             box([node("h2", "任务监控"), header_chip], "p115-heading")],
             "p115-header-main"), refresh,
     ], "p115-header")]
+    if cooling:
+        cooldown_clock = datetime.fromtimestamp(cooldown_until).astimezone().strftime("%H:%M:%S")
+        remaining = format_eta(cooldown_until - now).removesuffix("后")
+        content.append(box([
+            icon("mdi-shield-alert-outline", size=22),
+            box([
+                node("strong", f"115 访问风控冷却中 · 约 {remaining}后恢复（{cooldown_clock}）"),
+                paragraph("冷却期间已暂停领取队列任务，也不会消耗自动重试次数；恢复后将自动平滑退避调度。",
+                          **{"class": "p115-copy p115-muted mt-1"}),
+            ]),
+        ], "p115-cooldown-banner", role="status"))
     if notice:
         content.append(node("VAlert", notice, type="info", variant="tonal", **{"class": "mb-4", "role": "status"}))
     if error:
@@ -839,17 +1118,32 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
     states, methods = summary["states"], summary["methods"]
     count = lambda *values: sum(states.get(value, 0) for value in values)
     waiting_count, completed_count = count("queued", "waiting"), count("completed")
-    if waiting_count and enabled:
+    if cooling and waiting_count:
+        wait_caption = "冷却至 " + datetime.fromtimestamp(cooldown_until).astimezone().strftime("%H:%M:%S")
+    elif waiting_count and enabled:
         next_at = summary["next_at"] or 0
-        wait_caption = "已到时间，等待调度" if next_at <= now else "下次 " + datetime.fromtimestamp(next_at).strftime("%H:%M:%S")
+        wait_caption = "已到时间，等待调度" if next_at <= now else "下次 " + format_eta(next_at - now)
     else:
         wait_caption = "启用后继续调度" if waiting_count else "暂无等待任务"
     instant, upload = methods.get("instant", 0), methods.get("upload", 0)
+    known_methods = instant + upload
+    if completed_count and known_methods > 0:
+        instant_pct = round(instant * 100 / known_methods, 1)
+        upload_pct = round(100.0 - instant_pct, 1)
+        completed_ratio = (instant_pct, upload_pct)
+        completed_caption = f"秒传率 {int(round(instant_pct))}% · 秒传 {instant} · 上传 {upload}" + (
+            f" · 未记录 {completed_count - known_methods}" if completed_count > known_methods else ""
+        )
+    else:
+        completed_ratio = None
+        completed_caption = f"秒传 {instant} · 上传 {upload}" + (
+            f" · 未记录 {completed_count - known_methods}" if completed_count > known_methods else ""
+        )
     content.append(box([
         metric("等待秒传", waiting_count, wait_caption, "info", "mdi-clock-outline"),
         metric("执行与上传", count("running", "uploading", "upload_queued", "finalizing"), f"执行中 {count('running', 'uploading')} · 上传排队 {count('upload_queued')} · 待回写 {count('finalizing')}", "primary", "mdi-cloud-upload-outline"),
         metric("需要处理", count("paused", "failed"), f"暂停 {count('paused')} · 失败 {count('failed')}", "error", "mdi-alert-circle-outline", True),
-        metric("整理完成", completed_count, f"秒传 {instant} · 上传 {upload}" + (f" · 未记录 {completed_count-instant-upload}" if completed_count > instant+upload else ""), "success", "mdi-check-circle-outline"),
+        metric("整理完成", completed_count, completed_caption, "success", "mdi-check-circle-outline", ratio=completed_ratio),
     ], "p115-metrics", **{"aria-label": "全部保留记录状态概览"}))
     content.append(paragraph(f"全库共 {summary['total']} 条记录 · 成功任务仅显示最近完成的 50 条，其他状态全部显示；筛选与批量操作作用于当前显示的记录。",
                              **{"class": "p115-hint mb-3"}))
@@ -864,10 +1158,22 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
                  **{"aria-label": f"{title} {count} 条任务"}),
             node("span", title), node("span", str(count), **{"class": "p115-count"})],
             **{"class": "p115-filter"}))
-    content.append(box([box(filters, "p115-filters", role="radiogroup", **{"aria-label": "筛选任务状态"}),
-                        node("span", f"显示 {len(tasks)} 条", **{"class": "p115-hint"})], "p115-toolbar"))
+    density_toggle = node("details", content=[
+        node("summary", content=[icon("mdi-format-list-bulleted-square", size=15), node("span", "紧凑视图")])
+    ], **{"class": "p115-density-toggle", "title": "收起摘要行，单屏浏览更多任务"})
+    content.append(box([
+        box(filters, "p115-filters", role="radiogroup", **{"aria-label": "筛选任务状态"}),
+        box([density_toggle, node("span", f"显示 {len(tasks)} 条", **{"class": "p115-hint"})], "p115-toolbar-meta"),
+    ], "p115-toolbar"))
     if batch_result:
         content.append(batch_feedback(batch_result))
+    quick_controls = batch_confirmations(tasks, enabled, min_count=2)
+    if quick_controls:
+        content.append(box([
+            box([icon("mdi-lightning-bolt-outline", size=18, style=tone_style("primary")),
+                 node("strong", "快捷批量处理")], "p115-inline-tools"),
+            box(quick_controls, "p115-inline-tools"),
+        ], "p115-quick-bulk"))
     if tasks:
         rank = {"paused": 0, "failed": 1, "running": 2, "uploading": 2, "finalizing": 2, "upload_queued": 3, "queued": 4, "waiting": 4}
         ordered = sorted(tasks, key=lambda t: (rank.get(t["state"], 5),

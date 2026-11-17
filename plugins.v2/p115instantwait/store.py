@@ -15,7 +15,10 @@ TERMINAL = ("completed", "cancelled", "failed")
 class QueueStore:
     def __init__(self, path):
         self.path = str(path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        db_file = Path(path)
+        if db_file.is_file() and self._schema_ready():
+            return
+        db_file.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("""CREATE TABLE IF NOT EXISTS jobs (
@@ -37,6 +40,25 @@ class QueueStore:
                                (transfer_method(json.loads(row["payload"])), row["id"]))
             db.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_summary ON jobs(state,transfer_method,next_at)")
+
+    def _schema_ready(self):
+        db = None
+        try:
+            db = sqlite3.connect(self.path, timeout=1)
+            db.row_factory = sqlite3.Row
+            objects = {r["name"] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','index')")}
+            if not {"jobs", "target_owners", "active_source", "jobs_created", "jobs_summary"} <= objects:
+                return False
+            if "transfer_method" not in {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}:
+                return False
+            mode = db.execute("PRAGMA journal_mode").fetchone()
+            return bool(mode and str(mode[0]).lower() == "wal")
+        except sqlite3.Error:
+            return False
+        finally:
+            if db is not None:
+                db.close()
 
     @contextmanager
     def connect(self):

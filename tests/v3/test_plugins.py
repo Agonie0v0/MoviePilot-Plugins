@@ -538,6 +538,15 @@ def test_api_response_models_preserve_reads_and_wrap_page_actions(h, task):
     h.engine.store.update(row["id"], state="waiting")
     assert client.post(f"/tasks/{row['id']}/upload").json() == {
         "success": True, "message": "", "data": {"state": "upload_queued"}}
+    assert "size" in record and "upload_progress" in record
+
+    assert client.post("/form/tasks/pause", json={"keys": [row["id"]]}).json()["data"]["accepted"] == 1
+    h.engine.store.update(row["id"], state="completed", payload=data)
+    clear_res = client.post("/form/history/clear", json={"mode": "selected", "keys": [row["id"]]}).json()
+    assert clear_res["success"] is True and clear_res["data"]["deleted"] == 1
+    assert client.post("/form/history/clear", json={"mode": "filtered", "states": ["completed"], "days": 0.5}).status_code == 400
+    with patch.object(h.remote, "_COOLDOWN_UNTIL", time.time() + 600):
+        assert "115 访问风控冷却中" in json.dumps(plugin.get_page(), ensure_ascii=False)
 
 
 def test_page_actions_satisfy_native_client_and_reload_current_state(h, task):
@@ -735,6 +744,46 @@ def test_final_validation_failure_blocks_native_success(h, task):
         h.Chain()._TransferChain__default_callback(task, info)
     assert not h.history.get(row["history_id"]).status
     assert h.engine.store.get(row["id"])["state"] == "paused"
+
+
+def test_v3_latest_defers_old_version_deletion_until_upload_succeeds(h, task):
+    task.plan_checkpoint.overwrite_mode = "latest"
+    h.api.files["999"] = h.FileItem(storage="u115", type="file", fileid="999",
+        path="/library/Film.Old.mkv", name="Film.Old.mkv", extension="mkv", size=10)
+    row = h.enter(task)
+    h.api.hit = False
+    h.engine.execute(h.engine.store.claim())
+    assert h.engine.store.get(row["id"])["state"] == "waiting"
+    assert h.api.deletes == []
+    assert "999" in h.api.files
+
+    h.api.hit = True
+    h.engine.store.update(row["id"], next_at=0)
+    h.engine.execute(h.engine.store.claim())
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.history.get(row["history_id"]).status
+    assert h.api.deletes == ["999"]
+    assert "999" not in h.api.files
+
+
+def test_v3_expired_upload_token_does_not_exhaust_upload_retry_budget(h, task):
+    h.engine.config["max_retries"] = 1
+    row = h.enter(task)
+    h.engine.control(row["id"], "upload")
+    h.api.hit = False
+    with patch.object(h.api, "upload", side_effect=h.remote.TokenExpired("上传凭证已过期")):
+        for _ in range(3):
+            h.engine.store.update(row["id"], next_at=0)
+            h.engine.execute(h.engine.store.claim(manual=True))
+            current = h.engine.store.get(row["id"])
+            assert current["state"] == "upload_queued"
+            assert current["payload"].get("upload_attempts", 0) == 0
+    h.engine.store.update(row["id"], next_at=0)
+    h.engine.execute(h.engine.store.claim(manual=True))
+    h.Chain()._TransferChain__handle_transfer(task)
+    assert h.engine.store.get(row["id"])["state"] == "completed"
+    assert h.api.uploads == 1
 
 
 def re_name(name, source):
