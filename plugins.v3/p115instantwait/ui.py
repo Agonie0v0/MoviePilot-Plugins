@@ -24,269 +24,226 @@ ACTION_HINT = "继续等待会重置自动尝试次数和时限；强制上传�
 # Native details work in both FormRender and PageRender without a custom bundle.
 STYLES = """
 @keyframes p115-spin{to{transform:rotate(360deg)}}
-@keyframes p115-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.55;transform:scale(.92)}}
+@keyframes p115-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.55;transform:scale(.9)}}
 @keyframes p115-reveal{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 @keyframes p115-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 .p115-ui{
   --p115-ease:cubic-bezier(.22,1,.36,1);
-  --p115-line:rgba(var(--v-theme-on-surface),.09);
-  --p115-line-strong:rgba(var(--v-theme-on-surface),.14);
-  --p115-muted:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 68%,rgb(var(--v-theme-surface)));
-  --p115-subtle:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 52%,rgb(var(--v-theme-surface)));
-  --p115-card:linear-gradient(180deg,rgba(var(--v-theme-on-surface),.016) 0%,rgba(var(--v-theme-on-surface),.032) 100%);
-  --p115-well:rgba(var(--v-theme-on-surface),.036);
-  --p115-shadow-sm:0 2px 10px -2px rgba(0,0,0,.06),0 1px 3px -1px rgba(0,0,0,.04),inset 0 1px 0 rgba(255,255,255,.08);
-  --p115-shadow-md:0 10px 26px -8px rgba(0,0,0,.11),0 3px 8px -2px rgba(0,0,0,.05),inset 0 1px 0 rgba(255,255,255,.12);
+  --p115-surface:rgb(var(--v-theme-surface));
+  --p115-subtle-bg:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 2.6%,rgb(var(--v-theme-surface)));
+  --p115-well:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 4.5%,rgb(var(--v-theme-surface)));
+  --p115-line:rgba(var(--v-theme-on-surface),.07);
+  --p115-line-strong:rgba(var(--v-theme-on-surface),.10);
+  --p115-line-hover:rgba(var(--v-theme-on-surface),.18);
+  --p115-muted:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 58%,rgb(var(--v-theme-surface)));
+  --p115-faint:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 40%,rgb(var(--v-theme-surface)));
+  --p115-shadow-sm:0 1px 2px rgba(0,0,0,.035);
   color:rgb(var(--v-theme-on-surface));font-size:14px;line-height:1.55;max-width:100%;container-type:inline-size
 }
 .p115-ui *{box-sizing:border-box}
 .p115-ui h2,.p115-ui h3,.p115-ui p{margin:0}
-.p115-ui h2{font-size:22px;line-height:1.35;font-weight:750;letter-spacing:-.025em}
-.p115-ui h3{font-size:15px;font-weight:680;letter-spacing:-.01em}
+.p115-ui h2{font-size:18px;line-height:1.35;font-weight:680;letter-spacing:-.02em}
+.p115-ui h3{font-size:14.5px;font-weight:660;letter-spacing:-.01em}
 .p115-ui .p115-muted{color:var(--p115-muted);opacity:1}
 .p115-ui .p115-copy{overflow-wrap:anywhere}
 .p115-ui .p115-header{
-  position:relative;overflow:hidden;display:flex;align-items:center;gap:16px;margin-bottom:20px;
-  padding:18px 20px;border-radius:16px;border:1px solid rgba(var(--v-theme-primary),.18);
-  background:radial-gradient(120% 160% at 0% 0%,rgba(var(--v-theme-primary),.14) 0%,rgba(var(--v-theme-info),.05) 48%,rgba(var(--v-theme-on-surface),.018) 100%);
-  box-shadow:var(--p115-shadow-sm)
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  margin-bottom:16px;padding:2px 0 14px;border-bottom:1px solid var(--p115-line)
 }
 .p115-ui .p115-header-main{flex:1;min-width:0}
-.p115-ui .p115-brand-icon{
-  display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:14px;
-  background:linear-gradient(135deg,rgba(var(--v-theme-primary),.22) 0%,rgba(var(--v-theme-info),.12) 100%);
-  border:1px solid rgba(var(--v-theme-primary),.28);color:rgb(var(--v-theme-primary));flex-shrink:0;
-  box-shadow:0 6px 16px -4px rgba(var(--v-theme-primary),.25),inset 0 1px 0 rgba(255,255,255,.26)
-}
-.p115-ui .p115-eyebrow{
-  font-size:11.5px;font-weight:650;
-  color:color-mix(in srgb,rgb(var(--v-theme-primary)) 55%,rgb(var(--v-theme-on-surface)));
-  margin-bottom:3px;letter-spacing:.06em;text-transform:uppercase
-}
 .p115-ui .p115-heading{display:flex;align-items:center;flex-wrap:wrap;gap:10px}
 .p115-ui .p115-refresh-btn{
-  border-radius:10px!important;background:rgba(var(--v-theme-surface),.74)!important;
-  border-color:var(--p115-line-strong)!important;backdrop-filter:blur(8px);box-shadow:var(--p115-shadow-sm)
+  border-radius:8px!important;background:var(--p115-surface)!important;
+  border-color:var(--p115-line-strong)!important;box-shadow:var(--p115-shadow-sm);min-height:34px!important
 }
+.p115-ui .p115-badge{
+  display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:6px;
+  font-size:12px;font-weight:600;line-height:1;background:var(--p115-subtle-bg);
+  border:1px solid var(--p115-line-strong);
+  color:color-mix(in srgb,rgb(var(--v-theme-on-surface)) 82%,rgb(var(--v-theme-surface)));
+  white-space:nowrap
+}
+.p115-ui .p115-dot{width:6px;height:6px;border-radius:999px;flex-shrink:0;background:var(--p115-faint)}
+.p115-ui .p115-badge[data-tone=success] .p115-dot{
+  background:color-mix(in srgb,rgb(var(--v-theme-success)) 75%,rgb(var(--v-theme-on-surface)))
+}
+.p115-ui .p115-badge[data-tone=info] .p115-dot{
+  background:color-mix(in srgb,rgb(var(--v-theme-info)) 75%,rgb(var(--v-theme-on-surface)))
+}
+.p115-ui .p115-badge[data-tone=primary] .p115-dot{
+  background:rgb(var(--v-theme-primary));animation:p115-pulse 1.8s ease-in-out infinite
+}
+.p115-ui .p115-badge[data-tone=warning]{
+  background:rgba(var(--v-theme-warning),.08);border-color:rgba(var(--v-theme-warning),.24)
+}
+.p115-ui .p115-badge[data-tone=warning] .p115-dot{background:rgb(var(--v-theme-warning))}
+.p115-ui .p115-badge[data-tone=error]{
+  background:rgba(var(--v-theme-error),.06);border-color:rgba(var(--v-theme-error),.22);
+  color:color-mix(in srgb,rgb(var(--v-theme-error)) 72%,rgb(var(--v-theme-on-surface)))
+}
+.p115-ui .p115-badge[data-tone=error] .p115-dot{background:rgb(var(--v-theme-error))}
 .p115-ui .p115-section{
-  padding:20px 22px;margin-bottom:14px;border:1px solid var(--p115-line-strong);
-  border-radius:16px;background:var(--p115-card);box-shadow:var(--p115-shadow-sm)
+  padding:18px 20px;margin-bottom:14px;border:1px solid var(--p115-line-strong);
+  border-radius:12px;background:var(--p115-surface);box-shadow:var(--p115-shadow-sm)
 }
-.p115-ui .p115-section-head{display:flex;align-items:center;gap:10px;margin-bottom:6px}
-.p115-ui .p115-section-icon{
-  display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;
-  background:rgba(var(--v-theme-primary),.12);border:1px solid rgba(var(--v-theme-primary),.2);
-  color:rgb(var(--v-theme-primary));flex-shrink:0
-}
-.p115-ui .p115-switches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:18px}
+.p115-ui .p115-section-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.p115-ui .p115-switches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:16px}
 .p115-ui .p115-toggle{
-  display:flex;align-items:center;justify-content:space-between;gap:14px;min-width:0;padding:15px 18px;
-  border:1px solid var(--p115-line-strong);border-radius:14px;background:var(--p115-card);
-  box-shadow:var(--p115-shadow-sm);transition:border-color .18s ease,box-shadow .18s ease,background .18s ease
+  display:flex;align-items:center;justify-content:space-between;gap:14px;min-width:0;padding:14px 16px;
+  border:1px solid var(--p115-line-strong);border-radius:12px;background:var(--p115-surface);
+  box-shadow:var(--p115-shadow-sm);transition:border-color .15s ease
 }
-.p115-ui .p115-toggle:has(input:checked){
-  border-color:rgba(var(--v-theme-primary),.32);
-  background:linear-gradient(135deg,rgba(var(--v-theme-primary),.07) 0%,rgba(var(--v-theme-on-surface),.02) 100%)
-}
-.p115-ui .p115-toggle label{font-size:14px;font-weight:680;cursor:pointer}
+.p115-ui .p115-toggle:has(input:checked){border-color:var(--p115-line-hover)}
+.p115-ui .p115-toggle label{font-size:14px;font-weight:650;cursor:pointer}
 .p115-ui .p115-switches .v-switch{flex:0 0 auto}
-.p115-ui .p115-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 20px}
+.p115-ui .p115-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 18px}
 .p115-ui .p115-field{min-width:0}
 .p115-ui.p115-settings .p115-field>.v-input{max-width:100%}
-.p115-ui .p115-field-label{display:block;font-weight:650;font-size:13.5px;margin-bottom:7px}
-.p115-ui .p115-hint{font-size:12px;color:var(--p115-muted);margin-top:6px;line-height:1.6;overflow-wrap:anywhere}
-.p115-ui .v-field{border-radius:10px!important;background:rgba(var(--v-theme-surface),.55)}
+.p115-ui .p115-field-label{display:block;font-weight:620;font-size:13px;margin-bottom:6px}
+.p115-ui .p115-hint{font-size:12px;color:var(--p115-muted);margin-top:6px;line-height:1.55;overflow-wrap:anywhere}
+.p115-ui .v-field{border-radius:9px!important;background:var(--p115-surface)}
 .p115-ui .v-field__input{opacity:1}
 .p115-ui input::placeholder,.p115-ui textarea::placeholder{color:var(--p115-muted);opacity:1}
 .p115-ui .p115-note{
-  display:flex;align-items:flex-start;gap:10px;padding:12px 15px;
-  background:linear-gradient(90deg,rgba(var(--v-theme-primary),.07) 0%,rgba(var(--v-theme-on-surface),.03) 100%);
-  border:1px solid rgba(var(--v-theme-primary),.16);border-radius:11px;margin-top:14px;font-size:13px
+  display:flex;align-items:flex-start;gap:10px;padding:11px 14px;
+  background:var(--p115-subtle-bg);border:1px solid var(--p115-line-strong);
+  border-radius:10px;margin-top:14px;font-size:13px;color:var(--p115-muted)
 }
-.p115-ui .p115-note .v-icon{flex-shrink:0;margin-top:2px;color:rgb(var(--v-theme-primary))}
+.p115-ui .p115-note .v-icon{flex-shrink:0;margin-top:2px;color:var(--p115-muted)}
 .p115-ui .p115-disclosure{
-  border:1px solid var(--p115-line-strong);border-radius:14px;background:var(--p115-card);
-  margin-bottom:12px;box-shadow:var(--p115-shadow-sm);overflow:hidden;transition:border-color .18s ease,box-shadow .18s ease
+  border:1px solid var(--p115-line-strong);border-radius:12px;background:var(--p115-surface);
+  margin-bottom:12px;box-shadow:var(--p115-shadow-sm);overflow:hidden;transition:border-color .15s ease
 }
-.p115-ui .p115-disclosure[open]{border-color:rgba(var(--v-theme-primary),.26);box-shadow:var(--p115-shadow-md)}
+.p115-ui .p115-disclosure[open]{border-color:var(--p115-line-hover)}
 .p115-ui .p115-disclosure>summary{
-  display:flex;align-items:center;gap:10px;min-height:52px;padding:12px 18px;
-  cursor:pointer;list-style:none;font-weight:680;font-size:14px;user-select:none;transition:background .15s ease
+  display:flex;align-items:center;gap:10px;min-height:48px;padding:11px 16px;
+  cursor:pointer;list-style:none;font-weight:640;font-size:13.5px;user-select:none;transition:background .15s ease
 }
-.p115-ui .p115-disclosure>summary .v-icon{
-  padding:5px;width:28px;height:28px;border-radius:8px;
-  background:rgba(var(--v-theme-primary),.1);color:rgb(var(--v-theme-primary))
-}
+.p115-ui .p115-disclosure>summary .v-icon{width:18px;height:18px;color:var(--p115-muted);flex-shrink:0}
 .p115-ui .p115-disclosure[open]>summary{
-  border-bottom:1px solid var(--p115-line);background:rgba(var(--v-theme-on-surface),.02)
+  border-bottom:1px solid var(--p115-line);background:var(--p115-subtle-bg)
 }
 .p115-ui summary::-webkit-details-marker{display:none}
 .p115-ui .p115-disclosure>summary::after{
-  content:'›';display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
-  border-radius:6px;background:rgba(var(--v-theme-on-surface),.05);font-size:18px;line-height:1;
+  content:'›';display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;
+  border-radius:6px;background:var(--p115-well);color:var(--p115-muted);font-size:17px;line-height:1;
   flex-shrink:0;margin-left:auto;transition:transform .2s cubic-bezier(.2,.8,.2,1),background .15s ease
 }
-.p115-ui details[open]>summary::after{transform:rotate(90deg);background:rgba(var(--v-theme-primary),.12);color:rgb(var(--v-theme-primary))}
+.p115-ui details[open]>summary::after{transform:rotate(90deg);background:var(--p115-well);color:rgb(var(--v-theme-on-surface))}
 .p115-ui .p115-disclosure-body{padding:16px 18px 18px}
 .p115-ui .p115-disclosure[open]>.p115-disclosure-body,.p115-ui .p115-task-details[open]>.p115-task-body,.p115-ui .p115-confirm[open]>.p115-confirm-body{animation:p115-reveal .18s var(--p115-ease)}
-.p115-ui summary:focus-visible,.p115-ui button:focus-visible,.p115-ui input:focus-visible{outline:2px solid rgb(var(--v-theme-primary));outline-offset:3px;border-radius:6px}
-.p115-ui .p115-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}
+.p115-ui summary:focus-visible,.p115-ui button:focus-visible,.p115-ui input:focus-visible{outline:2px solid rgb(var(--v-theme-primary));outline-offset:2px;border-radius:6px}
+.p115-ui .p115-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
 .p115-ui .p115-metric{
-  --p115-tone:var(--v-theme-primary);
-  position:relative;overflow:hidden;padding:15px 16px 13px;border:1px solid var(--p115-line-strong);
-  border-radius:14px;min-width:0;
-  background:
-    radial-gradient(110px circle at 100% 0%,rgba(var(--p115-tone),.12),transparent 72%),
-    var(--p115-card);
-  box-shadow:var(--p115-shadow-sm);transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease
+  position:relative;padding:14px 16px 12px;border:1px solid var(--p115-line-strong);
+  border-radius:12px;min-width:0;background:var(--p115-surface);
+  box-shadow:var(--p115-shadow-sm);transition:border-color .15s ease
 }
-.p115-ui .p115-metric::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:3px;
-  background:linear-gradient(90deg,rgb(var(--p115-tone)) 0%,rgba(var(--p115-tone),.18) 100%)
-}
-.p115-ui .p115-metric[data-tone=info]{--p115-tone:var(--v-theme-info)}
-.p115-ui .p115-metric[data-tone=primary]{--p115-tone:var(--v-theme-primary)}
-.p115-ui .p115-metric[data-tone=error]{--p115-tone:var(--v-theme-error)}
-.p115-ui .p115-metric[data-tone=success]{--p115-tone:var(--v-theme-success)}
-.p115-ui .p115-metric-label{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--p115-muted);font-size:12.5px;font-weight:600}
-.p115-ui .p115-metric-icon{
-  display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:9px;
-  background:rgba(var(--p115-tone),.12);border:1px solid rgba(var(--p115-tone),.22);flex-shrink:0;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.16)
-}
+.p115-ui .p115-metric-label{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--p115-muted);font-size:12.5px;font-weight:580}
+.p115-ui .p115-metric-label .v-icon{color:var(--p115-faint);flex-shrink:0}
 .p115-ui .p115-metric-value{
-  font-size:30px;line-height:1.25;font-weight:760;letter-spacing:-.03em;
-  font-variant-numeric:tabular-nums;margin:6px 0 8px
+  font-size:26px;line-height:1.2;font-weight:700;letter-spacing:-.025em;
+  font-variant-numeric:tabular-nums;margin:6px 0 8px;color:rgb(var(--v-theme-on-surface))
 }
+.p115-ui .p115-metric-zero{color:var(--p115-muted);font-weight:620}
 .p115-ui .p115-metric-caption{
   font-size:12px;color:var(--p115-muted);overflow-wrap:anywhere;
   padding-top:7px;border-top:1px solid var(--p115-line)
 }
-.p115-ui .p115-metric-attention{
-  border-color:rgba(var(--v-theme-error),.34);
-  background:
-    radial-gradient(130px circle at 100% 0%,rgba(var(--v-theme-error),.16),transparent 75%),
-    linear-gradient(180deg,rgba(var(--v-theme-error),.04) 0%,rgba(var(--v-theme-error),.07) 100%)
+.p115-ui .p115-metric-attention{border-color:rgba(var(--v-theme-error),.28)}
+.p115-ui .p115-metric-attention .p115-metric-value,.p115-ui .p115-metric-attention .p115-metric-label .v-icon{
+  color:color-mix(in srgb,rgb(var(--v-theme-error)) 78%,rgb(var(--v-theme-on-surface)))
 }
 .p115-ui .p115-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:14px}
 .p115-ui .p115-filters{
   display:flex;flex-wrap:wrap;gap:4px;border:1px solid var(--p115-line-strong);
-  background:var(--p115-well);padding:4px;border-radius:12px;box-shadow:inset 0 1px 2px rgba(0,0,0,.05)
+  background:var(--p115-well);padding:3px;border-radius:10px
 }
 .p115-ui .p115-filter{
   position:relative;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;
-  padding:6px 12px;border-radius:8px;font-size:13px;min-height:36px;color:var(--p115-muted);
-  user-select:none;transition:all .16s cubic-bezier(.2,.8,.2,1)
+  padding:5px 11px;border-radius:7px;font-size:12.5px;min-height:32px;color:var(--p115-muted);
+  user-select:none;transition:background .15s ease,color .15s ease
 }
 .p115-ui .p115-filter input{position:absolute;opacity:0;width:1px;height:1px}
 .p115-ui .p115-filter:has(input:checked){
-  color:rgb(var(--v-theme-on-surface));background:rgb(var(--v-theme-surface));
-  box-shadow:0 2px 8px -2px rgba(0,0,0,.12),0 0 0 1px rgba(var(--v-theme-primary),.16);font-weight:680
+  color:rgb(var(--v-theme-on-surface));background:var(--p115-surface);
+  box-shadow:0 1px 3px rgba(0,0,0,.08),0 0 0 1px var(--p115-line-strong);font-weight:640
 }
 .p115-ui .p115-filter:has(input:focus-visible){outline:2px solid rgb(var(--v-theme-primary));outline-offset:2px}
 .p115-ui .p115-count{
-  display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:19px;
-  padding:0 6px;border-radius:999px;background:rgba(var(--v-theme-on-surface),.07);
-  font-size:11.5px;font-weight:650;font-variant-numeric:tabular-nums
+  display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;
+  padding:0 5px;border-radius:999px;background:rgba(var(--v-theme-on-surface),.06);
+  font-size:11px;font-weight:600;color:var(--p115-muted);font-variant-numeric:tabular-nums
 }
 .p115-ui .p115-filter:has(input:checked) .p115-count{
-  background:rgba(var(--v-theme-primary),.15);
-  color:color-mix(in srgb,rgb(var(--v-theme-primary)) 42%,rgb(var(--v-theme-on-surface)))
+  background:var(--p115-well);color:rgb(var(--v-theme-on-surface))
 }
-.p115-ui .p115-list{display:grid;gap:10px;margin-bottom:14px}
+.p115-ui .p115-list{display:grid;gap:8px;margin-bottom:14px}
 .p115-ui .p115-task{
-  --p115-task-tone:var(--v-theme-secondary);
-  position:relative;border:1px solid var(--p115-line-strong);border-radius:14px;
-  padding:14px 16px 14px 18px;min-width:0;background:var(--p115-card);
-  box-shadow:var(--p115-shadow-sm);transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease
+  position:relative;border:1px solid var(--p115-line-strong);border-radius:12px;
+  padding:12px 16px;min-width:0;background:var(--p115-surface);
+  box-shadow:var(--p115-shadow-sm);transition:border-color .15s ease
 }
-.p115-ui .p115-task::before{
-  content:'';position:absolute;left:0;top:12px;bottom:12px;width:3.5px;
-  border-radius:0 4px 4px 0;background:rgb(var(--p115-task-tone));opacity:.85
-}
-.p115-ui .p115-task[data-tone=info]{--p115-task-tone:var(--v-theme-info)}
-.p115-ui .p115-task[data-tone=primary]{--p115-task-tone:var(--v-theme-primary)}
-.p115-ui .p115-task[data-tone=error]{--p115-task-tone:var(--v-theme-error)}
-.p115-ui .p115-task[data-tone=success]{--p115-task-tone:var(--v-theme-success)}
-.p115-ui .p115-task[data-category~=attention]{
-  border-color:rgba(var(--v-theme-error),.28);
-  background:linear-gradient(90deg,rgba(var(--v-theme-error),.055) 0%,rgba(var(--v-theme-on-surface),.02) 65%)
-}
-.p115-ui .p115-row{display:flex;align-items:center;gap:14px;min-width:0;padding-right:42px}
+.p115-ui .p115-task[data-category~=attention]{border-color:rgba(var(--v-theme-error),.26)}
+.p115-ui .p115-row{display:flex;align-items:center;gap:14px;min-width:0;padding-right:38px}
 .p115-ui .p115-row:has(.p115-confirm[open]){flex-wrap:wrap}
-.p115-ui .p115-task-icon{
-  display:flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:11px;
-  background:rgba(var(--p115-task-tone),.1);border:1px solid rgba(var(--p115-task-tone),.2);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.14);flex-shrink:0
-}
-.p115-ui .p115-task[data-state=running] .p115-task-icon .v-icon{animation:p115-spin 2.4s linear infinite}
-.p115-ui .p115-task[data-state=uploading] .p115-task-icon .v-icon,.p115-ui .p115-task[data-state=finalizing] .p115-task-icon .v-icon{animation:p115-pulse 1.8s ease-in-out infinite}
 .p115-ui .p115-task-main{min-width:0;flex:1}
-.p115-ui .p115-task-name{font-weight:680;font-size:14.5px;line-height:1.45;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:text}
-.p115-ui .p115-task-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px 8px;margin-top:6px;font-size:12px;color:var(--p115-muted);font-variant-numeric:tabular-nums}
-.p115-ui .p115-meta-pill{
-  display:inline-flex;align-items:center;padding:2px 8px;border-radius:6px;
-  background:rgba(var(--v-theme-on-surface),.045);border:1px solid rgba(var(--v-theme-on-surface),.06)
-}
+.p115-ui .p115-task-name{font-weight:620;font-size:14px;line-height:1.45;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:text}
+.p115-ui .p115-task-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;margin-top:6px;font-size:12px;color:var(--p115-muted);font-variant-numeric:tabular-nums}
+.p115-ui .p115-meta-item{display:inline-flex;align-items:center;color:var(--p115-muted)}
+.p115-ui .p115-meta-item+.p115-meta-item::before{content:'·';margin-right:8px;color:var(--p115-faint)}
 .p115-ui .p115-task-context{
-  display:block;font-size:12px;margin-top:7px;padding:4px 10px;border-radius:7px;
-  background:rgba(var(--p115-task-tone),.07);border-left:2.5px solid rgba(var(--p115-task-tone),.55);
+  display:block;font-size:12px;margin-top:8px;padding:2px 0 2px 9px;
+  border-left:2px solid rgba(var(--v-theme-error),.45);
   color:var(--p115-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap
 }
 .p115-ui .p115-task:has(.p115-task-details[open]) .p115-task-context{display:none}
 .p115-ui .p115-row-actions{display:flex;align-items:flex-start;flex-wrap:wrap;gap:8px;flex-shrink:0}
-.p115-ui .p115-row-actions>.v-btn{min-width:84px}
-.p115-ui .p115-row-actions:has(.p115-confirm[open]){flex-basis:100%;width:100%;max-width:100%;margin-left:0;padding-left:54px;margin-top:4px}
+.p115-ui .p115-row-actions>.v-btn{min-width:80px}
+.p115-ui .p115-row-actions:has(.p115-confirm[open]){flex-basis:100%;width:100%;max-width:100%;margin-left:0;padding-left:0;margin-top:4px}
 .p115-ui .p115-row-actions .p115-confirm[open]{flex:1 1 100%;width:100%}
 .p115-ui .p115-row-actions .p115-confirm-body{margin-left:0;width:100%}
 .p115-ui .v-btn{letter-spacing:0;border-radius:8px}
-.p115-ui .p115-row-actions .v-btn{min-height:36px;font-weight:600}
+.p115-ui .p115-row-actions .v-btn{min-height:34px;font-weight:580}
 .p115-ui .p115-confirm{min-width:0;font-size:13px}
 .p115-ui .p115-confirm>summary{
-  display:inline-flex;align-items:center;justify-content:center;min-height:36px;
-  border:1px solid var(--p115-line-strong);border-radius:8px;padding:6px 13px;
-  background:rgba(var(--v-theme-on-surface),.03);cursor:pointer;list-style:none;font-weight:600;
-  user-select:none;transition:all .15s ease
+  display:inline-flex;align-items:center;justify-content:center;min-height:34px;
+  border:1px solid var(--p115-line-strong);border-radius:8px;padding:5px 12px;
+  background:var(--p115-surface);cursor:pointer;list-style:none;font-weight:580;
+  user-select:none;transition:background .15s ease,border-color .15s ease
 }
 .p115-ui .p115-confirm-upload>summary{
-  color:color-mix(in srgb,rgb(var(--v-theme-primary)) 38%,rgb(var(--v-theme-on-surface)));
-  background:rgba(var(--v-theme-primary),.1);border-color:rgba(var(--v-theme-primary),.24)
+  color:rgb(var(--v-theme-on-surface));background:var(--p115-subtle-bg);border-color:var(--p115-line-strong)
 }
 .p115-ui .p115-confirm[open]{flex-basis:100%;width:100%}
 .p115-ui .p115-confirm-body{
   display:flex;align-items:center;justify-content:space-between;gap:12px 16px;flex-wrap:wrap;
   margin-top:8px;padding:12px 14px;border-radius:10px;
-  background:rgba(var(--v-theme-on-surface),.04);border:1px solid var(--p115-line-strong);
+  background:var(--p115-subtle-bg);border:1px solid var(--p115-line-strong);
   max-width:100%;font-size:13px;overflow-wrap:anywhere
 }
 .p115-ui .p115-confirm-body>p{flex:1 1 260px;margin:0!important}
-.p115-ui .p115-confirm-upload .p115-confirm-body{
-  background:linear-gradient(90deg,rgba(var(--v-theme-primary),.08) 0%,rgba(var(--v-theme-on-surface),.03) 100%);
-  border-color:rgba(var(--v-theme-primary),.22)
-}
 .p115-ui .p115-task-details>summary{
-  position:absolute;right:12px;top:16px;display:flex;align-items:center;justify-content:center;gap:5px;
-  width:34px;min-height:34px;border-radius:9px;background:rgba(var(--v-theme-on-surface),.04);
+  position:absolute;right:12px;top:12px;display:flex;align-items:center;justify-content:center;gap:5px;
+  width:30px;min-height:30px;border-radius:7px;background:transparent;
   border:1px solid transparent;font-size:12px;color:var(--p115-muted);cursor:pointer;list-style:none;
-  transition:all .16s ease
+  transition:background .15s ease,border-color .15s ease,color .15s ease
 }
 .p115-ui .p115-task-details[open]>summary{
-  background:rgba(var(--v-theme-primary),.12);border-color:rgba(var(--v-theme-primary),.24);
-  color:rgb(var(--v-theme-primary))
+  background:var(--p115-well);border-color:var(--p115-line-strong);color:rgb(var(--v-theme-on-surface))
 }
 .p115-ui .p115-task-details>summary span{position:absolute;width:1px;height:1px;clip-path:inset(50%);overflow:hidden;white-space:nowrap}
 .p115-ui .p115-task-details>summary .v-icon{transition:transform .2s cubic-bezier(.2,.8,.2,1)}
 .p115-ui .p115-task-details[open]>summary .v-icon{transform:rotate(180deg)}
-.p115-ui .p115-task-body{border-top:1px solid var(--p115-line);padding-top:14px;margin-top:14px}
+.p115-ui .p115-task-body{border-top:1px solid var(--p115-line);padding-top:12px;margin-top:12px}
 .p115-ui .p115-result{
-  padding:11px 14px;border-radius:10px;
-  background:linear-gradient(90deg,rgba(var(--p115-task-tone),.08) 0%,rgba(var(--v-theme-on-surface),.03) 100%);
-  border:1px solid rgba(var(--p115-task-tone),.2);overflow-wrap:anywhere;margin-bottom:12px
+  padding:10px 13px;border-radius:10px;background:var(--p115-subtle-bg);
+  border:1px solid var(--p115-line-strong);overflow-wrap:anywhere;margin-bottom:12px
 }
-.p115-ui .p115-result-label{font-size:12px;font-weight:700;margin-bottom:4px;letter-spacing:.02em}
+.p115-ui .p115-result-label{font-size:12px;font-weight:660;margin-bottom:3px;color:var(--p115-muted)}
 .p115-ui .p115-path-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:10px 0 12px}
 .p115-ui .p115-path-card{
-  padding:10px 13px;border-radius:10px;background:var(--p115-well);
+  padding:10px 13px;border-radius:10px;background:var(--p115-subtle-bg);
   border:1px solid var(--p115-line);min-width:0
 }
 .p115-ui .p115-path-card:last-child:nth-child(odd){grid-column:1/-1}
@@ -296,67 +253,67 @@ STYLES = """
   line-height:1.65;overflow-wrap:anywhere;white-space:pre-wrap;user-select:all;cursor:pointer;margin:0
 }
 .p115-ui .p115-cooldown-banner{
-  display:flex;align-items:center;gap:12px;padding:12px 16px;margin-bottom:16px;border-radius:13px;
-  border:1px solid rgba(var(--v-theme-warning),.36);
-  background:linear-gradient(90deg,rgba(var(--v-theme-warning),.14) 0%,rgba(var(--v-theme-warning),.04) 70%);
+  display:flex;align-items:center;gap:12px;padding:12px 15px;margin-bottom:14px;border-radius:11px;
+  border:1px solid rgba(var(--v-theme-warning),.32);
+  background:rgba(var(--v-theme-warning),.07);
   box-shadow:var(--p115-shadow-sm);animation:p115-reveal .2s var(--p115-ease)
 }
 .p115-ui .p115-cooldown-banner .v-icon{color:rgb(var(--v-theme-warning));flex-shrink:0;animation:p115-pulse 2s ease-in-out infinite}
 .p115-ui .p115-progress{margin-top:9px}
 .p115-ui .p115-progress-head{
   display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
-  font-size:11.5px;font-weight:620;color:var(--p115-muted);font-variant-numeric:tabular-nums;margin-bottom:5px
+  font-size:11.5px;font-weight:600;color:var(--p115-muted);font-variant-numeric:tabular-nums;margin-bottom:5px
 }
 .p115-ui .p115-progress-track{
-  position:relative;height:6px;border-radius:999px;background:rgba(var(--v-theme-on-surface),.09);overflow:hidden
+  position:relative;height:5px;border-radius:999px;background:rgba(var(--v-theme-on-surface),.08);overflow:hidden
 }
 .p115-ui .p115-progress-fill{
   height:100%;border-radius:999px;min-width:6px;
-  background:linear-gradient(90deg,rgb(var(--v-theme-primary)) 0%,rgb(var(--v-theme-info)) 100%);
+  background:rgb(var(--v-theme-primary));
   transition:width .3s var(--p115-ease)
 }
 .p115-ui .p115-task[data-state=uploading] .p115-progress-fill{
-  background:linear-gradient(90deg,rgb(var(--v-theme-primary)) 0%,rgb(var(--v-theme-info)) 50%,rgb(var(--v-theme-primary)) 100%);
+  background:linear-gradient(90deg,rgb(var(--v-theme-primary)) 0%,color-mix(in srgb,rgb(var(--v-theme-primary)) 65%,white) 50%,rgb(var(--v-theme-primary)) 100%);
   background-size:200% 100%;animation:p115-shimmer 2.2s linear infinite
 }
 .p115-ui .p115-ratio-bar{
-  display:flex;height:4px;border-radius:999px;overflow:hidden;gap:2px;margin:0 0 8px;
-  background:rgba(var(--v-theme-on-surface),.07)
+  display:flex;height:3px;border-radius:999px;overflow:hidden;gap:2px;margin:0 0 8px;
+  background:rgba(var(--v-theme-on-surface),.06)
 }
-.p115-ui .p115-ratio-instant{background:rgb(var(--v-theme-success));border-radius:999px}
-.p115-ui .p115-ratio-upload{background:rgb(var(--v-theme-primary));border-radius:999px}
+.p115-ui .p115-ratio-instant{background:rgba(var(--v-theme-on-surface),.34);border-radius:999px}
+.p115-ui .p115-ratio-upload{background:rgba(var(--v-theme-on-surface),.14);border-radius:999px}
 .p115-ui .p115-toolbar-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .p115-ui .p115-density-toggle>summary{
-  display:inline-flex;align-items:center;gap:5px;padding:6px 11px;min-height:34px;border-radius:9px;
-  border:1px solid var(--p115-line-strong);background:var(--p115-well);color:var(--p115-muted);
-  font-size:12.5px;font-weight:600;cursor:pointer;list-style:none;user-select:none;transition:all .15s ease
+  display:inline-flex;align-items:center;gap:5px;padding:5px 10px;min-height:32px;border-radius:8px;
+  border:1px solid var(--p115-line-strong);background:var(--p115-surface);color:var(--p115-muted);
+  font-size:12.5px;font-weight:580;cursor:pointer;list-style:none;user-select:none;transition:background .15s ease,border-color .15s ease
 }
 .p115-ui .p115-density-toggle[open]>summary{
-  color:rgb(var(--v-theme-primary));background:rgba(var(--v-theme-primary),.12);border-color:rgba(var(--v-theme-primary),.28)
+  color:rgb(var(--v-theme-on-surface));background:var(--p115-well);border-color:var(--p115-line-hover)
 }
 .p115-ui .p115-quick-bulk{
   display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
-  padding:10px 14px;margin-bottom:12px;border-radius:12px;
-  border:1px solid rgba(var(--v-theme-primary),.2);background:rgba(var(--v-theme-primary),.05)
+  padding:10px 14px;margin-bottom:12px;border-radius:11px;
+  border:1px solid var(--p115-line-strong);background:var(--p115-subtle-bg)
 }
+.p115-ui .p115-quick-bulk .v-icon{color:var(--p115-muted)}
 .p115-ui .p115-inline-tools{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
 .p115-ui .p115-exec-bar{
   display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:14px;padding:12px 14px;
-  border-radius:11px;border:1px solid var(--p115-line-strong);background:var(--p115-well)
+  border-radius:10px;border:1px solid var(--p115-line-strong);background:var(--p115-subtle-bg)
 }
-.p115-ui:has(.p115-density-toggle[open]) .p115-list{gap:6px}
-.p115-ui:has(.p115-density-toggle[open]) .p115-task{padding:9px 14px 9px 16px}
-.p115-ui:has(.p115-density-toggle[open]) .p115-task-icon{width:32px;height:32px;border-radius:9px}
+.p115-ui:has(.p115-density-toggle[open]) .p115-list{gap:5px}
+.p115-ui:has(.p115-density-toggle[open]) .p115-task{padding:8px 14px}
 .p115-ui:has(.p115-density-toggle[open]) .p115-task-context{display:none}
-.p115-ui:has(.p115-density-toggle[open]) .p115-task-details>summary{top:9px}
+.p115-ui:has(.p115-density-toggle[open]) .p115-task-details>summary{top:8px}
 .p115-ui .p115-times{display:flex;flex-wrap:wrap;gap:8px 12px;font-size:12px;color:var(--p115-muted);font-variant-numeric:tabular-nums;margin:12px 0}
 .p115-ui .p115-time-pill{
-  display:inline-flex;align-items:center;padding:4px 10px;border-radius:7px;
-  background:rgba(var(--v-theme-on-surface),.04);border:1px solid var(--p115-line)
+  display:inline-flex;align-items:center;padding:3px 9px;border-radius:6px;
+  background:var(--p115-subtle-bg);border:1px solid var(--p115-line)
 }
 .p115-ui .p115-empty{
-  text-align:center;padding:38px 22px;border:1px dashed var(--p115-line-strong);
-  border-radius:16px;background:var(--p115-card);margin-bottom:14px
+  text-align:center;padding:36px 20px;border:1px dashed var(--p115-line-strong);
+  border-radius:12px;background:var(--p115-surface);margin-bottom:14px
 }
 .p115-ui .p115-empty h3{margin:12px 0 6px}
 .p115-ui .p115-filter-empty{display:none}
@@ -365,34 +322,30 @@ STYLES = """
 .p115-ui .p115-bulk-actions{display:flex;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-top:12px}
 .p115-ui .p115-bulk-actions .p115-confirm{flex:1 1 220px}
 .p115-ui .p115-bulk-actions .p115-confirm-body{max-width:100%}
-.p115-ui .p115-help-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0;padding:0;list-style:none}
+.p115-ui .p115-help-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:0;padding:0;list-style:none}
 .p115-ui .p115-help-card{
-  padding:13px 15px;border-radius:11px;background:var(--p115-well);
+  padding:12px 14px;border-radius:10px;background:var(--p115-subtle-bg);
   border:1px solid var(--p115-line)
 }
 .p115-ui .p115-help-card:last-child:nth-child(odd){grid-column:1/-1}
 .p115-ui .p115-help-card h3{display:flex;align-items:center;gap:7px;font-size:13.5px}
 .p115-ui .p115-help-card h3::before{
-  content:'';width:6px;height:6px;border-radius:999px;background:rgb(var(--v-theme-primary));flex-shrink:0
+  content:'';width:5px;height:5px;border-radius:999px;background:var(--p115-faint);flex-shrink:0
 }
 .p115-ui .p115-footer{
-  font-size:12px;color:var(--p115-muted);margin-top:16px;padding:10px 14px;
-  border-radius:10px;background:rgba(var(--v-theme-on-surface),.025);border:1px solid var(--p115-line);
+  font-size:12px;color:var(--p115-muted);margin-top:14px;padding:10px 14px;
+  border-radius:10px;background:var(--p115-subtle-bg);border:1px solid var(--p115-line);
   overflow-wrap:anywhere
 }
 @media(hover:hover) and (pointer:fine){
-  .p115-ui .p115-filter:hover,.p115-ui .p115-confirm>summary:hover,.p115-ui .p115-disclosure>summary:hover{background:rgba(var(--v-theme-primary),.07)}
-  .p115-ui .p115-metric:hover,.p115-ui .p115-task:hover,.p115-ui .p115-toggle:hover{
-    border-color:rgba(var(--v-theme-primary),.28);box-shadow:var(--p115-shadow-md);transform:translateY(-1px)
-  }
-  .p115-ui .p115-task-details>summary:hover{
-    background:rgba(var(--v-theme-primary),.1);border-color:rgba(var(--v-theme-primary),.22);color:rgb(var(--v-theme-primary))
-  }
+  .p115-ui .p115-filter:hover,.p115-ui .p115-confirm>summary:hover,.p115-ui .p115-disclosure>summary:hover{background:var(--p115-well)}
+  .p115-ui .p115-metric:hover,.p115-ui .p115-task:hover,.p115-ui .p115-toggle:hover{border-color:var(--p115-line-hover)}
+  .p115-ui .p115-task-details>summary:hover{background:var(--p115-well);color:rgb(var(--v-theme-on-surface))}
 }
 @container (max-width:700px){
   .p115-ui .p115-row{flex-wrap:wrap;gap:10px}
-  .p115-ui .p115-task-main{flex-basis:calc(100% - 56px)}
-  .p115-ui .p115-row-actions,.p115-ui .p115-row-actions:has(.p115-confirm[open]){max-width:100%;margin-left:54px}
+  .p115-ui .p115-task-main{flex-basis:100%}
+  .p115-ui .p115-row-actions,.p115-ui .p115-row-actions:has(.p115-confirm[open]){max-width:100%;margin-left:0;padding-left:0}
   .p115-ui .p115-task-context{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
   .p115-ui .p115-help-list,.p115-ui .p115-path-grid{grid-template-columns:1fr}
 }
@@ -400,18 +353,15 @@ STYLES = """
   .p115-ui .p115-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
   .p115-ui .p115-metric{padding:12px}
   .p115-ui .p115-fields,.p115-ui .p115-switches{grid-template-columns:1fr}
-  .p115-ui .p115-header{padding:14px 16px;gap:12px;flex-wrap:wrap}
-  .p115-ui .p115-header-main{flex-basis:calc(100% - 62px)}
-  .p115-ui .p115-heading .v-chip{margin-top:4px}
-  .p115-ui h2{font-size:20px}
-  .p115-ui .p115-section{padding:16px}
-  .p115-ui .p115-task{padding:12px 14px 12px 16px}
-  .p115-ui .p115-task-icon{display:none}
+  .p115-ui .p115-header{padding:2px 0 12px;gap:10px;flex-wrap:wrap}
+  .p115-ui h2{font-size:17px}
+  .p115-ui .p115-section{padding:14px}
+  .p115-ui .p115-task{padding:11px 13px}
   .p115-ui .p115-task-main{flex-basis:100%}
   .p115-ui .p115-task-name{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
   .p115-ui .p115-row-actions,.p115-ui .p115-row-actions:has(.p115-confirm[open]){margin-left:0;padding-left:0}
   .p115-ui .p115-filter,.p115-ui .p115-row-actions .v-btn,.p115-ui .p115-confirm>summary,.p115-ui .p115-task-details>summary{min-height:44px}
-  .p115-ui .p115-task-meta{gap:6px 8px}
+  .p115-ui .p115-task-meta{gap:4px 8px}
   .p115-ui .p115-row{padding-right:0}
   .p115-ui .p115-task-details{margin-top:8px}
   .p115-ui .p115-task-details>summary{position:static;width:fit-content;padding:0 12px}
@@ -456,6 +406,19 @@ def parent_label(path):
     return name if name and name not in (".", "/") else ""
 
 
+def concise_folder(source_path):
+    """Omit redundant parent folder names that already mirror the filename prefix."""
+    folder = parent_label(source_path)
+    if not folder:
+        return ""
+    file = filename(source_path)
+    norm = lambda text: "".join(ch for ch in text.lower() if ch.isalnum())
+    norm_folder, norm_file = norm(folder), norm(file)
+    if len(norm_folder) >= 10 and norm_file.startswith(norm_folder[:10]):
+        return ""
+    return folder[:26] + "…" if len(folder) > 28 else folder
+
+
 def format_bytes(size):
     """Format byte size using compact IEC units for UI pills and progress."""
     if not isinstance(size, (int, float)) or isinstance(size, bool) or size < 0:
@@ -494,7 +457,7 @@ def note(text, icon_name="mdi-information-outline", **props):
 
 def section(title, description, children, icon_name="mdi-tune-variant"):
     return node("section", content=[
-        box([box([icon(icon_name, size=17)], "p115-section-icon"), node("h3", title)], "p115-section-head"),
+        box([node("h3", title)], "p115-section-head"),
         paragraph(description, **{"class": "p115-copy p115-muted mb-4"}), *children,
     ], **{"class": "p115-section"})
 
@@ -674,11 +637,9 @@ def record_search_controls(scope):
 
 def config_form(tasks, error="", batch_result=None, history_result=None, notice=""):
     content = [node("style", STYLES),
-        box([box([icon("mdi-cloud-clock-outline", size=26)], "p115-brand-icon"),
-             box([paragraph("115 秒传等待 / 参数设置", **{"class": "p115-eyebrow"}),
-                  node("h2", "设置等待的节奏"),
-                  paragraph("常用设置集中在这里，任务操作可在监控页直接完成。",
-                            **{"class": "p115-copy p115-muted mt-2"})], "p115-header-main")], "p115-header"),
+        box([box([node("h2", "参数设置"),
+                  paragraph("本地视频整理至 115 时后台等待秒传，不阻塞常规整理。",
+                            **{"class": "p115-copy p115-muted mt-1"})], "p115-header-main")], "p115-header"),
         box([toggle("enabled", "启用秒传等待", "后台处理视频，其他整理照常进行。"),
              toggle("notify", "推送任务通知", "首次等待、达到上限或异常时通知。")], "p115-switches")]
     if notice:
@@ -839,14 +800,15 @@ def tone_style(tone, background=False):
     return style
 
 
-def status_chip(state, label=None, tone_override=None, icon_override=None):
-    default_tone, default_icon = TONES.get(state, ("secondary", "mdi-circle-outline"))
+def status_chip(state, label=None, tone_override=None, icon_override=None, transfer_method=None):
+    default_tone, _ = TONES.get(state, ("secondary", "mdi-circle-outline"))
     tone = tone_override or default_tone
-    name = icon_override or default_icon
-    return node("VChip", content=[icon(name, size=16, **{"class": "mr-1"}),
-                                 node("span", label or LABELS.get(state, state))],
-                variant="flat", size="small",
-                **{"style": tone_style(tone, True) + f"border:1px solid rgba(var(--v-theme-{tone}),.24);font-weight:650"})
+    text = label
+    if text is None and state == "completed":
+        text = {"instant": "秒传完成", "upload": "上传完成"}.get(transfer_method, "整理成功")
+    return node("span", content=[node("span", "", **{"class": "p115-dot", "aria-hidden": "true"}),
+                                 node("span", text or LABELS.get(state, state))],
+                **{"class": "p115-badge", "data-tone": tone})
 
 
 def schedule_summary(task, enabled, now):
@@ -884,10 +846,13 @@ def record_time(value, compact=False):
 
 
 def task_button(task, action, label):
+    props = {"aria-label": f"{label}：{filename(task['source'])}"}
+    if action == "cancel":
+        props["color"] = "error"
+    elif action in ("resume", "upload"):
+        props["color"] = "primary"
     button = node("VBtn", label, variant="tonal" if action in ("resume", "upload") else "outlined",
-                  color="error" if action == "cancel" else "primary", size="small",
-                  **{"aria-label": f"{label}：{filename(task['source'])}",
-                     "style": tone_style("error" if action == "cancel" else "primary")})
+                  size="small", **props)
     button["events"] = {"click": {"api": f"plugin/P115InstantWait/tasks/{task['id']}/{action}", "method": "POST"}}
     return button
 
@@ -926,20 +891,20 @@ def task_row(task, enabled, now, max_retries, notice=""):
     budget = (f"自动尝试 {auto}/{max_retries + 1} 次"
               if max_retries is not None and status in ACTIVE else f"自动尝试 {auto} 次")
     result = latest_result(task)
-    meta = [status_chip(status),
-            node("span", f"#{task['history_id']}" if task['history_id'] else "记录待生成", **{"class": "p115-meta-pill"})]
-    folder_name = parent_label(task.get("source"))
+    meta = [status_chip(status, transfer_method=task.get("transfer_method")),
+            node("span", f"#{task['history_id']}" if task['history_id'] else "记录待生成", **{"class": "p115-meta-item"})]
+    folder_name = concise_folder(task.get("source"))
     if folder_name:
-        meta.append(node("span", folder_name, **{"class": "p115-meta-pill", "title": "所在目录：" + folder_name}))
+        meta.append(node("span", folder_name, **{"class": "p115-meta-item", "title": "所在目录：" + parent_label(task.get("source"))}))
     size_text = format_bytes(task.get("size"))
     if size_text:
-        meta.append(node("span", size_text, **{"class": "p115-meta-pill", "title": "源文件大小"}))
-    meta.append(node("span", budget, **{"class": "p115-meta-pill"}))
+        meta.append(node("span", size_text, **{"class": "p115-meta-item", "title": "源文件大小"}))
+    meta.append(node("span", budget, **{"class": "p115-meta-item"}))
     if status in ACTIVE:
-        meta.append(node("span", value, **{"class": "p115-meta-pill", "style": tone_style(tone), "title": label}))
+        meta.append(node("span", value, **{"class": "p115-meta-item", "title": label}))
     else:
-        meta.append(node("span", "结束 " + record_time(task.get("updated"), compact=True),
-                         **{"class": "p115-meta-pill", "title": record_time(task.get("updated"))}))
+        meta.append(node("span", record_time(task.get("updated"), compact=True),
+                         **{"class": "p115-meta-item", "title": "结束 " + record_time(task.get("updated"))}))
     main = [node("div", filename(task["source"]), **{"class": "p115-task-name", "title": filename(task["source"])}),
             box(meta, "p115-task-meta")]
     progress = task.get("upload_progress")
@@ -959,7 +924,7 @@ def task_row(task, enabled, now, max_retries, notice=""):
             box([node("span", left_text), node("span", right_text)], "p115-progress-head"),
             box([box([], "p115-progress-fill", style=bar_width)], "p115-progress-track"),
         ], "p115-progress"))
-    if status in ("paused", "failed", "completed"):
+    if status in ("paused", "failed"):
         main.append(paragraph(result, **{"class": "p115-task-context", "title": result}))
     actions = []
     if status in ("queued", "waiting", "paused", "upload_queued") and enabled:
@@ -968,8 +933,7 @@ def task_row(task, enabled, now, max_retries, notice=""):
         if status != "upload_queued":
             actions.append(confirm_action(task, "upload", "强制上传…",
                 "先尝试秒传，未命中就上传视频正文，会占用上行带宽。若上次请求结果未知，将在目标当前不存在时重试；延迟出现的远端文件可能造成重复，请先核对目标。", "确认强制上传"))
-    row = [box([icon(icon_name, size=21, style=tone_style(tone_key))], "p115-task-icon"),
-           box(main, "p115-task-main")]
+    row = [box(main, "p115-task-main")]
     if actions:
         row.append(box(actions, "p115-row-actions", **{"aria-label": "任务操作"}))
     details = [box([node("div", "暂停原因" if status == "paused" else "最新结果",
@@ -1009,10 +973,10 @@ def task_row(task, enabled, now, max_retries, notice=""):
 
 
 def metric(title, count, caption, tone, name, attention=False, ratio=None):
+    value_cls = "p115-metric-value" + (" p115-metric-zero" if not count else "")
     children = [
-        box([node("span", title),
-             box([icon(name, size=17, style=tone_style(tone))], "p115-metric-icon")], "p115-metric-label"),
-        node("div", str(count), **{"class": "p115-metric-value", "style": tone_style(tone)}),
+        box([node("span", title), icon(name, size=16)], "p115-metric-label"),
+        node("div", str(count), **{"class": value_cls}),
     ]
     if ratio:
         instant_pct, upload_pct = ratio
@@ -1047,8 +1011,7 @@ def batch_confirmations(tasks, enabled, min_count=1):
         if len(keys) < min_count:
             continue
         keys = keys[:200]
-        button = node("VBtn", f"确认{title} {len(keys)} 项", variant="tonal", color="primary", size="small",
-                      style=tone_style("primary"))
+        button = node("VBtn", f"确认{title} {len(keys)} 项", variant="tonal", color="primary", size="small")
         button["events"] = {"click": {"api": f"plugin/P115InstantWait/batch/{action}",
                                        "method": "POST", "params": {"keys": keys}}}
         controls.append(confirmation(f"{title} · {len(keys)} 项…", explanation, button))
@@ -1071,7 +1034,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
     now = time.time()
     cooling = bool(enabled and cooldown_until and cooldown_until > now)
     refresh = node("VBtn", "刷新", variant="outlined", size="small",
-                   **{"prepend-icon": "mdi-refresh", "class": "p115-refresh-btn", "style": "min-height:40px", "aria-label": "刷新任务状态"})
+                   **{"prepend-icon": "mdi-refresh", "class": "p115-refresh-btn", "aria-label": "刷新任务状态"})
     # Native page API returns the standard envelope required by PageRender;
     # /tasks intentionally stays a bare list for existing plugin API clients.
     refresh["events"] = {"click": {"api": "plugin/page/P115InstantWait", "method": "GET"}}
@@ -1082,10 +1045,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
         header_chip = status_chip("running" if enabled else "cancelled",
                                   "后台运行中" if enabled else "等待任务结束" if notice else "插件已关闭")
     content = [node("style", STYLES), box([
-        box([icon("mdi-cloud-clock-outline", size=26)], "p115-brand-icon"),
-        box([paragraph("115 秒传等待 / 任务监控", **{"class": "p115-eyebrow"}),
-             box([node("h2", "任务监控"), header_chip], "p115-heading")],
-            "p115-header-main"), refresh,
+        box([node("h2", "任务监控"), header_chip], "p115-heading"), refresh,
     ], "p115-header")]
     if cooling:
         cooldown_clock = datetime.fromtimestamp(cooldown_until).astimezone().strftime("%H:%M:%S")
@@ -1170,7 +1130,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
     quick_controls = batch_confirmations(tasks, enabled, min_count=2)
     if quick_controls:
         content.append(box([
-            box([icon("mdi-lightning-bolt-outline", size=18, style=tone_style("primary")),
+            box([icon("mdi-lightning-bolt-outline", size=17),
                  node("strong", "快捷批量处理")], "p115-inline-tools"),
             box(quick_controls, "p115-inline-tools"),
         ], "p115-quick-bulk"))
@@ -1187,7 +1147,7 @@ def task_page(tasks, enabled, error="", max_retries=None, batch_result=None, sum
                     paragraph("当前显示的记录中没有匹配项；切换状态查看其他任务。", **{"class": "p115-muted"})],
                     "p115-empty p115-filter-empty", **{"data-filter": group}))
     else:
-        content.append(box([icon("mdi-cloud-clock-outline", size=32, color="primary"),
+        content.append(box([icon("mdi-cloud-clock-outline", size=32),
             node("h3", "还没有等待任务"),
             paragraph("在配置页启用插件，确认 MP 内置 115 已授权，再发起本地到 115 的视频整理。",
                       **{"class": "p115-copy p115-muted"})], "p115-empty"))

@@ -115,3 +115,47 @@ class TaskActionTests(unittest.TestCase):
                 label, value, _ = page_ui.schedule_summary({"state": "waiting", "next_at": now + 900}, True, now)
                 self.assertEqual(label, "下次重试 · MP 时间")
                 self.assertIn("分钟后", value)
+
+    def test_minimal_neutral_palette_and_deduplicated_completed_rows(self):
+        from tests.test_records import modules
+        now = time.time()
+        cases = [
+            dict(id="done-instant", history_id=11,
+                 source="/downloads/The.Silent.Storm.S01.2026/The.Silent.Storm.S01E30.2026.mkv",
+                 target="/library/Ep30.mkv", state="completed", transfer_method="instant",
+                 attempts=1, updated=now, message="触发秒传成功 · 文件传输与 MP 整理完成"),
+            dict(id="done-upload", history_id=12,
+                 source="/downloads/Show.S01/Ep01.mkv",
+                 target="/library/Ep01.mkv", state="completed", transfer_method="upload",
+                 attempts=2, updated=now, message="强制上传成功 · 文件传输与 MP 整理完成"),
+            dict(id="paused-row", history_id=13,
+                 source="/downloads/Show.S01/Ep02.mkv",
+                 target="/library/Ep02.mkv", state="paused",
+                 attempts=4, updated=now, next_at=now, message="已达上限，等待手动处理"),
+            dict(id="failed-row", history_id=14,
+                 source="/downloads/Show.S01/Ep03.mkv",
+                 target="/library/Ep03.mkv", state="failed",
+                 attempts=1, updated=now, message="蓝光原盘目录暂不支持"),
+        ]
+        for generation in ("v2", "v3"):
+            with self.subTest(generation=generation):
+                _, _, page_ui = modules(generation)
+                self.assertNotIn(".p115-metric::before", page_ui.STYLES)
+                self.assertNotIn(".p115-task::before", page_ui.STYLES)
+                self.assertNotIn("radial-gradient", page_ui.STYLES)
+                self.assertEqual(page_ui.concise_folder(cases[0]["source"]), "")
+                self.assertEqual(page_ui.concise_folder(cases[1]["source"]), "Show.S01")
+
+                instant_row = page_ui.task_row(cases[0], True, now, 3)
+                upload_row = page_ui.task_row(cases[1], True, now, 3)
+                paused_row = page_ui.task_row(cases[2], True, now, 3)
+                failed_row = page_ui.task_row(cases[3], True, now, 3)
+
+                self.assertTrue(any(n.get("text") == "秒传完成" for n in walk([instant_row])))
+                self.assertTrue(any(n.get("text") == "上传完成" for n in walk([upload_row])))
+                self.assertFalse(any(n.get("props", {}).get("class") == "p115-task-context" for n in walk([instant_row])))
+                self.assertFalse(any(n.get("props", {}).get("class") == "p115-task-context" for n in walk([upload_row])))
+                self.assertFalse(any(n.get("text") == "The.Silent.Storm.S01.2026" for n in walk([instant_row])))
+                self.assertTrue(any(n.get("text") == "Show.S01" for n in walk([upload_row])))
+                self.assertTrue(any(n.get("props", {}).get("class") == "p115-task-context" for n in walk([paused_row])))
+                self.assertTrue(any(n.get("props", {}).get("class") == "p115-task-context" for n in walk([failed_row])))
