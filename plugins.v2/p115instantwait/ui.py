@@ -641,12 +641,27 @@ def config_form(tasks, error="", batch_result=None, history_result=None, notice=
                   paragraph("本地视频整理至 115 时后台等待秒传，不阻塞常规整理。",
                             **{"class": "p115-copy p115-muted mt-1"})], "p115-header-main")], "p115-header"),
         box([toggle("enabled", "启用秒传等待", "后台处理视频，其他整理照常进行。"),
-             toggle("notify", "推送任务通知", "首次等待、达到上限或异常时通知。")], "p115-switches")]
+             toggle("notify", "推送任务通知", "开启后按下方勾选的触发条件推送。")], "p115-switches")]
     if notice:
         content.append(node("VAlert", notice, type="info", variant="tonal", **{"class": "mb-4", "role": "status"}))
     if error:
         content.append(node("VAlert", error, title="插件需要检查", type="error", variant="tonal",
                             **{"class": "mb-5", "role": "alert"}))
+
+    notify_section = box([
+        box([node("h3", "通知触发条件")], "p115-section-head"),
+        paragraph("仅推送勾选的场景；同一次状态变化若同时命中多项，只发送一条通知。",
+                  **{"class": "p115-copy p115-muted mb-4"}),
+        field("VSelect", "notify_events", "触发通知的场景",
+              "默认全选；留空表示不发送插件主动通知。整理成功与最终整理失败仍沿用 MP 原生通知。",
+              items=[
+                  {"title": "遇到不秒传（每轮首次）", "value": "not_instant"},
+                  {"title": "达到重试 / 等待上限", "value": "max_retries"},
+                  {"title": "触发自动强制上传", "value": "auto_upload"},
+                  {"title": "暂停 / 等待手动操作", "value": "manual_action"},
+              ],
+              multiple=True, chips=True, **{"closable-chips": True}),
+    ], "p115-section", show="{{ notify }}")
 
     strategy = section("重试与上限策略", "次数或等待时限任一达到，即执行所选策略。", [
         box([
@@ -773,11 +788,12 @@ def config_form(tasks, error="", batch_result=None, history_result=None, notice=
     help_items = [
         ("整理记录", "等待时显示失败；成功后更新同一条记录。本地文件保留到整理完成。"),
         ("重试规则", "次数不含首次，0 表示只尝试首次。间隔从每轮结束后计时，实际有 ±10% 浮动。"),
-        ("通知设置", "在 MP 通知渠道中开启「整理入库」和「手动处理」。中间重试不重复推送；成功与最终失败沿用 MP 原生通知。"),
+        ("通知设置", "支持按场景勾选触发条件，遇到不秒传每轮仅首次通知，同一次状态转换命中多项只发送一条；请在 MP 通知渠道中开启「整理入库」和「手动处理」。成功与最终失败沿用 MP 原生通知。"),
         ("支持范围", "MP V2.15.6，本地到内置 115 的复制或移动。字幕、NFO、图片沿用 MP；蓝光原盘目录暂不支持。"),
         ("目标文件", "直接写入正式目录和文件名，覆盖及旧版本清理遵循 MP 设置。不会创建暂存或备份目录。"),
     ]
     content.extend([
+        notify_section,
         strategy,
         disclosure("视频格式", [field("VTextarea", "extensions", "接管的视频后缀", "英文逗号分隔，不加点号，例如 mkv,mp4,iso；未列出的格式走 MP 原流程。",
                     rows=2, spellcheck=False, **{"auto-grow": True})], "mdi-file-video-outline"),

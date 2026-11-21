@@ -29,6 +29,7 @@ DEFAULTS = {
     "max_retries": 3,
     "limit_action": "manual",
     "notify": True,
+    "notify_events": ["not_instant", "max_retries", "auto_upload", "manual_action"],
     "task_id": "",
     "task_ids": [],
     "action": "pause",
@@ -128,7 +129,7 @@ class P115InstantWait(RuntimePlugin, _PluginBase):
     plugin_name = "115秒传等待"
     plugin_desc = "内置115整理等待秒传，到达上限可自动上传或手动处理，更新原整理记录"
     plugin_icon = "https://raw.githubusercontent.com/Agonie0v0/MoviePilot-Plugins/main/icons/p115instantwait.png"
-    plugin_version = "1.3.6"
+    plugin_version = "1.3.7"
     plugin_author = "Agonie"
     author_url = "https://github.com/Agonie0v0/MoviePilot-Plugins"
     plugin_config_prefix = "p115instantwait_"
@@ -193,7 +194,17 @@ class P115InstantWait(RuntimePlugin, _PluginBase):
                 raise ValueError("达到上限后的操作必须为手动处理或强制上传")
             if not self._config["extensions"].strip():
                 raise ValueError("请配置需要接管的文件扩展名")
-            runtime = {**self._config, "max_wait_hours": hours, "max_retries": int(retries), "retry_delays": delays}
+            allowed_notify_events = ("not_instant", "max_retries", "auto_upload", "manual_action")
+            raw_notify_events = self._config.get("notify_events")
+            if raw_notify_events is None:
+                raw_notify_events = []
+            if not isinstance(raw_notify_events, list) or any(
+                not isinstance(v, str) or v not in allowed_notify_events for v in raw_notify_events
+            ):
+                raise ValueError("通知触发条件配置无效，请重新选择")
+            notify_events = list(dict.fromkeys(raw_notify_events))
+            runtime = {**self._config, "max_wait_hours": hours, "max_retries": int(retries), "retry_delays": delays,
+                       "notify_events": notify_events}
             engine = InstantWaitEngine(self.get_data_path(), runtime, self._notify)
             engine.runtime_lock = self._runtime.lock
             engine.install(before_start=(lambda: self._apply_actions(engine, selected, self._config["action"])) if apply_action else None)

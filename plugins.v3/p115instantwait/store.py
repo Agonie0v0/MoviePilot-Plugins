@@ -272,6 +272,7 @@ class QueueStore:
                 payload["wait_since"] = time.time()
                 payload["auto_attempts"] = 0
                 payload.pop("finalize_attempts", None)
+                payload.pop("not_instant_notified", None)
                 db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), key))
             elif action == "upload" and row["state"] in ("queued", "waiting", "paused"):
                 state = "upload_queued"

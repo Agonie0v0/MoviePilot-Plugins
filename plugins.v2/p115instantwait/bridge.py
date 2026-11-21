@@ -130,6 +130,13 @@ class InstantWaitEngine:
         getattr(logger, level)(f"【115秒传等待】{event} | " +
                                " | ".join(f"{key}={log_text(value)}" for key, value in fields.items()))
 
+    def _should_notify(self, events):
+        if not events:
+            return False
+        configured = self.config.get("notify_events")
+        allowed = {"not_instant", "max_retries", "auto_upload", "manual_action"} if configured is None else set(configured)
+        return bool(set(events) & allowed)
+
     def notify_task(self, row, manual=True):
         if not self.notify:
             return
@@ -439,7 +446,11 @@ class InstantWaitEngine:
                 self.store.update(row["id"], state="paused", message="任务恢复失败，请检查 MP 版本与队列数据")
                 logger.error(f"【115秒传等待】任务恢复失败 | 任务={row['id']} | 整理记录={row['history_id'] or '待生成'} | 已保留队列并暂停")
                 if row["state"] != "paused":
-                    self.notify_task(self.store.get(row["id"]))
+                    paused_row = self.store.get(row["id"])
+                    if self._should_notify({"manual_action"}):
+                        self.notify_task(paused_row)
+                    else:
+                        self.log_task(paused_row, "跳过通知", 原因="未启用对应通知触发条件", 事件="manual_action")
         active_batches = {task.transfer_batch_id for task in self.live_tasks.values() if task.transfer_batch_id}
         # Recover already completed peers from our own durable checkpoint.
         for row in self.store.all(limit=100000):
@@ -606,7 +617,7 @@ class InstantWaitEngine:
         except PauseTask as exc:
             self.defer(row, "paused", str(exc))
         except NotInstant as exc:
-            self.defer(row, "waiting", str(exc))
+            self.defer(row, "waiting", str(exc), not_instant=True)
         except RetryLater as exc:
             current = self.store.get(key)
             saved_data = current["payload"]
@@ -623,13 +634,14 @@ class InstantWaitEngine:
             if api:
                 api.close()
 
-    def defer(self, row, state, reason, limit_reached=False):
+    def defer(self, row, state, reason, limit_reached=False, not_instant=False):
         previous_state = self.store.get(row["id"])["state"]
         now = time.time()
         payload = self.store.get(row["id"])["payload"]
         limit = self.config["max_wait_hours"] * 3600
         deadline = payload.get("wait_since", row["created"]) + limit if limit else None
         upload_retry = False
+        reached = None
         if row["state"] == "uploading":
             upload_retry = state == "waiting" and payload.get("upload_attempts", 1) <= self.config.get("max_retries", 3)
             if self.stop_event.is_set():
@@ -661,6 +673,16 @@ class InstantWaitEngine:
         task = self.live_tasks.get(row["id"])
         if task:
             self.waiting_view(task)
+        events = set()
+        if not_instant and row["state"] != "uploading" and not payload.get("not_instant_notified"):
+            payload["not_instant_notified"] = True
+            events.add("not_instant")
+        if reached or limit_reached:
+            events.add("max_retries")
+        if state == "upload_queued" and not upload_retry:
+            events.add("auto_upload")
+        if state == "paused" and previous_state != "paused":
+            events.add("manual_action")
         self.store.update(row["id"], state=state, next_at=next_at, message=message, payload=payload)
         # Use the published snapshot: the upload worker may already have claimed it.
         saved = {**row, "state": state, "next_at": next_at, "message": message, "payload": payload}
@@ -669,13 +691,12 @@ class InstantWaitEngine:
                       下次重试=log_time(saved["next_at"]) if state == "waiting" or upload_retry else "无，等待上传调度" if state == "upload_queued" else "无，等待手动处理",
                       **({"间隔秒": round(next_at - now)} if state == "waiting" else {}))
         if state == "upload_queued":
-            if not upload_retry:
-                self.notify_task(saved, manual=False)
             self.upload_wake.set()
-        elif state == "paused" and previous_state != "paused":
-            self.notify_task(saved)
-        elif state == "waiting" and previous_state != "waiting" and saved["payload"].get("auto_attempts", saved["attempts"]) == 1:
-            self.notify_task(saved, manual=False)
+        if events:
+            if self._should_notify(events):
+                self.notify_task(saved, manual=state == "paused")
+            else:
+                self.log_task(saved, "跳过通知", 原因="未启用对应通知触发条件", 事件=",".join(sorted(events)))
 
     def complete(self, row, task, info, api):
         key = row["id"]

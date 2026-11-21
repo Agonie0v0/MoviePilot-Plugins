@@ -82,6 +82,13 @@ class InstantWaitEngine:
                   "本轮自动尝试": f"{row['payload'].get('auto_attempts', row['attempts'])}/{self.config['max_retries'] + 1}", **details}
         getattr(logger, level)(f"【115秒传等待】{event} | " + " | ".join(f"{k}={log_text(v)}" for k, v in fields.items()))
 
+    def _should_notify(self, events):
+        if not events:
+            return False
+        configured = self.config.get("notify_events")
+        allowed = {"not_instant", "max_retries", "auto_upload", "manual_action"} if configured is None else set(configured)
+        return bool(set(events) & allowed)
+
     def notify_task(self, row, manual=True):
         """Use the host notification adapter without letting channel errors retry work."""
         if not self.notify:
@@ -516,7 +523,7 @@ class InstantWaitEngine:
         except PauseTask as error:
             self.defer(row, "paused", str(error))
         except NotInstant as error:
-            self.defer(row, "waiting", str(error))
+            self.defer(row, "waiting", str(error), not_instant=True)
         except RetryLater as error:
             current = self.store.get(key)
             saved_data = current["payload"]
@@ -565,12 +572,15 @@ class InstantWaitEngine:
                 else:
                     self.request_finalize(row)
 
-    def defer(self, row, state, reason, limit_reached=False):
+    def defer(self, row, state, reason, limit_reached=False, not_instant=False):
         """Retry temporary failures without replaying completed native work."""
-        data = self.store.get(row["id"])["payload"]
+        current = self.store.get(row["id"])
+        previous_state = current["state"]
+        data = current["payload"]
         now = time.time()
         deadline = data.get("wait_since", row["created"]) + self.config["max_wait_hours"] * 3600 if self.config["max_wait_hours"] else None
         upload_retry = False
+        reached = None
         if state == "finalizing":
             data["finalize_attempts"] = data.get("finalize_attempts", 0) + 1
             if data["finalize_attempts"] > self.config["max_retries"]:
@@ -598,12 +608,25 @@ class InstantWaitEngine:
         next_at = min(now + delay, deadline) if deadline and state == "waiting" else now + delay
         if state == "upload_queued" and not upload_retry:
             next_at = now
+        events = set()
+        if not_instant and row["state"] != "uploading" and not data.get("not_instant_notified"):
+            data["not_instant_notified"] = True
+            events.add("not_instant")
+        if reached or limit_reached:
+            events.add("max_retries")
+        if state == "upload_queued" and not upload_retry:
+            events.add("auto_upload")
+        if state == "paused" and previous_state != "paused":
+            events.add("manual_action")
         self.store.update(row["id"], state=state, next_at=next_at, message=reason, payload=data)
         saved = {**row, "state": state, "next_at": next_at, "message": reason, "payload": data}
         self.log_task(saved, "任务状态变化", level="warning" if state == "paused" else "info", 状态=state, 原因=reason,
                       下次重试=log_time(next_at) if state in ("waiting", "finalizing") or upload_retry else "无")
-        if state == "paused" or (state == "upload_queued" and not upload_retry) or (state == "waiting" and data.get("auto_attempts", row["attempts"]) == 1):
-            self.notify_task(saved, manual=state == "paused")
+        if events:
+            if self._should_notify(events):
+                self.notify_task(saved, manual=state == "paused")
+            else:
+                self.log_task(saved, "跳过通知", 原因="未启用对应通知触发条件", 事件=",".join(sorted(events)))
         self.upload_wake.set()
 
     def control(self, key, action):
